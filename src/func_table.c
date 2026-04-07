@@ -29,6 +29,7 @@ static void entry_init(func_table_entry_t *e, func_id_t id)
     atomic_init(&e->version,    0);
     atomic_init(&e->cur_level,  (int)OPT_NONE);
     atomic_init(&e->in_queue,   false);
+    atomic_init(&e->last_compile_duration_ms, 0);
 
     e->id        = id;
     e->dl_handle = NULL;

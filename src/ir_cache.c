@@ -358,7 +358,75 @@ static char *irc_read_from_disk(const char *path)
     return buf;
 }
 
-/* ═══════════════════════════ public API ═══════════════════════════════════ */
+/* ═══════════════════════════ async I/O thread pool ════════════════════════ */
+
+/**
+ * Main loop of an async I/O prefetch thread.
+ *
+ * Blocks on the prefetch condvar when the queue is empty.  On each wake,
+ * dequeues one func_id and calls ir_cache_get_ir() which handles the
+ * COLD→WARM promotion (disk read + LRU insertion) with all proper locking.
+ * The returned IR copy is freed immediately — the goal is only to warm the
+ * cache, not to use the IR ourselves.
+ */
+static void *io_thread_fn(void *arg)
+{
+    ir_lru_cache_t *cache = (ir_lru_cache_t *)arg;
+
+    while (!atomic_load_explicit(&cache->stop_io_flag, memory_order_acquire)) {
+        pthread_mutex_lock(&cache->pf_mutex);
+
+        /* Block until there is work or we are asked to stop. */
+        while (cache->pf_count == 0 &&
+               !atomic_load_explicit(&cache->stop_io_flag, memory_order_relaxed))
+            pthread_cond_wait(&cache->pf_cond, &cache->pf_mutex);
+
+        if (cache->pf_count == 0) {
+            pthread_mutex_unlock(&cache->pf_mutex);
+            break;  /* stop_io_flag was set while queue was empty */
+        }
+
+        /* Dequeue one request. */
+        func_id_t id    = cache->pf_buf[cache->pf_head];
+        cache->pf_head  = (cache->pf_head + 1) % IRC_PREFETCH_CAP;
+        --cache->pf_count;
+        pthread_mutex_unlock(&cache->pf_mutex);
+
+        /*
+         * ir_cache_get_ir handles COLD→WARM: drops cache->lock during disk I/O
+         * so other threads are not blocked.  For HOT/WARM entries the call is
+         * a cheap in-memory hit.  The returned copy is freed immediately; we
+         * only care about the side-effect of warming the cache entry.
+         */
+        char *ir = ir_cache_get_ir(cache, id);
+        free(ir);
+    }
+
+    return NULL;
+}
+
+bool ir_cache_prefetch(ir_lru_cache_t *cache, func_id_t func_id)
+{
+    if (!cache || !cache->num_io_threads) return false;
+    if (func_id >= cache->max_funcs)       return false;
+
+    pthread_mutex_lock(&cache->pf_mutex);
+
+    if (cache->pf_count >= IRC_PREFETCH_CAP) {
+        pthread_mutex_unlock(&cache->pf_mutex);
+        return false;  /* queue full; caller falls back to synchronous load */
+    }
+
+    uint32_t tail       = (cache->pf_head + cache->pf_count) % IRC_PREFETCH_CAP;
+    cache->pf_buf[tail] = func_id;
+    ++cache->pf_count;
+
+    pthread_cond_signal(&cache->pf_cond);  /* wake one I/O thread */
+    pthread_mutex_unlock(&cache->pf_mutex);
+    return true;
+}
+
+
 
 ir_lru_cache_t *ir_cache_create(const ir_cache_config_t *cfg)
 {
@@ -395,6 +463,8 @@ ir_lru_cache_t *ir_cache_create(const ir_cache_config_t *cfg)
     atomic_init(&cache->stat_cache_misses,    0);
     atomic_init(&cache->stat_pressure_evictions, 0);
 
+    atomic_init(&cache->stop_io_flag,    false);
+
     /* Build IR directory path. */
     if (cfg->ir_dir && cfg->ir_dir[0]) {
         snprintf(cache->ir_dir, sizeof(cache->ir_dir), "%s", cfg->ir_dir);
@@ -408,6 +478,22 @@ ir_lru_cache_t *ir_cache_create(const ir_cache_config_t *cfg)
                 cache->ir_dir, strerror(errno));
     }
 
+    /* I/O prefetch pool – initialise FIFO and start threads. */
+    pthread_mutex_init(&cache->pf_mutex, NULL);
+    pthread_cond_init(&cache->pf_cond, NULL);
+    cache->pf_head = cache->pf_tail = cache->pf_count = 0;
+
+    cache->num_io_threads = cfg->num_io_threads ? cfg->num_io_threads : 2;
+    cache->io_threads = calloc(cache->num_io_threads, sizeof(pthread_t));
+    if (!cache->io_threads) {
+        /* Non-fatal: degrade gracefully to no async prefetch. */
+        cache->num_io_threads = 0;
+        fprintf(stderr, "[ir_cache] WARNING: cannot allocate I/O thread array\n");
+    } else {
+        for (uint32_t i = 0; i < cache->num_io_threads; ++i)
+            pthread_create(&cache->io_threads[i], NULL, io_thread_fn, cache);
+    }
+
     /* Start the pressure-monitor thread immediately so the first
      * compilation already benefits from an accurate pressure reading.   */
     pthread_create(&cache->pressure_thread, NULL, pressure_monitor_fn, cache);
@@ -418,6 +504,21 @@ ir_lru_cache_t *ir_cache_create(const ir_cache_config_t *cfg)
 void ir_cache_destroy(ir_lru_cache_t *cache)
 {
     if (!cache) return;
+
+    /* Stop I/O threads. */
+    if (cache->num_io_threads > 0) {
+        atomic_store_explicit(&cache->stop_io_flag, true, memory_order_release);
+        /* Wake all I/O threads so they observe the stop flag. */
+        pthread_mutex_lock(&cache->pf_mutex);
+        pthread_cond_broadcast(&cache->pf_cond);
+        pthread_mutex_unlock(&cache->pf_mutex);
+        for (uint32_t i = 0; i < cache->num_io_threads; ++i)
+            pthread_join(cache->io_threads[i], NULL);
+        free(cache->io_threads);
+        cache->io_threads = NULL;
+    }
+    pthread_cond_destroy(&cache->pf_cond);
+    pthread_mutex_destroy(&cache->pf_mutex);
 
     /* Stop pressure thread. */
     atomic_store_explicit(&cache->stop_pressure_flag, true, memory_order_release);

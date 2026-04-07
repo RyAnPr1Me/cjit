@@ -361,10 +361,17 @@ static void *compiler_thread_fn(void *raw_arg)
             continue;
         }
 
+        uint64_t t0_compile = engine_now_ms();
         codegen_result_t cres;
         bool ok = codegen_compile(entry->name, ir_to_use,
                                    task.target_level, &copts, &cres);
         free(ir_cache_copy);
+
+        /* Record how long this compilation took (relaxed store, read by monitor
+         * for adaptive cooloff — zero hot-path overhead). */
+        uint32_t dur_ms = (uint32_t)(engine_now_ms() - t0_compile);
+        atomic_store_explicit(&entry->last_compile_duration_ms, dur_ms,
+                              memory_order_relaxed);
 
         if (!ok) {
             atomic_fetch_add_explicit(&engine->stat_failed, 1,
@@ -405,55 +412,66 @@ static void *compiler_thread_fn(void *raw_arg)
 /**
  * Main loop of the hot-function monitor thread.
  *
- * Algorithm: confidence-based tier promotion
- * ──────────────────────────────────────────
+ * Algorithm: EMA-smoothed confidence-based tier promotion
+ * ────────────────────────────────────────────────────────
  * All state is LOCAL to this function (zero hot-path overhead):
  *
- *   prev_cnt[i]       – call_cnt at the previous scan (for delta / rate)
- *   hot_streak[i]     – consecutive scan cycles above the rate threshold
+ *   prev_cnt[i]       – call_cnt at the previous scan
+ *   ema_rate[i]       – exponential moving average of calls/sec
+ *                       α = 2 / (hot_confirm_cycles + 1)
  *   cnt_at_compile[i] – call_cnt when the last compile task was enqueued
- *   last_queued_ms[i] – monotonic timestamp when the last task was enqueued
+ *   last_queued_ms[i] – monotonic timestamp of the last enqueue
+ *   prefetch_done[i]  – true once a prefetch request has been submitted
  *
  * Per-scan decision for function i:
  *
  *   delta = call_cnt[i] - prev_cnt[i]
- *   rate  = delta * 1000 / interval_ms        (calls/sec)
- *   prev_cnt[i] = call_cnt[i]
+ *   rate  = delta * 1000 / interval_ms       (instantaneous calls/sec)
+ *   ema   = α × rate + (1 − α) × ema         (smoothed)
  *
- *   T1 (OPT_O2, first JIT compile):
- *     if rate >= hot_rate_t1:
- *       hot_streak[i]++
- *       if hot_streak[i] >= hot_confirm_cycles  AND
- *          (now - last_queued_ms[i]) >= compile_cooloff_ms:
- *         enqueue O2
- *     else:
- *       hot_streak[i] = 0           // reset on any cold cycle
+ *   Warm-up prefetch (zero-overhead, one-shot):
+ *     if ema >= hot_rate_t1/10 AND ir is COLD AND !prefetch_done[i]:
+ *       ir_cache_prefetch(…)     ← non-blocking, returns immediately
+ *       prefetch_done[i] = true
+ *     By the time hot_confirm_cycles cycles pass and a compile task fires,
+ *     the IR is already in memory.
+ *
+ *   T1 (OPT_O2):
+ *     if ema >= hot_rate_t1:
+ *       if (now − last_queued_ms[i]) >= effective_cooloff:  enqueue O2
+ *     else: ema decays naturally; no explicit reset needed
  *
  *   T2 (OPT_O3 upgrade from O2):
- *     same streak/cooloff gate, PLUS:
- *       (call_cnt[i] - cnt_at_compile[i]) >= min_calls_for_tier2
- *     This ensures there is hard evidence that the function remained hot
- *     long enough after O2 compilation to justify the extra O3 cost.
+ *     same gate, plus (call_cnt[i] − cnt_at_compile[i]) >= min_calls_for_tier2
  *
- * The streak requirement rejects brief call spikes; the calls-since-compile
- * requirement rejects functions that were hot once but have since cooled.
- * Together they ensure every O3 compile has a realistic chance of paying off.
+ *   Adaptive cooloff:
+ *     effective_cooloff = max(cfg.compile_cooloff_ms,
+ *                             2 × entry->last_compile_duration_ms)
+ *     Re-enqueuing before the previous compile likely completed is prevented.
  */
 static void *monitor_thread_fn(void *arg)
 {
-    cjit_engine_t *engine     = (cjit_engine_t *)arg;
-    uint32_t       max_funcs  = engine->cfg.max_functions;
-    uint32_t       itvl_ms    = engine->cfg.monitor_interval_ms;
+    cjit_engine_t *engine    = (cjit_engine_t *)arg;
+    uint32_t       max_funcs = engine->cfg.max_functions;
+    uint32_t       itvl_ms   = engine->cfg.monitor_interval_ms;
+    uint32_t       itvl_safe = itvl_ms > 0 ? itvl_ms : 1;
+
+    /* EMA coefficient: α = 2 / (hot_confirm_cycles + 1).
+     * hot_confirm_cycles >= 1 enforced by cjit_create. */
+    float alpha = 2.0f / (float)(engine->cfg.hot_confirm_cycles + 1);
 
     /* Per-function monitoring state, private to this thread. */
-    uint64_t *prev_cnt        = calloc(max_funcs, sizeof(uint64_t));
-    uint32_t *hot_streak      = calloc(max_funcs, sizeof(uint32_t));
-    uint64_t *cnt_at_compile  = calloc(max_funcs, sizeof(uint64_t));
-    uint64_t *last_queued_ms  = calloc(max_funcs, sizeof(uint64_t));
+    uint64_t *prev_cnt       = calloc(max_funcs, sizeof(uint64_t));
+    float    *ema_rate       = calloc(max_funcs, sizeof(float));
+    uint64_t *cnt_at_compile = calloc(max_funcs, sizeof(uint64_t));
+    uint64_t *last_queued_ms = calloc(max_funcs, sizeof(uint64_t));
+    bool     *prefetch_done  = calloc(max_funcs, sizeof(bool));
 
-    if (!prev_cnt || !hot_streak || !cnt_at_compile || !last_queued_ms) {
-        free(prev_cnt); free(hot_streak);
-        free(cnt_at_compile); free(last_queued_ms);
+    /* Free all on partial allocation failure (free(NULL) is a no-op). */
+    if (!prev_cnt || !ema_rate || !cnt_at_compile ||
+        !last_queued_ms || !prefetch_done) {
+        free(prev_cnt); free(ema_rate); free(cnt_at_compile);
+        free(last_queued_ms); free(prefetch_done);
         return NULL;
     }
 
@@ -461,8 +479,11 @@ static void *monitor_thread_fn(void *arg)
     interval.tv_sec  = itvl_ms / 1000;
     interval.tv_nsec = (long)(itvl_ms % 1000) * 1000000L;
 
-    /* Safe division: avoid divide-by-zero if interval_ms somehow 0. */
-    uint32_t itvl_safe = itvl_ms > 0 ? itvl_ms : 1;
+    /* Low-watermark rate at which we prefetch COLD IR: 10 % of the T1 gate.
+     * This is intentionally generous — prefetch is cheap and cancels itself
+     * if the function never becomes truly hot. */
+    uint64_t prefetch_rate_threshold = engine->cfg.hot_rate_t1 / 10;
+    if (prefetch_rate_threshold == 0) prefetch_rate_threshold = 1;
 
     while (!atomic_load_explicit(&engine->stop_requested, memory_order_acquire)) {
         nanosleep(&interval, NULL);
@@ -474,26 +495,32 @@ static void *monitor_thread_fn(void *arg)
         for (uint32_t i = 0; i < n; ++i) {
             func_table_entry_t *entry = &engine->ftable->entries[i];
 
-            /* Read current call count (relaxed – approximation is fine). */
+            /* ── Update EMA ────────────────────────────────────────────── */
             uint64_t cur_cnt = atomic_load_explicit(&entry->call_cnt,
                                                      memory_order_relaxed);
             uint64_t delta   = cur_cnt - prev_cnt[i];
             prev_cnt[i]      = cur_cnt;
 
-            /* calls per second over this interval */
-            uint64_t rate = delta * 1000ULL / itvl_safe;
+            uint64_t inst_rate = delta * 1000ULL / itvl_safe;  /* calls/sec */
+            ema_rate[i] = ema_rate[i] + alpha * ((float)inst_rate - ema_rate[i]);
 
             opt_level_t cur_level =
                 (opt_level_t)atomic_load_explicit(&entry->cur_level,
                                                    memory_order_relaxed);
 
-            /* Already at maximum tier – nothing to do. */
-            if (cur_level >= OPT_O3) {
-                hot_streak[i] = 0;
-                continue;
+            /* Already at maximum tier. */
+            if (cur_level >= OPT_O3) continue;
+
+            /* ── Warm-up prefetch (one-shot, non-blocking) ─────────────── */
+            if (!prefetch_done[i] && engine->ir_cache &&
+                (uint64_t)ema_rate[i] >= prefetch_rate_threshold &&
+                ir_cache_get_generation(engine->ir_cache, (func_id_t)i)
+                    == 2 /* IR_GEN_COLD */) {
+                if (ir_cache_prefetch(engine->ir_cache, (func_id_t)i))
+                    prefetch_done[i] = true;
             }
 
-            /* Determine target tier and required rate threshold. */
+            /* ── Tier promotion gate ────────────────────────────────────── */
             opt_level_t target;
             uint64_t    rate_thresh;
             if (cur_level < OPT_O2) {
@@ -504,35 +531,31 @@ static void *monitor_thread_fn(void *arg)
                 rate_thresh = engine->cfg.hot_rate_t2;
             }
 
-            /* Rate gate: must sustain above threshold for hot_confirm_cycles. */
-            if (rate >= rate_thresh) {
-                if (hot_streak[i] < engine->cfg.hot_confirm_cycles)
-                    hot_streak[i]++;
-            } else {
-                hot_streak[i] = 0;   /* any cold cycle resets the streak */
-                continue;
-            }
+            /* EMA must be above the rate threshold. */
+            if ((uint64_t)ema_rate[i] < rate_thresh) continue;
 
-            if (hot_streak[i] < engine->cfg.hot_confirm_cycles)
-                continue;            /* not yet confident enough */
+            /* Adaptive cooloff: max(cfg.compile_cooloff_ms,
+             *                       2 × last_compile_duration_ms). */
+            uint32_t last_dur = atomic_load_explicit(
+                &entry->last_compile_duration_ms, memory_order_relaxed);
+            uint32_t effective_cooloff = engine->cfg.compile_cooloff_ms;
+            if (last_dur * 2 > effective_cooloff)
+                effective_cooloff = last_dur * 2;
 
-            /* Cooloff gate: don't thrash recompilation. */
-            if ((now - last_queued_ms[i]) < engine->cfg.compile_cooloff_ms)
-                continue;
+            if ((now - last_queued_ms[i]) < effective_cooloff) continue;
 
-            /* T2-only gate: require enough calls since the O2 compilation. */
+            /* T2-only gate: require enough calls since O2 compilation. */
             if (target == OPT_O3) {
                 uint64_t calls_since = cur_cnt - cnt_at_compile[i];
-                if (calls_since < engine->cfg.min_calls_for_tier2)
-                    continue;
+                if (calls_since < engine->cfg.min_calls_for_tier2) continue;
             }
 
-            /* All gates passed – try to enqueue. */
+            /* ── Enqueue ────────────────────────────────────────────────── */
             bool expected = false;
             if (!atomic_compare_exchange_strong_explicit(
                     &entry->in_queue, &expected, true,
                     memory_order_relaxed, memory_order_relaxed))
-                continue;   /* already queued */
+                continue;
 
             compile_task_t task = {
                 .func_id      = entry->id,
@@ -540,32 +563,28 @@ static void *monitor_thread_fn(void *arg)
                 .priority     = (target == OPT_O3) ? 2 : 1,
                 .version_req  = atomic_load_explicit(&entry->version,
                                                       memory_order_relaxed),
-                .call_rate    = rate,
+                .call_rate    = (uint64_t)ema_rate[i],
             };
 
             if (!engine_enqueue_task(engine, &task)) {
-                /* Queue full: clear in_queue so we retry next scan. */
                 atomic_store_explicit(&entry->in_queue, false,
                                       memory_order_relaxed);
             } else {
-                cnt_at_compile[i] = cur_cnt;
-                last_queued_ms[i] = now;
-                hot_streak[i]     = 0;  /* reset; re-confirm before next tier */
+                cnt_at_compile[i]  = cur_cnt;
+                last_queued_ms[i]  = now;
+                prefetch_done[i]   = false;  /* reset for next tier */
                 if (engine->cfg.verbose)
                     fprintf(stderr,
                             "[cjit/monitor] enqueued '%s' for O%d "
-                            "(rate=%llucps streak=%u)\n",
+                            "(ema=%.0fcps cooloff=%ums)\n",
                             entry->name, (int)target,
-                            (unsigned long long)rate,
-                            engine->cfg.hot_confirm_cycles);
+                            (double)ema_rate[i], effective_cooloff);
             }
         }
     }
 
-    free(prev_cnt);
-    free(hot_streak);
-    free(cnt_at_compile);
-    free(last_queued_ms);
+    free(prev_cnt); free(ema_rate); free(cnt_at_compile);
+    free(last_queued_ms); free(prefetch_done);
     return NULL;
 }
 
@@ -582,6 +601,8 @@ cjit_config_t cjit_default_config(void)
      * available for the caller.  Clamped to [1, CJIT_COMPILER_THREADS].
      * Falls back to 1 when sysconf fails.
      */
+    /* sysconf returns -1 on error; (ncpu > 1) handles -1, 0, 1 correctly,
+     * all of which fall back to nthreads = 1 via the ternary. */
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     uint32_t nthreads = (ncpu > 1) ? (uint32_t)(ncpu - 1) : 1;
     if (nthreads > CJIT_COMPILER_THREADS) nthreads = CJIT_COMPILER_THREADS;
@@ -592,12 +613,13 @@ cjit_config_t cjit_default_config(void)
     cfg.grace_period_ms     = CJIT_GRACE_PERIOD_MS;
     cfg.monitor_interval_ms = 50;
 
-    /* Hot-function detection (confidence-based). */
-    cfg.hot_rate_t1         = 1000;   /* calls/sec to trigger O2 */
-    cfg.hot_rate_t2         = 5000;   /* calls/sec to trigger O3 */
-    cfg.hot_confirm_cycles  = 3;      /* consecutive hot scans before promoting */
-    cfg.min_calls_for_tier2 = 2000;   /* min calls since O2 before trying O3 */
-    cfg.compile_cooloff_ms  = 500;    /* min ms between promotions */
+    /* Hot-function detection (EMA-based confidence). */
+    cfg.hot_rate_t1         = CJIT_DEFAULT_HOT_RATE_T1;
+    cfg.hot_rate_t2         = CJIT_DEFAULT_HOT_RATE_T2;
+    cfg.hot_confirm_cycles  = CJIT_DEFAULT_HOT_CONFIRM_CYCLES;
+    cfg.min_calls_for_tier2 = CJIT_DEFAULT_MIN_CALLS_T2;
+    cfg.compile_cooloff_ms  = CJIT_DEFAULT_COMPILE_COOLOFF_MS;
+    cfg.io_threads          = CJIT_DEFAULT_IO_THREADS;
 
     cfg.enable_inlining      = true;
     cfg.enable_vectorization = true;
@@ -645,6 +667,7 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
         .mem_low_pct           = e->cfg.mem_pressure_low_pct,
         .mem_high_pct          = e->cfg.mem_pressure_high_pct,
         .mem_critical_pct      = e->cfg.mem_pressure_critical_pct,
+        .num_io_threads        = e->cfg.io_threads,
     };
     e->ir_cache = ir_cache_create(&icc);
     if (!e->ir_cache) { func_table_destroy(e->ftable); free(e); return NULL; }
@@ -739,7 +762,10 @@ void cjit_destroy(cjit_engine_t *engine)
                                        memory_order_relaxed);
     for (uint32_t i = 0; i < n; ++i) {
         func_table_entry_t *entry = &engine->ftable->entries[i];
-        if (entry->dl_handle) { dlclose(entry->dl_handle); entry->dl_handle = NULL; }
+        if (entry->dl_handle) {
+            dlclose(entry->dl_handle);
+            entry->dl_handle = NULL;
+        }
     }
 
     func_table_destroy(engine->ftable);

@@ -202,9 +202,11 @@ uint32_t dgc_sweep(deferred_gc_t *dgc, bool force)
             atomic_fetch_add_explicit(&dgc->total_freed, 1, memory_order_relaxed);
             free(list);
         } else {
-            /* Not yet ready: compute remaining lifetime. */
-            uint64_t age       = now - list->retire_ms;
-            uint32_t remaining = (uint32_t)(dgc->grace_period_ms - age);
+            /* Not yet ready: compute remaining lifetime with underflow guard. */
+            uint64_t age = now - list->retire_ms;
+            uint32_t remaining = (age < dgc->grace_period_ms)
+                                     ? (uint32_t)(dgc->grace_period_ms - age)
+                                     : 1u; /* defensive: treat as almost ready */
             if (min_remaining == 0 || remaining < min_remaining)
                 min_remaining = remaining;
 

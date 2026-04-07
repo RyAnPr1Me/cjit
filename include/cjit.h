@@ -73,6 +73,30 @@ extern "C" {
 /** Milliseconds to keep a retired function handle alive before dlclose. */
 #define CJIT_GRACE_PERIOD_MS    100
 
+/* ── Hot-function detection defaults ──────────────────────────────────────── */
+
+/** Default minimum sustained calls/sec to trigger O2 compilation. */
+#define CJIT_DEFAULT_HOT_RATE_T1        1000ULL
+
+/** Default minimum sustained calls/sec to trigger O3 compilation. */
+#define CJIT_DEFAULT_HOT_RATE_T2        5000ULL
+
+/**
+ * Default EMA smoothing: number of scan cycles whose equivalent weight is
+ * used to compute α = 2 / (CJIT_DEFAULT_HOT_CONFIRM_CYCLES + 1).
+ * A value of 3 gives α = 0.5; a single cold scan drops the EMA by 50%.
+ */
+#define CJIT_DEFAULT_HOT_CONFIRM_CYCLES 3U
+
+/** Default minimum calls since last O2 compilation before trying O3. */
+#define CJIT_DEFAULT_MIN_CALLS_T2       2000ULL
+
+/** Default minimum ms between tier promotions of the same function. */
+#define CJIT_DEFAULT_COMPILE_COOLOFF_MS 500U
+
+/** Default number of async I/O threads for IR prefetch (inside ir_cache). */
+#define CJIT_DEFAULT_IO_THREADS         2U
+
 /* ══════════════════════════════ public types ══════════════════════════════ */
 
 /** Opaque JIT engine handle. */
@@ -208,12 +232,31 @@ typedef struct {
      * Minimum milliseconds that must elapse between consecutive promotion
      * attempts for the same function (cooloff period).
      *
-     * Prevents compilation thrashing when the call rate oscillates around
-     * a threshold boundary.
+     * The monitor also enforces max(compile_cooloff_ms, 2 × last_compile_duration_ms)
+     * so that re-enqueuing cannot happen before the previous compilation has
+     * likely completed.  last_compile_duration_ms is written by the background
+     * compiler thread into the function-table entry — zero hot-path overhead.
      *
-     * Default: 500 ms.
+     * Default: CJIT_DEFAULT_COMPILE_COOLOFF_MS (500 ms).
      */
     uint32_t compile_cooloff_ms;
+
+    /**
+     * Number of background I/O threads dedicated to async IR prefetch.
+     *
+     * When the monitor observes a function's call rate crossing hot_rate_t1/10
+     * for the first time and the function's IR is COLD (on disk only), it
+     * submits a non-blocking prefetch request.  An I/O thread loads the IR
+     * from disk into the WARM generation so that by the time hot_confirm_cycles
+     * scan cycles later the compile task fires, the IR is already in memory —
+     * hiding disk-read latency from the compiler thread entirely.
+     *
+     * Setting this to 0 disables async prefetch (reads happen synchronously
+     * in the compiler thread, as before).
+     *
+     * Default: CJIT_DEFAULT_IO_THREADS (2).
+     */
+    uint32_t io_threads;
 } cjit_config_t;
 
 /* ══════════════════════════════ runtime stats ═════════════════════════════ */

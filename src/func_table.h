@@ -89,6 +89,16 @@ typedef struct {
     void                       *dl_handle;  /**< dlopen handle of current .so.  */
     func_id_t                   id;         /**< Self-reference for convenience.*/
     atomic_bool                 in_queue;   /**< True if already enqueued.      */
+    /**
+     * How long (ms) the most recent compilation of this function took.
+     *
+     * Written by the compiler thread after each compilation (relaxed store).
+     * Read by the monitor thread (relaxed load) to compute an adaptive
+     * cooloff: max(cfg.compile_cooloff_ms, 2 × last_compile_duration_ms).
+     * This prevents re-enqueuing before the previous compile has likely
+     * completed.  Zero overhead on the hot path.
+     */
+    atomic_uint_fast32_t        last_compile_duration_ms;
     pthread_mutex_t             compile_lock; /**< Serialises concurrent compiles.*/
     char                        name[CJIT_NAME_MAX]; /**< Function symbol name. */
 } func_table_entry_t;
