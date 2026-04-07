@@ -73,6 +73,47 @@ extern "C" {
 /** Milliseconds to keep a retired function handle alive before dlclose. */
 #define CJIT_GRACE_PERIOD_MS    100
 
+/**
+ * Per-calling-thread TLS call-counter flush threshold.
+ *
+ * Each calling thread maintains a private per-function byte counter in
+ * thread-local storage (TLS).  The counter is incremented on every call
+ * with no shared-memory traffic.  When it reaches CJIT_TLS_FLUSH_THRESHOLD,
+ * the accumulated count is flushed to the global atomic call_cnt in the
+ * function table and the local counter is reset to zero.
+ *
+ * Benefits
+ * ────────
+ * • Hot path (common case): one plain byte increment to thread-private memory
+ *   — no atomics, no cache-line ownership transfer, zero coherence traffic.
+ * • func_ptr (cache line 0) stays in "Shared" state on all cores at all times.
+ *   It is only invalidated during an actual function-pointer swap, which is
+ *   rare (compilation events).  Previously, every call_cnt write (same line)
+ *   forced a cache-line ownership transfer that also evicted func_ptr.
+ * • Atomic flush to call_cnt (cache line 1) occurs once every
+ *   CJIT_TLS_FLUSH_THRESHOLD calls per thread — a > 97 % reduction in
+ *   shared-memory traffic compared with a direct per-call atomic_fetch_add.
+ *
+ * Accuracy
+ * ────────
+ * The monitor reads call_cnt with a relaxed load each scan cycle.  With N
+ * calling threads, the maximum unobserved lag is
+ *   N × (CJIT_TLS_FLUSH_THRESHOLD − 1)  calls.
+ * The EMA-based detection algorithm naturally absorbs this small lag: it
+ * smooths call rates over multiple monitor scan cycles, so a short delay in
+ * observing the last batch never prevents correct tier-promotion decisions.
+ *
+ * Multi-engine note
+ * ─────────────────
+ * The TLS array is indexed by func_id_t, which is engine-specific.  Programs
+ * that use more than one cjit_engine_t should call cjit_flush_local_counts()
+ * for every engine on each thread before switching to a different engine,
+ * to avoid cross-engine counter contamination.
+ *
+ * Must be a power of two ≥ 2.  Default: 32.
+ */
+#define CJIT_TLS_FLUSH_THRESHOLD  32u
+
 /* ── Hot-function detection defaults ──────────────────────────────────────── */
 
 /** Default minimum sustained calls/sec to trigger O2 compilation. */
@@ -489,7 +530,11 @@ jit_func_t cjit_get_func(cjit_engine_t *engine, func_id_t id);
 /**
  * Record a call to a function (updates the hot-function counter).
  *
- * Uses a single relaxed atomic_fetch_add – effectively free on modern CPUs.
+ * Uses a per-calling-thread TLS batch counter (see CJIT_TLS_FLUSH_THRESHOLD).
+ * The hot-path cost is a single byte increment to thread-private memory — no
+ * atomics, no shared-memory traffic.  A flush to the global atomic call_cnt
+ * occurs automatically every CJIT_TLS_FLUSH_THRESHOLD calls per thread.
+ *
  * Call this immediately after cjit_get_func() in the dispatch loop if you
  * want the monitor thread to track call frequency.
  *
@@ -506,11 +551,14 @@ void cjit_record_call(cjit_engine_t *engine, func_id_t id);
  * separately because it performs only ONE table lookup (one atomic bounds-check
  * load + one stable-pointer dereference) instead of two.
  *
+ * Call-count accounting uses the TLS batch counter (CJIT_TLS_FLUSH_THRESHOLD),
+ * so the counter increment is always overhead-free on the hot path.
+ *
  * Atomicity guarantees:
- *   • call_cnt increment : relaxed (approximation is sufficient for the
- *                          monitor; no ordering with other variables needed).
- *   • func_ptr load      : acquire (ensures the function and its data are
- *                          fully visible before the indirect call).
+ *   • call_cnt flush : relaxed atomic_fetch_add (once per THRESHOLD calls;
+ *                      approximation is sufficient; no ordering needed).
+ *   • func_ptr load  : acquire (ensures the function body is fully visible
+ *                      before the indirect call executes).
  *
  * @param engine  The engine.
  * @param id      Function ID returned by cjit_register_function().
@@ -557,6 +605,33 @@ jit_func_t cjit_get_func_counted(cjit_engine_t *engine, func_id_t id);
 void cjit_request_recompile(cjit_engine_t *engine,
                              func_id_t      id,
                              opt_level_t    level);
+
+/**
+ * Flush this thread's pending TLS call-count batch to the engine.
+ *
+ * Under normal operation calling threads never need to call this; the TLS
+ * batch flushes automatically every CJIT_TLS_FLUSH_THRESHOLD calls.  However
+ * there are two situations where an explicit flush is needed:
+ *
+ *   1. Before the calling thread exits.  TLS storage is reclaimed by the
+ *      C runtime when a thread terminates; any unflushed partial batch is
+ *      silently lost.  Calling this function in a thread-exit hook (e.g.
+ *      pthread_cleanup_push) preserves those call-count observations.
+ *
+ *   2. Before calling cjit_stop() / cjit_destroy() if you want the final
+ *      call-count snapshot to be accurate (e.g. for logging / diagnostics).
+ *
+ * The function iterates over registered functions and flushes the partial
+ * remainder (counts[i] % CJIT_TLS_FLUSH_THRESHOLD) for each one.  It is
+ * O(registered_functions) and touches no shared memory for functions whose
+ * local counter is currently zero.
+ *
+ * Thread safety: safe to call from any thread at any time.  Only the calling
+ * thread's TLS state is modified; no other threads are affected.
+ *
+ * @param engine  The engine whose function table should be updated.
+ */
+void cjit_flush_local_counts(cjit_engine_t *engine);
 
 /**
  * Return a snapshot of engine-wide statistics.

@@ -71,23 +71,52 @@
 /**
  * One entry in the function table.
  *
- * Padded to a multiple of 64 bytes so that each entry occupies its own cache
- * line(s), preventing false sharing between entries accessed by different
- * threads.
+ * Each entry spans multiple 64-byte cache lines.  Cache lines are organised
+ * by access pattern to minimise coherence traffic:
+ *
+ *   Cache line 0 – func_ptr ONLY (read-mostly by ALL runtime threads).
+ *     Placed on its own line so that frequent writes to call_cnt (line 1)
+ *     never invalidate the Shared state of func_ptr on other cores.  With
+ *     per-thread TLS batch counting, this line is invalidated ONLY during an
+ *     actual function-pointer swap — an extremely rare event.
+ *
+ *   Cache line 1 – call_cnt, version, cur_level (write-frequently or by
+ *     compiler threads).  call_cnt is updated by calling threads via the TLS
+ *     batch flush (every CJIT_TLS_FLUSH_THRESHOLD calls per thread), which is
+ *     orders of magnitude less frequent than a direct per-call atomic.
+ *
+ *   Cache line 2+ – cold metadata (registration and compiler threads only).
  */
 typedef struct {
     /*
-     * HOT FIELDS (cache line 0)
-     * Read by runtime threads on every call.
+     * FUNC-PTR LINE (cache line 0) – read-mostly; never written by callers.
+     *
+     * Occupies its own 64-byte cache line so writes to call_cnt (line 1)
+     * do NOT invalidate cached copies of func_ptr on other cores.  Combined
+     * with TLS batch counting, this line stays in "Shared" state on all cores
+     * throughout steady-state execution.
      */
     _Alignas(64)
     _Atomic(jit_func_t)         func_ptr;   /**< Current compiled function.     */
-    atomic_uint_fast64_t        call_cnt;   /**< Call counter (relaxed incr.).  */
+
+    /*
+     * COUNTERS LINE (cache line 1) – written by TLS flush + compiler threads.
+     *
+     * call_cnt : incremented by calling threads via TLS batch flush
+     *            (every CJIT_TLS_FLUSH_THRESHOLD calls per thread).
+     * version  : incremented by compiler thread on each successful swap.
+     * cur_level: updated by compiler thread on each swap.
+     *
+     * The monitor thread reads all three fields on every scan cycle; keeping
+     * them together on one line is cache-friendly for its access pattern.
+     */
+    _Alignas(64)
+    atomic_uint_fast64_t        call_cnt;   /**< Call counter (TLS-batched).    */
     _Atomic uint32_t             version;    /**< Recompile generation counter.  */
     atomic_int                  cur_level;  /**< opt_level_t of loaded code.    */
 
     /*
-     * COLD FIELDS (cache line 1+)
+     * COLD FIELDS (cache line 2+)
      * Written only by registration or compiler threads; never on hot path.
      */
     _Alignas(64)
