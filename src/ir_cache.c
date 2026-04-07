@@ -481,7 +481,7 @@ ir_lru_cache_t *ir_cache_create(const ir_cache_config_t *cfg)
     /* I/O prefetch pool – initialise FIFO and start threads. */
     pthread_mutex_init(&cache->pf_mutex, NULL);
     pthread_cond_init(&cache->pf_cond, NULL);
-    cache->pf_head = cache->pf_tail = cache->pf_count = 0;
+    cache->pf_head = cache->pf_count = 0;
 
     cache->num_io_threads = cfg->num_io_threads ? cfg->num_io_threads : 2;
     cache->io_threads = calloc(cache->num_io_threads, sizeof(pthread_t));

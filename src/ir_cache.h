@@ -61,6 +61,11 @@
 
 /* ═══════════════════════════ per-function node ════════════════════════════ */
 
+/** IR generation tags. */
+#define IRC_GEN_HOT  ((uint8_t)0)  /**< In memory; most-recently-used tier.  */
+#define IRC_GEN_WARM ((uint8_t)1)  /**< In memory; less-recently-used tier.  */
+#define IRC_GEN_COLD ((uint8_t)2)  /**< On disk only; IR freed from heap.    */
+
 /**
  * One LRU node per registered function.
  *
@@ -157,7 +162,7 @@ typedef struct {
      */
 #define IRC_PREFETCH_CAP 128u
     func_id_t        pf_buf[IRC_PREFETCH_CAP]; /**< Ring-buffer of func ids.   */
-    uint32_t         pf_head, pf_tail, pf_count;
+    uint32_t         pf_head, pf_count;
     pthread_mutex_t  pf_mutex;
     pthread_cond_t   pf_cond;
 

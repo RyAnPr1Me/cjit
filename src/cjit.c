@@ -515,7 +515,7 @@ static void *monitor_thread_fn(void *arg)
             if (!prefetch_done[i] && engine->ir_cache &&
                 (uint64_t)ema_rate[i] >= prefetch_rate_threshold &&
                 ir_cache_get_generation(engine->ir_cache, (func_id_t)i)
-                    == 2 /* IR_GEN_COLD */) {
+                    == IRC_GEN_COLD) {
                 if (ir_cache_prefetch(engine->ir_cache, (func_id_t)i))
                     prefetch_done[i] = true;
             }
@@ -599,10 +599,9 @@ cjit_config_t cjit_default_config(void)
     /*
      * Default compiler thread count: (online CPUs - 1) so one CPU is always
      * available for the caller.  Clamped to [1, CJIT_COMPILER_THREADS].
-     * Falls back to 1 when sysconf fails.
+     * sysconf returns -1 on error; (ncpu > 1) handles -1, 0, and 1 correctly —
+     * all fall back to nthreads = 1 via the ternary.
      */
-    /* sysconf returns -1 on error; (ncpu > 1) handles -1, 0, 1 correctly,
-     * all of which fall back to nthreads = 1 via the ternary. */
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     uint32_t nthreads = (ncpu > 1) ? (uint32_t)(ncpu - 1) : 1;
     if (nthreads > CJIT_COMPILER_THREADS) nthreads = CJIT_COMPILER_THREADS;
