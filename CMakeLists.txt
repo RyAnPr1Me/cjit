@@ -44,6 +44,14 @@ add_executable(cjit src/cli.c)
 target_link_libraries(cjit PRIVATE cjit_lib)
 target_compile_definitions(cjit PRIVATE _GNU_SOURCE)
 
+# ─────────────────────────── integration tests ────────────────────────────
+add_executable(test_jit tests/test_jit.c)
+target_link_libraries(test_jit PRIVATE cjit_lib)
+target_compile_definitions(test_jit PRIVATE _GNU_SOURCE)
+
+enable_testing()
+add_test(NAME jit_suite COMMAND test_jit)
+
 # ─────────────────────────── install ──────────────────────────────────────
 install(TARGETS cjit RUNTIME DESTINATION bin)
 install(DIRECTORY include/ DESTINATION include/cjit)

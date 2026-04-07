@@ -37,12 +37,26 @@
  * Optimisation flags by tier
  * ──────────────────────────
  *   OPT_NONE : -O0
- *   OPT_O1   : -O1
- *   OPT_O2   : -O2 -finline-functions -fno-semantic-interposition
- *   OPT_O3   : -O3 -finline-functions -funroll-loops -ftree-vectorize
- *              -fomit-frame-pointer -fno-semantic-interposition
+ *   OPT_O1   : -O1 -fomit-frame-pointer -fno-semantic-interposition
+ *   OPT_O2   : -O2 -fomit-frame-pointer -fno-semantic-interposition
+ *              -finline-functions -funroll-loops -ftree-vectorize
+ *   OPT_O3   : -O3 -fomit-frame-pointer -fno-semantic-interposition
+ *              -finline-functions -funroll-loops -ftree-vectorize
  *              -march=native        (if enable_native_arch)
  *              -ffast-math          (if enable_fast_math)
+ *
+ * Applied at every tier (including OPT_NONE):
+ *   -fno-stack-protector        removes stack-canary overhead
+ *   -fno-asynchronous-unwind-tables  omits .eh_frame (smaller .so,
+ *                                    faster dlopen, better I-cache)
+ *
+ * Source file delivery
+ * ────────────────────
+ * On Linux, the C source string is written to an anonymous in-memory file
+ * created with memfd_create(2) and passed to the compiler via its
+ * /proc/self/fd/<fd> path.  This avoids any filesystem writes for the
+ * source step: no tmpfs inode, no directory entry, no unlink.  On non-Linux
+ * systems (or when memfd_create fails) a traditional /tmp tmpfile is used.
  *
  * Additionally the following hint macros are injected into every translation
  * unit at the top of the source:
@@ -66,6 +80,7 @@
 
 #include <stdbool.h>
 #include "../include/cjit.h"  /* opt_level_t, jit_func_t */
+#include "arg_profile.h"      /* cjit_arg_profile_t */
 
 /* ─────────────────────────── result type ───────────────────────────────────── */
 
@@ -89,6 +104,19 @@ typedef struct {
     bool enable_native_arch;   /**< -march=native (only at OPT_O3)             */
     bool enable_fast_math;     /**< -ffast-math   (only at OPT_O3)             */
     bool verbose;              /**< Print compiler command to stderr            */
+
+    /**
+     * Optional argument profile for specialisation.
+     *
+     * When non-NULL and the profile contains at least one argument slot with
+     * a confident dominant value, codegen_compile() prepends a specialised
+     * wrapper to the user's source and renames the original function via a
+     * -D preprocessor flag.  The wrapper fast-paths the common argument value
+     * through an inlined call that GCC/Clang can constant-fold.
+     *
+     * NULL (the default) disables argument specialisation entirely.
+     */
+    const cjit_arg_profile_t  *arg_profile;
 } codegen_opts_t;
 
 /* ─────────────────────────── API ───────────────────────────────────────────── */

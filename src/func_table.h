@@ -18,6 +18,9 @@
  *   • dl_handle – dlopen handle of the currently loaded shared object; the
  *                 compiler thread stores this so it can be retired (via
  *                 deferred_gc) when the pointer is swapped out.
+ *   • arg_profile – statistical profile of argument values observed at call
+ *                 sites (populated via CJIT_SAMPLE_ARGS; used by codegen to
+ *                 generate specialised function wrappers).
  *
  * Hot path (read, called by runtime threads):
  *   jit_func_t f = atomic_load_explicit(&entry->func_ptr, memory_order_acquire);
@@ -54,6 +57,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include "../include/cjit.h"
+#include "arg_profile.h"
 
 /* ─────────────────────────── constants ─────────────────────────────────────── */
 
@@ -71,23 +75,56 @@
 /**
  * One entry in the function table.
  *
- * Padded to a multiple of 64 bytes so that each entry occupies its own cache
- * line(s), preventing false sharing between entries accessed by different
- * threads.
+ * Each entry spans multiple 64-byte cache lines.  Cache lines are organised
+ * by access pattern to minimise coherence traffic:
+ *
+ *   Cache line 0 – func_ptr ONLY (read-mostly by ALL runtime threads).
+ *     Placed on its own line so that frequent writes to call_cnt (line 1)
+ *     never invalidate the Shared state of func_ptr on other cores.  With
+ *     per-thread TLS batch counting, this line is invalidated ONLY during an
+ *     actual function-pointer swap — an extremely rare event.
+ *
+ *   Cache line 1 – call_cnt, version, cur_level (written infrequently, by
+ *     calling threads via TLS flush or by compiler threads).  call_cnt is
+ *     updated every CJIT_TLS_FLUSH_THRESHOLD calls per thread — orders of
+ *     magnitude less frequent than a direct per-call atomic.
+ *
+ *   Cache line 2+ – cold metadata (registration and compiler threads only).
  */
 typedef struct {
     /*
-     * HOT FIELDS (cache line 0)
-     * Read by runtime threads on every call.
+     * FUNC-PTR LINE (cache line 0) – read-mostly; never written by callers.
+     *
+     * Occupies its own 64-byte cache line so writes to call_cnt (line 1)
+     * do NOT invalidate cached copies of func_ptr on other cores.  Combined
+     * with TLS batch counting, this line stays in "Shared" state on all cores
+     * throughout steady-state execution.
      */
     _Alignas(64)
     _Atomic(jit_func_t)         func_ptr;   /**< Current compiled function.     */
-    atomic_uint_fast64_t        call_cnt;   /**< Call counter (relaxed incr.).  */
-    _Atomic uint32_t             version;    /**< Recompile generation counter.  */
-    atomic_int                  cur_level;  /**< opt_level_t of loaded code.    */
 
     /*
-     * COLD FIELDS (cache line 1+)
+     * COUNTERS LINE (cache line 1) – written by TLS flush + compiler threads.
+     *
+     * call_cnt         : incremented by calling threads via TLS batch flush
+     *                    (every CJIT_TLS_FLUSH_THRESHOLD calls per thread).
+     * total_elapsed_ns : cumulative nanoseconds spent inside this function,
+     *                    flushed from the per-thread TLS accumulator alongside
+     *                    call_cnt.  Zero until CJIT_DISPATCH_TIMED is used.
+     * version          : incremented by compiler thread on each successful swap.
+     * cur_level        : updated by compiler thread on each swap.
+     *
+     * The monitor thread reads all four fields on every scan cycle; keeping
+     * them together on one line is cache-friendly for its access pattern.
+     */
+    _Alignas(64)
+    atomic_uint_fast64_t        call_cnt;         /**< Call counter (TLS-batched).       */
+    atomic_uint_fast64_t        total_elapsed_ns; /**< Cumulative ns (TLS-batched).      */
+    _Atomic uint32_t             version;          /**< Recompile generation counter.     */
+    atomic_int                  cur_level;        /**< opt_level_t of loaded code.       */
+
+    /*
+     * COLD FIELDS (cache line 2+)
      * Written only by registration or compiler threads; never on hot path.
      */
     _Alignas(64)
@@ -120,6 +157,19 @@ typedef struct {
     _Atomic uint32_t             recompile_count;
     pthread_mutex_t             compile_lock; /**< Serialises concurrent compiles.*/
     char                        name[CJIT_NAME_MAX]; /**< Function symbol name. */
+
+    /**
+     * Argument-value profile (populated by CJIT_SAMPLE_ARGS).
+     *
+     * Written by calling threads at the TLS-flush sample boundary (once per
+     * CJIT_TLS_FLUSH_THRESHOLD calls per thread); read by the compiler thread
+     * during codegen_compile() to decide whether to generate a specialised
+     * wrapper.  Access is intentionally lock-free: the data is statistical
+     * and a momentarily inconsistent snapshot causes no safety issue — the
+     * compiler simply falls back to unspecialised compilation if the snapshot
+     * looks ambiguous.
+     */
+    cjit_arg_profile_t          arg_profile;
 } func_table_entry_t;
 
 /* ─────────────────────────── table ─────────────────────────────────────────── */
