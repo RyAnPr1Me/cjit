@@ -97,6 +97,56 @@ extern "C" {
 /** Default number of async I/O threads for IR prefetch (inside ir_cache). */
 #define CJIT_DEFAULT_IO_THREADS         2U
 
+/**
+ * Default hard cap on per-function JIT recompilations.
+ *
+ * Once a function has been recompiled this many times the monitor stops
+ * promoting it entirely, preventing infinite recompilation loops.  The
+ * practical maximum useful tier promotions are OPT_O2 and OPT_O3, so the
+ * default of 8 leaves significant headroom for manual recompile requests.
+ */
+#define CJIT_DEFAULT_MAX_RECOMPILES     8U
+
+/**
+ * Default rate-threshold scale factor per recompile (percent).
+ *
+ * The effective EMA rate threshold = base × (1 + recompile_count × pct/100).
+ * At the default of 50%:
+ *   0 recompiles → 1.0× base    (no extra evidence needed yet)
+ *   1 recompile  → 1.5× base    (must be 50% hotter than the original gate)
+ *   2 recompiles → 2.0× base
+ *   4 recompiles → 3.0× base
+ * This ensures each successive recompile is only triggered when the call
+ * rate is meaningfully higher than the previous trigger level, preventing
+ * oscillation and cache thrashing for tiny potential gains.
+ */
+#define CJIT_DEFAULT_RECOMPILE_RATE_SCALE_PCT  50U
+
+/**
+ * Default minimum engine uptime (ms) before O3 compilations are allowed.
+ *
+ * Programs exhibit call-pattern spikes in the first few seconds (class
+ * loading, JIT-compiler warmup, application init).  Suppressing O3 during
+ * this window prevents expensive compilations triggered by transient
+ * startup hotness that will never recur in steady state.
+ *
+ * Default: 5 000 ms (5 seconds).
+ */
+#define CJIT_DEFAULT_MIN_UPTIME_T2_MS          5000U
+
+/**
+ * Default extra required consecutive-above-threshold scan cycles per
+ * recompile count.
+ *
+ * Required stability streak = hot_confirm_cycles + recompile_count × N.
+ * At N = 2: after 3 recompiles the monitor needs 6 more consecutive
+ * above-threshold scans than the baseline hot_confirm_cycles.  This
+ * ensures that each successive promotion requires a proportionally
+ * longer window of observed sustained hotness, preventing decisions
+ * based on insufficient data.
+ */
+#define CJIT_DEFAULT_EXTRA_STREAK_PER_RECOMPILE  2U
+
 /* ══════════════════════════════ public types ══════════════════════════════ */
 
 /** Opaque JIT engine handle. */
@@ -257,6 +307,66 @@ typedef struct {
      * Default: CJIT_DEFAULT_IO_THREADS (2).
      */
     uint32_t io_threads;
+
+    /* ── Data-driven recompile throttling ───────────────────────────────── */
+
+    /**
+     * Hard cap on the number of successful JIT recompilations per function.
+     *
+     * Once a function's recompile_count reaches this limit the monitor
+     * stops promoting it entirely, preventing endless recompilation loops
+     * and DL-cache thrashing for progressively smaller gains.  Manual
+     * cjit_request_recompile() calls are not affected by this limit.
+     *
+     * Default: CJIT_DEFAULT_MAX_RECOMPILES (8).
+     */
+    uint32_t max_recompiles_per_func;
+
+    /**
+     * Percentage by which the effective EMA rate threshold increases for
+     * each additional recompile already performed on the function.
+     *
+     * Effective threshold = base_thresh × (1 + recompile_count × pct / 100).
+     *
+     * Higher values make the monitor demand proportionally stronger evidence
+     * of sustained hotness before attempting another recompile, preventing
+     * the engine from repeatedly recompiling a function for tiny gains.
+     * Setting this to 0 disables the per-recompile threshold scaling.
+     *
+     * Default: CJIT_DEFAULT_RECOMPILE_RATE_SCALE_PCT (50).
+     */
+    uint32_t recompile_rate_scale_pct;
+
+    /**
+     * Minimum engine uptime (ms) before tier-2 (O3) compilations are issued.
+     *
+     * Programs exhibit artificial call-rate spikes during initialisation
+     * (module loading, internal warmup, memory layout settling).  Suppressing
+     * O3 promotions until the engine has been running for at least this long
+     * prevents expensive O3 compilations from being triggered by transient
+     * startup hotness that will never recur once the program reaches steady
+     * state.
+     *
+     * Default: CJIT_DEFAULT_MIN_UPTIME_T2_MS (5 000 ms).
+     */
+    uint32_t min_uptime_for_tier2_ms;
+
+    /**
+     * Extra consecutive above-threshold scan cycles required per additional
+     * recompile already performed.
+     *
+     * Required stability streak = hot_confirm_cycles
+     *                           + recompile_count × extra_streak_per_recompile.
+     *
+     * A function that has been recompiled multiple times must demonstrate
+     * sustained hotness over a proportionally longer observation window before
+     * the next recompile is issued.  Setting this to 0 keeps the streak
+     * requirement constant (equal to hot_confirm_cycles) regardless of how
+     * many times the function has been recompiled.
+     *
+     * Default: CJIT_DEFAULT_EXTRA_STREAK_PER_RECOMPILE (2).
+     */
+    uint32_t extra_streak_per_recompile;
 } cjit_config_t;
 
 /* ══════════════════════════════ runtime stats ═════════════════════════════ */
@@ -271,6 +381,14 @@ typedef struct {
     uint64_t retired_handles;       /**< Total handles enqueued for deferred GC.*/
     uint64_t freed_handles;         /**< Total handles already freed.           */
     uint32_t queue_depth;           /**< Current depth of the compile queue.    */
+
+    /**
+     * Highest recompile_count seen across all registered functions.
+     *
+     * Useful for diagnosing whether the hard cap is being hit or whether
+     * the scaled thresholds are having the desired effect.
+     */
+    uint32_t max_recompile_count;   /**< Highest per-function recompile count.  */
 
     /* ── IR LRU cache ────────────────────────────────────────────────── */
     uint32_t ir_hot_count;          /**< Entries in HOT  generation (memory).  */
@@ -465,6 +583,20 @@ uint64_t cjit_get_call_count(const cjit_engine_t *engine, func_id_t id);
  */
 opt_level_t cjit_get_current_opt_level(const cjit_engine_t *engine,
                                         func_id_t            id);
+
+/**
+ * Return the number of successful JIT recompilations performed for the
+ * given function.
+ *
+ * Incremented atomically each time a compiled .so is loaded and the
+ * function pointer is swapped.  Useful for diagnosing whether the
+ * data-driven recompile throttle (max_recompiles_per_func) is being hit.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @return        Recompile count, or 0 if id is invalid.
+ */
+uint32_t cjit_get_recompile_count(const cjit_engine_t *engine, func_id_t id);
 
 #ifdef __cplusplus
 }

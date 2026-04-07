@@ -19,8 +19,12 @@
  * │   │  Monitor thread (×1)                                         │  │
  * │   │   • Wakes every monitor_interval_ms (nanosleep, low CPU)     │  │
  * │   │   • Maintains per-function EMA of call rate                  │  │
- * │   │   • Promotes functions to O2/O3 only after hot_confirm_cycles│  │
- * │   │     consecutive above-threshold scans (rejects brief spikes) │  │
+ * │   │   • 5-gate data-driven promotion (all must pass):            │  │
+ * │   │     1. Hard recompile cap  (max_recompiles_per_func)         │  │
+ * │   │     2. Scaled rate thresh  (+scale_pct% per recompile)       │  │
+ * │   │     3. Stability streak    (hot_confirm_cycles + rc×extra)   │  │
+ * │   │     4. O3 uptime gate      (min_uptime_for_tier2_ms)         │  │
+ * │   │     5. Scaled O3 min-calls (min_calls_for_tier2 × (1+rc))   │  │
  * │   │   • Adaptive cooloff: max(cfg.cooloff, 2×last_compile_ms)    │  │
  * │   │   • Non-blocking async IR prefetch via ir_cache_prefetch()   │  │
  * │   └─────────────────────────────┬────────────────────────────────┘  │
@@ -204,6 +208,17 @@ struct cjit_engine {
     /* Lifecycle control. */
     atomic_bool     running;
     atomic_bool     stop_requested;
+
+    /**
+     * Monotonic timestamp (ms) captured by cjit_start().
+     *
+     * Used by the monitor thread to compute engine uptime, which gates
+     * tier-2 (O3) promotions: compilations triggered by startup hotness
+     * spikes (before uptime >= min_uptime_for_tier2_ms) are suppressed.
+     * Not atomic: written once in cjit_start() (before compiler/monitor
+     * threads exist), then read-only by the monitor thread thereafter.
+     */
+    uint64_t        start_ms;
 
     /* Global statistics (relaxed atomics; no strict ordering needed). */
     atomic_uint_fast64_t stat_compilations;
@@ -514,28 +529,38 @@ static void *monitor_thread_fn(void *arg)
      *
      * Allocated as ONE contiguous block so that the monitor scan loop
      * (which steps through all arrays in lockstep) benefits from spatial
-     * locality: prefetching one cache line from prev_cnt also prefetches
-     * adjacent elements.  Layout (high-alignment types first):
+     * locality.  Layout (descending alignment to avoid padding gaps):
      *
      *   [uint64_t × max_funcs] prev_cnt
      *   [uint64_t × max_funcs] cnt_at_compile
      *   [uint64_t × max_funcs] last_queued_ms
      *   [float    × max_funcs] ema_rate
+     *   [uint32_t × max_funcs] hot_scan_streak
      *   [bool     × max_funcs] prefetch_done
+     *
+     * hot_scan_streak[i] counts consecutive monitor scans where
+     * ema_rate[i] was >= the scaled rate threshold for function i.
+     * Promotion only happens once the streak reaches:
+     *   hot_confirm_cycles + recompile_count[i] × extra_streak_per_recompile
+     * This ensures each successive recompile requires a proportionally
+     * longer observation window, preventing promotions based on
+     * insufficient or transient data.
      */
     size_t monitor_block_sz =
-        (size_t)max_funcs * (3 * sizeof(uint64_t) + sizeof(float) + sizeof(bool));
+        (size_t)max_funcs * (3 * sizeof(uint64_t) + sizeof(float)
+                             + sizeof(uint32_t) + sizeof(bool));
     void *monitor_block = calloc(1, monitor_block_sz);
     if (!monitor_block) {
         fprintf(stderr, "[cjit/monitor] FATAL: cannot allocate monitor state (%zu B)\n", monitor_block_sz);
         return NULL;
     }
 
-    uint64_t *prev_cnt       = (uint64_t *)monitor_block;
-    uint64_t *cnt_at_compile = prev_cnt       + max_funcs;
-    uint64_t *last_queued_ms = cnt_at_compile + max_funcs;
-    float    *ema_rate       = (float *)(void *)(last_queued_ms + max_funcs);
-    bool     *prefetch_done  = (bool  *)(void *)(ema_rate       + max_funcs);
+    uint64_t *prev_cnt        = (uint64_t *)monitor_block;
+    uint64_t *cnt_at_compile  = prev_cnt        + max_funcs;
+    uint64_t *last_queued_ms  = cnt_at_compile  + max_funcs;
+    float    *ema_rate        = (float   *)(void *)(last_queued_ms  + max_funcs);
+    uint32_t *hot_scan_streak = (uint32_t *)(void *)(ema_rate       + max_funcs);
+    bool     *prefetch_done   = (bool    *)(void *)(hot_scan_streak + max_funcs);
 
     struct timespec interval;
     interval.tv_sec  = itvl_ms / 1000;
@@ -551,6 +576,9 @@ static void *monitor_thread_fn(void *arg)
         nanosleep(&interval, NULL);
 
         uint64_t now = engine_now_ms();
+        /* Engine uptime, used to gate O3 promotions during startup. */
+        uint64_t uptime_ms = (now >= engine->start_ms)
+                                 ? (now - engine->start_ms) : 0;
         uint32_t n   = atomic_load_explicit(&engine->ftable->count,
                                              memory_order_acquire);
 
@@ -590,6 +618,29 @@ static void *monitor_thread_fn(void *arg)
             }
 
             /* ── Tier promotion gate ────────────────────────────────────── */
+
+            /*
+             * Load how many times this function has already been JIT-compiled.
+             * Used below to scale thresholds so each successive recompile
+             * requires progressively stronger evidence of sustained benefit.
+             */
+            uint32_t rc = atomic_load_explicit(&entry->recompile_count,
+                                               memory_order_relaxed);
+
+            /*
+             * Gate 1 – Hard recompile cap.
+             *
+             * Once a function has been recompiled max_recompiles_per_func
+             * times the monitor stops considering it, preventing infinite
+             * recompilation loops and cache-thrashing for diminishing gains.
+             * Reset the streak so a later inspection (e.g. after a cfg change)
+             * sees a clean slate.
+             */
+            if (rc >= engine->cfg.max_recompiles_per_func) {
+                hot_scan_streak[i] = 0;
+                continue;
+            }
+
             opt_level_t target;
             uint64_t    rate_thresh;
             if (cur_level < OPT_O2) {
@@ -600,8 +651,73 @@ static void *monitor_thread_fn(void *arg)
                 rate_thresh = engine->cfg.hot_rate_t2;
             }
 
-            /* EMA must be above the rate threshold. */
-            if ((uint64_t)ema_rate[i] < rate_thresh) continue;
+            /*
+             * Gate 2 – Scaled rate threshold.
+             *
+             * Effective threshold = base × (1 + rc × scale_pct / 100).
+             *
+             * Each additional recompile raises the required EMA rate by
+             * scale_pct percent, ensuring the monitor only triggers again
+             * when the function is proportionally hotter than the previous
+             * trigger level.  This prevents re-promotions for marginal gains
+             * (e.g. 0.00001% faster) that do not justify the compilation cost
+             * or the I-cache pressure of swapping in new code.
+             *
+             * Example with scale_pct=50:
+             *   rc=0 → 1.0× base  (first recompile: standard gate)
+             *   rc=1 → 1.5× base  (second: must be 50% hotter)
+             *   rc=2 → 2.0× base
+             *   rc=4 → 3.0× base
+             *
+             * Cap at 64× base to avoid overflow; the hard cap above terminates
+             * the loop long before rc would reach such values.
+             */
+            uint64_t scaled_rate_thresh = rate_thresh;
+            if (engine->cfg.recompile_rate_scale_pct > 0 && rc > 0) {
+                uint64_t bump = rate_thresh
+                                * (uint64_t)rc
+                                * engine->cfg.recompile_rate_scale_pct
+                                / 100ULL;
+                uint64_t max_bump = rate_thresh * 63ULL;
+                if (bump > max_bump) bump = max_bump;
+                scaled_rate_thresh = rate_thresh + bump;
+            }
+
+            /* EMA must be above the scaled threshold.
+             * If not, this scan is "cold" — reset the streak. */
+            if ((uint64_t)ema_rate[i] < scaled_rate_thresh) {
+                hot_scan_streak[i] = 0;
+                continue;
+            }
+
+            /* Increment the consecutive-above-threshold scan streak. */
+            if (hot_scan_streak[i] < UINT32_MAX) hot_scan_streak[i]++;
+
+            /*
+             * Gate 3 – Stability streak (data sufficiency).
+             *
+             * Required streak = hot_confirm_cycles
+             *                 + rc × extra_streak_per_recompile.
+             *
+             * A function that has already been recompiled rc times must
+             * demonstrate sustained hotness over a proportionally longer
+             * observation window.  This is the primary "enough data" gate:
+             * a transient spike that dies after a few scans resets the streak
+             * to 0 and must prove itself again from scratch.
+             *
+             * Saturating arithmetic throughout to handle extreme rc values.
+             */
+            uint32_t req_streak = engine->cfg.hot_confirm_cycles;
+            {
+                uint32_t extra = engine->cfg.extra_streak_per_recompile;
+                uint32_t rc_extra = (extra == 0 || rc == 0)
+                                        ? 0
+                                        : ((rc <= UINT32_MAX / extra)
+                                               ? rc * extra : UINT32_MAX);
+                req_streak = (req_streak <= UINT32_MAX - rc_extra)
+                                 ? req_streak + rc_extra : UINT32_MAX;
+            }
+            if (hot_scan_streak[i] < req_streak) continue;
 
             /* Adaptive cooloff: max(cfg.compile_cooloff_ms,
              *                       2 × last_compile_duration_ms). */
@@ -616,10 +732,37 @@ static void *monitor_thread_fn(void *arg)
 
             if ((now - last_queued_ms[i]) < effective_cooloff) continue;
 
-            /* T2-only gate: require enough calls since O2 compilation. */
             if (target == OPT_O3) {
-                uint64_t calls_since = cur_cnt - cnt_at_compile[i];
-                if (calls_since < engine->cfg.min_calls_for_tier2) continue;
+                /*
+                 * Gate 4 – Uptime gate for O3.
+                 *
+                 * Suppress O3 promotions until the engine has been running
+                 * for at least min_uptime_for_tier2_ms milliseconds.  Startup
+                 * call spikes (module init, JIT warmup, memory layout settling)
+                 * do not represent steady-state behaviour; compiling to O3
+                 * based on them wastes CPU and I-cache for code that will
+                 * rarely be called at the same intensity again.
+                 */
+                if (uptime_ms < engine->cfg.min_uptime_for_tier2_ms) continue;
+
+                /*
+                 * Gate 5 – Scaled min-calls for O3.
+                 *
+                 * Each successive recompile multiplies the minimum required
+                 * call count since the last promotion by (1 + rc), ensuring
+                 * the engine has collected proportionally more real-world
+                 * usage data before attempting another expensive upgrade.
+                 *
+                 * Saturating multiply to handle extreme rc values.
+                 */
+                uint64_t calls_since    = cur_cnt - cnt_at_compile[i];
+                uint64_t scaled_min_calls = engine->cfg.min_calls_for_tier2;
+                uint64_t mult = (uint64_t)(1 + rc);
+                if (scaled_min_calls <= UINT64_MAX / mult)
+                    scaled_min_calls *= mult;
+                else
+                    scaled_min_calls = UINT64_MAX;
+                if (calls_since < scaled_min_calls) continue;
             }
 
             /* ── Enqueue ────────────────────────────────────────────────── */
@@ -642,15 +785,18 @@ static void *monitor_thread_fn(void *arg)
                 atomic_store_explicit(&entry->in_queue, false,
                                       memory_order_relaxed);
             } else {
-                cnt_at_compile[i]  = cur_cnt;
-                last_queued_ms[i]  = now;
-                prefetch_done[i]   = false;  /* reset for next tier */
+                cnt_at_compile[i]   = cur_cnt;
+                last_queued_ms[i]   = now;
+                hot_scan_streak[i]  = 0;  /* fresh evidence required for next tier */
+                prefetch_done[i]    = false;
                 if (engine->cfg.verbose)
                     fprintf(stderr,
                             "[cjit/monitor] enqueued '%s' for O%d "
-                            "(ema=%.0fcps cooloff=%ums)\n",
+                            "(ema=%.0fcps streak=%u/%u rc=%u cooloff=%ums)\n",
                             entry->name, (int)target,
-                            (double)ema_rate[i], effective_cooloff);
+                            (double)ema_rate[i],
+                            hot_scan_streak[i], req_streak,
+                            rc, effective_cooloff);
             }
         }
     }
@@ -701,6 +847,11 @@ cjit_config_t cjit_default_config(void)
     cfg.min_calls_for_tier2 = CJIT_DEFAULT_MIN_CALLS_T2;
     cfg.compile_cooloff_ms  = CJIT_DEFAULT_COMPILE_COOLOFF_MS;
     cfg.io_threads          = CJIT_DEFAULT_IO_THREADS;
+
+    cfg.max_recompiles_per_func     = CJIT_DEFAULT_MAX_RECOMPILES;
+    cfg.recompile_rate_scale_pct    = CJIT_DEFAULT_RECOMPILE_RATE_SCALE_PCT;
+    cfg.min_uptime_for_tier2_ms     = CJIT_DEFAULT_MIN_UPTIME_T2_MS;
+    cfg.extra_streak_per_recompile  = CJIT_DEFAULT_EXTRA_STREAK_PER_RECOMPILE;
 
     cfg.enable_inlining      = true;
     cfg.enable_vectorization = true;
@@ -797,6 +948,8 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
 void cjit_start(cjit_engine_t *engine)
 {
     if (atomic_load_explicit(&engine->running, memory_order_acquire)) return;
+
+    engine->start_ms = engine_now_ms();
 
     atomic_store_explicit(&engine->stop_requested, false, memory_order_release);
     atomic_store_explicit(&engine->running,        true,  memory_order_release);
@@ -961,11 +1114,19 @@ cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
     s.freed_handles        = atomic_load_explicit(&engine->dgc.total_freed,
                                                    memory_order_relaxed);
 
-    /* Sum queue depths across all per-thread queues. */
-    uint32_t qd = 0;
+    /* Sum queue depths and find highest recompile count across all functions. */
+    uint32_t qd  = 0;
+    uint32_t max_rc = 0;
+    uint32_t nf  = s.registered_functions;
     for (uint32_t i = 0; i < engine->cfg.compiler_threads; ++i)
         qd += mpmc_size(&engine->work_queues[i]);
-    s.queue_depth = qd;
+    for (uint32_t i = 0; i < nf; ++i) {
+        uint32_t rc = atomic_load_explicit(
+            &engine->ftable->entries[i].recompile_count, memory_order_relaxed);
+        if (rc > max_rc) max_rc = rc;
+    }
+    s.queue_depth        = qd;
+    s.max_recompile_count = max_rc;
 
     if (engine->ir_cache) {
         ir_cache_stats_t cs = ir_cache_get_stats(engine->ir_cache);
@@ -992,32 +1153,33 @@ void cjit_print_stats(const cjit_engine_t *engine)
     static const char *const pnames[] =
         { "NORMAL", "MEDIUM", "HIGH", "CRITICAL" };
     fprintf(stderr,
-            "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
-            "\u2551           CJIT Engine Statistics          \u2551\n"
-            "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n"
-            "\u2551  Registered functions  : %6u            \u2551\n"
-            "\u2551  Total compilations    : %6llu            \u2551\n"
-            "\u2551  Failed compilations   : %6llu            \u2551\n"
-            "\u2551  Atomic pointer swaps  : %6llu            \u2551\n"
-            "\u2551  Handles retired (GC)  : %6llu            \u2551\n"
-            "\u2551  Handles freed   (GC)  : %6llu            \u2551\n"
-            "\u2551  Work-queue depth now  : %6u            \u2551\n"
-            "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n"
-            "\u2551  Memory pressure       : %-8s          \u2551\n"
-            "\u2551  Mem available         : %6llu MB         \u2551\n"
-            "\u2551  Mem total             : %6llu MB         \u2551\n"
-            "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n"
-            "\u2551  IR HOT  (in memory)   : %6u            \u2551\n"
-            "\u2551  IR WARM (in memory)   : %6u            \u2551\n"
-            "\u2551  IR COLD (on disk)     : %6u            \u2551\n"
-            "\u2551  IR cache hits         : %6llu            \u2551\n"
-            "\u2551  IR cache misses       : %6llu            \u2551\n"
-            "\u2551  IR disk writes        : %6llu            \u2551\n"
-            "\u2551  IR disk reads         : %6llu            \u2551\n"
-            "\u2551  IR LRU evictions      : %6llu            \u2551\n"
-            "\u2551  IR pressure evictions : %6llu            \u2551\n"
-            "\u2551  IR promotions         : %6llu            \u2551\n"
-            "\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n",
+            "╔══════════════════════════════════════════╗\n"
+            "║           CJIT Engine Statistics          ║\n"
+            "╠══════════════════════════════════════════╣\n"
+            "║  Registered functions  : %6u            ║\n"
+            "║  Total compilations    : %6llu            ║\n"
+            "║  Failed compilations   : %6llu            ║\n"
+            "║  Atomic pointer swaps  : %6llu            ║\n"
+            "║  Handles retired (GC)  : %6llu            ║\n"
+            "║  Handles freed   (GC)  : %6llu            ║\n"
+            "║  Work-queue depth now  : %6u            ║\n"
+            "║  Max recompile count   : %6u            ║\n"
+            "╠══════════════════════════════════════════╣\n"
+            "║  Memory pressure       : %-8s          ║\n"
+            "║  Mem available         : %6llu MB         ║\n"
+            "║  Mem total             : %6llu MB         ║\n"
+            "╠══════════════════════════════════════════╣\n"
+            "║  IR HOT  (in memory)   : %6u            ║\n"
+            "║  IR WARM (in memory)   : %6u            ║\n"
+            "║  IR COLD (on disk)     : %6u            ║\n"
+            "║  IR cache hits         : %6llu            ║\n"
+            "║  IR cache misses       : %6llu            ║\n"
+            "║  IR disk writes        : %6llu            ║\n"
+            "║  IR disk reads         : %6llu            ║\n"
+            "║  IR LRU evictions      : %6llu            ║\n"
+            "║  IR pressure evictions : %6llu            ║\n"
+            "║  IR promotions         : %6llu            ║\n"
+            "╚══════════════════════════════════════════╝\n",
             s.registered_functions,
             (unsigned long long)s.total_compilations,
             (unsigned long long)s.failed_compilations,
@@ -1025,6 +1187,7 @@ void cjit_print_stats(const cjit_engine_t *engine)
             (unsigned long long)s.retired_handles,
             (unsigned long long)s.freed_handles,
             s.queue_depth,
+            s.max_recompile_count,
             pnames[s.mem_pressure],
             (unsigned long long)s.mem_available_mb,
             (unsigned long long)s.mem_total_mb,
@@ -1053,4 +1216,11 @@ opt_level_t cjit_get_current_opt_level(const cjit_engine_t *engine,
         func_table_get(engine->ftable, id);
     if (!e) return OPT_NONE;
     return (opt_level_t)atomic_load_explicit(&e->cur_level, memory_order_relaxed);
+}
+
+uint32_t cjit_get_recompile_count(const cjit_engine_t *engine, func_id_t id)
+{
+    const func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (!e) return 0;
+    return atomic_load_explicit(&e->recompile_count, memory_order_relaxed);
 }

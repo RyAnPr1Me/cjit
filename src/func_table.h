@@ -99,6 +99,23 @@ typedef struct {
      * completed.  Zero overhead on the hot path.
      */
     atomic_uint_fast32_t        last_compile_duration_ms;
+
+    /**
+     * Number of successful JIT recompilations of this function.
+     *
+     * Incremented by the compiler thread in func_table_swap() after each
+     * successful compilation and pointer swap.  Read by the monitor thread
+     * (relaxed load) to scale promotion thresholds:
+     *   • Rate threshold rises by recompile_rate_scale_pct% per recompile.
+     *   • Required stability streak grows by extra_streak_per_recompile per
+     *     recompile.
+     *   • T2 min-calls gate multiplied by (1 + recompile_count).
+     *   • Hard cap at max_recompiles_per_func prevents infinite loops.
+     *
+     * This field is always zero on the hot path (runtime threads never
+     * read it) — zero cache pressure.
+     */
+    atomic_uint_fast32_t        recompile_count;
     pthread_mutex_t             compile_lock; /**< Serialises concurrent compiles.*/
     char                        name[CJIT_NAME_MAX]; /**< Function symbol name. */
 } func_table_entry_t;
