@@ -134,6 +134,8 @@ typedef struct {
     bool     enable_loop_unroll;  /**< Pass -funroll-loops to compiler.           */
     bool     enable_const_fold;   /**< Constant folding (enabled at -O1+).       */
     bool     enable_native_arch;  /**< Pass -march=native at OPT_O3.             */
+    bool     enable_fast_math;    /**< Pass -ffast-math at OPT_O3 (may change
+                                       floating-point semantics).                 */
     bool     verbose;             /**< Print compilation events to stderr.        */
 
     /* ── IR LRU cache settings ──────────────────────────────────────────── */

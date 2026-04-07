@@ -170,6 +170,7 @@ static void *compiler_thread_fn(void *arg)
         .enable_vectorization = engine->cfg.enable_vectorization,
         .enable_loop_unroll   = engine->cfg.enable_loop_unroll,
         .enable_native_arch   = engine->cfg.enable_native_arch,
+        .enable_fast_math     = engine->cfg.enable_fast_math,
         .verbose              = engine->cfg.verbose,
     };
 
@@ -435,6 +436,7 @@ cjit_config_t cjit_default_config(void)
     cfg.enable_loop_unroll   = true;
     cfg.enable_const_fold    = true;
     cfg.enable_native_arch   = true;
+    cfg.enable_fast_math     = false; /* opt-in: may change FP semantics */
     cfg.verbose              = false;
     /* IR LRU cache */
     cfg.hot_ir_cache_size         = 64;
