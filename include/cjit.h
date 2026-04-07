@@ -154,6 +154,66 @@ typedef struct {
     uint32_t mem_pressure_low_pct;      /**< % avail → MEDIUM  (def 20).        */
     uint32_t mem_pressure_high_pct;     /**< % avail → HIGH    (def 10).        */
     uint32_t mem_pressure_critical_pct; /**< % avail → CRITICAL (def  5).       */
+
+    /* ── Hot-function detection tuning ──────────────────────────────────── */
+
+    /**
+     * Minimum sustained call rate (calls/second) to consider a function
+     * ready for tier-1 (O2) compilation.
+     *
+     * The monitor computes rate = delta_calls / interval_ms * 1000 each
+     * scan cycle.  Using rate instead of a raw total count means a function
+     * that was heavily used last hour but has since cooled is NOT promoted,
+     * preventing wasteful O3 compilations of effectively cold code.
+     *
+     * Default: 1 000 calls/sec.
+     */
+    uint64_t hot_rate_t1;
+
+    /**
+     * Minimum sustained call rate (calls/second) to consider a function
+     * ready for tier-2 (O3) compilation.  Must be ≥ hot_rate_t1.
+     *
+     * Default: 5 000 calls/sec.
+     */
+    uint64_t hot_rate_t2;
+
+    /**
+     * Number of consecutive monitor scan cycles the function must stay above
+     * the rate threshold before a promotion is issued.
+     *
+     * This acts as a confidence filter: brief call spikes (e.g. a single
+     * burst loop that finishes quickly) do not trigger expensive O3
+     * compilation.  Only functions that are *continuously* hot over at least
+     * hot_confirm_cycles × monitor_interval_ms milliseconds are promoted.
+     *
+     * Default: 3 cycles (e.g. 150 ms at the 50 ms default interval).
+     */
+    uint32_t hot_confirm_cycles;
+
+    /**
+     * Minimum number of calls that must have occurred since the previous
+     * promotion before an O2 → O3 upgrade is issued.
+     *
+     * Ensures that O3 is only attempted when there is enough evidence that
+     * the function's hot window will persist long enough to recoup the
+     * extra compilation cost.  If a function reaches O2 and is then barely
+     * called again, upgrading to O3 would be pure overhead.
+     *
+     * Default: 2 000 calls.
+     */
+    uint64_t min_calls_for_tier2;
+
+    /**
+     * Minimum milliseconds that must elapse between consecutive promotion
+     * attempts for the same function (cooloff period).
+     *
+     * Prevents compilation thrashing when the call rate oscillates around
+     * a threshold boundary.
+     *
+     * Default: 500 ms.
+     */
+    uint32_t compile_cooloff_ms;
 } cjit_config_t;
 
 /* ══════════════════════════════ runtime stats ═════════════════════════════ */

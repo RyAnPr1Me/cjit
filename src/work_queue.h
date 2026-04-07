@@ -68,12 +68,16 @@ WQ_STATIC_ASSERT((WQ_CAPACITY & (WQ_CAPACITY - 1u)) == 0u); /* power of 2 */
  *                Currently informational; threads process in FIFO order.
  * version_req  : The IR version that triggered this request; used to discard
  *                stale tasks if the IR was updated while the task was queued.
+ * call_rate    : Observed calls/sec at the time of enqueue.  Carried through
+ *                to the compiler thread for verbose logging and future
+ *                profile-guided optimisation hints.  Zero for manual requests.
  */
 typedef struct {
     func_id_t   func_id;
     opt_level_t target_level;
     uint32_t    priority;
     uint32_t    version_req;
+    uint64_t    call_rate;   /* calls/sec at time of enqueue */
 } compile_task_t;
 
 /* ───────────────────────── queue structure ───────────────────────────────── */
@@ -81,8 +85,14 @@ typedef struct {
 /**
  * One ring-buffer slot.
  *
- * Padded so that seq and data fit on a single 64-byte cache line, preventing
- * false sharing between adjacent slots.
+ * seq and data are packed so the whole slot fits in one 64-byte cache line.
+ * Padding makes the size exactly 64 bytes regardless of platform alignment.
+ *
+ * Layout on LP64 (x86-64 / AArch64):
+ *   seq  : 8 bytes  (atomic_uint_fast64_t)
+ *   data : 24 bytes (compile_task_t: 4+4+4+4+8)
+ *   pad  : 32 bytes
+ *   total: 64 bytes = 1 cache line
  */
 typedef struct {
     _Alignas(64) atomic_uint_fast64_t seq;  /* monotonic sequence counter    */

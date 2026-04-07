@@ -111,6 +111,18 @@
 
 /* ══════════════════════════ engine structure ══════════════════════════════ */
 
+/*
+ * Per-compiler-thread argument block.
+ *
+ * Stable for the lifetime of the engine (allocated alongside compiler_threads
+ * in cjit_create).  Each compiler thread receives a pointer to its own entry
+ * so it knows its index for work-stealing without querying TLS.
+ */
+typedef struct {
+    cjit_engine_t *engine;
+    uint32_t       thread_idx;
+} compiler_thread_arg_t;
+
 struct cjit_engine {
     /* Configuration (immutable after cjit_start). */
     cjit_config_t   cfg;
@@ -121,21 +133,36 @@ struct cjit_engine {
     /* IR LRU cache with memory-pressure awareness. */
     ir_lru_cache_t *ir_cache;
 
-    /* Single compile work-queue shared by all compiler threads. */
-    mpmc_queue_t    work_queue;
+    /*
+     * Per-compiler-thread work queues.
+     *
+     * Heap-allocated array of cfg.compiler_threads MPMC queues.  Tasks are
+     * routed by (func_id % num_threads) so the same function always lands on
+     * the same queue.  This gives each function compile_lock affinity to one
+     * thread, eliminating cross-thread trylock contention in the common case.
+     *
+     * Each queue has exactly ONE consumer (its owning thread).  A thread whose
+     * queue is empty steals from the next queue in round-robin order before
+     * sleeping on the shared condition variable.
+     */
+    mpmc_queue_t   *work_queues;   /* [0 .. cfg.compiler_threads) */
 
     /*
-     * Condition variable used to wake compiler threads the instant a task
-     * is enqueued.  This eliminates the old exponential-backoff sleep loop,
-     * which could delay compilation startup by up to 8 ms.
+     * Shared condition variable.
      *
-     * Protocol:
-     *   Enqueue side : mpmc_enqueue → lock → cond_signal → unlock
-     *   Consume side : lock → while (empty && !stop) cond_wait → unlock
-     *                  → mpmc_dequeue (retry if another thread won the race)
+     * Any enqueue into any per-thread queue signals one waiting compiler
+     * thread via this condvar.  Protocol:
      *
-     * The brief mutex acquisition on the producer side is acceptable because
-     * JIT compilation itself takes >> 1 ms; the signal overhead is negligible.
+     *   Producer (engine_enqueue_task):
+     *     mpmc_enqueue(work_queues[target]) → lock → signal → unlock
+     *
+     *   Consumer (compiler_thread_fn):
+     *     all-queues-empty? → lock → while (all empty && !stop) wait → unlock
+     *     → retry dequeue from own queue (then neighbours)
+     *
+     * Using a single condvar (not per-thread) keeps the producer fast: one
+     * unconditional mutex_lock/signal/unlock per enqueue, regardless of how
+     * many threads are sleeping.
      */
     pthread_mutex_t work_cond_mutex;
     pthread_cond_t  work_cond;
@@ -144,14 +171,12 @@ struct cjit_engine {
     deferred_gc_t   dgc;
 
     /*
-     * Background thread handles.
-     *
-     * compiler_threads is a heap-allocated array of cfg.compiler_threads
-     * elements, sized dynamically in cjit_create() so the actual thread count
-     * can be determined at runtime (e.g. from the online CPU count).
+     * Background thread handles and per-thread arguments.
+     * Both are heap-allocated arrays of cfg.compiler_threads entries.
      */
-    pthread_t  *compiler_threads;
-    pthread_t   monitor_thread;
+    pthread_t              *compiler_threads;
+    compiler_thread_arg_t  *thread_args;
+    pthread_t               monitor_thread;
 
     /* Lifecycle control. */
     atomic_bool     running;
@@ -165,28 +190,33 @@ struct cjit_engine {
 
 /* ══════════════════════════ internal helpers ══════════════════════════════ */
 
+/* Monotonic timestamp in milliseconds (shared by monitor helpers). */
+static uint64_t engine_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
 /**
- * Enqueue a compile task and immediately signal one waiting compiler thread.
+ * Route a compile task to the owning thread's queue and signal a waiter.
  *
- * The signal is sent inside a brief mutex critical section so that the
- * pthread_cond_wait / pthread_cond_signal pair is race-free:
+ * Routing by (func_id % num_threads) gives each function affinity to one
+ * compiler thread.  That means the per-entry compile_lock is almost always
+ * acquired by the same thread, eliminating cross-thread trylock contention
+ * in the common case.
  *
- *   Producer (this function):
- *     mpmc_enqueue → lock → signal → unlock
+ * The condvar signal is sent inside a brief mutex section so no wake-up can
+ * be lost (see engine struct comment for the full protocol).
  *
- *   Consumer (compiler_thread_fn):
- *     lock → predicate check → [wait if empty] → unlock → mpmc_dequeue
- *
- * Because the consumer holds the mutex while evaluating the predicate, the
- * producer's enqueue is always visible to the predicate check (the item is
- * in the queue before the lock is acquired), so no wake-up can be lost.
- *
- * @return true if the task was accepted by the queue, false if full.
+ * @return true if the task was accepted, false if the target queue is full.
  */
 static bool engine_enqueue_task(cjit_engine_t *engine,
                                  const compile_task_t *task)
 {
-    bool ok = mpmc_enqueue(&engine->work_queue, task);
+    uint32_t n      = engine->cfg.compiler_threads;
+    uint32_t target = task->func_id % n;
+    bool ok = mpmc_enqueue(&engine->work_queues[target], task);
     if (ok) {
         pthread_mutex_lock(&engine->work_cond_mutex);
         pthread_cond_signal(&engine->work_cond);
