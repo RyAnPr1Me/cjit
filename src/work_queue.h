@@ -46,10 +46,19 @@
 
 /**
  * Ring-buffer capacity.  Must be a power of two so that the modulo reduction
- * collapses to a bitmask.  256 slots give ample depth for 3 compiler threads
- * and one monitor thread under normal load.
+ * collapses to a bitmask.
+ *
+ * 64 slots is sufficient in practice: the in_queue flag on each
+ * func_table_entry_t ensures at most one pending task per function, so the
+ * true worst-case queue depth equals the number of simultaneously-hot
+ * functions routed to one thread, which is far less than 64 in any real
+ * workload.  If enqueue fails under extreme load, in_queue is cleared and the
+ * monitor retries on the next scan cycle — correctness is preserved.
+ *
+ * Reducing from the previous value of 256 saves 12 KB per compiler thread
+ * (192 × 64-byte cache lines × n_threads).
  */
-#define WQ_CAPACITY 256u
+#define WQ_CAPACITY 64u
 
 /** Compile-time assertion helper. */
 #define WQ_STATIC_ASSERT(cond) typedef char _wq_sa[(cond) ? 1 : -1]

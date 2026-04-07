@@ -66,6 +66,26 @@ static void sanitise_name(char *dst, const char *src, size_t dstsz)
     dst[i] = '\0';
 }
 
+/**
+ * Reconstruct the on-disk IR path for a node into out[sz].
+ *
+ * The path is not stored in ir_node_t (saving 512 bytes per node).
+ * Instead it is computed on demand from the two stable, write-once fields:
+ * node->func_id and node->name.  This function is only called during disk
+ * I/O (registration write, COLD promotion read), so the snprintf overhead
+ * is negligible.
+ *
+ * Format: "<cache->ir_dir>/<func_id>_<name>.ir"
+ */
+static void node_disk_path(const ir_lru_cache_t *cache, const ir_node_t *node,
+                            char *out, size_t sz)
+{
+    snprintf(out, sz, "%s/%u_%s.ir", cache->ir_dir, node->func_id, node->name);
+}
+
+/* Maximum size of a reconstructed disk path (used for stack buffers). */
+#define IRC_PATH_MAX (sizeof(((ir_lru_cache_t *)0)->ir_dir) + 16 + CJIT_NAME_MAX + 4)
+
 /* ═══════════════════════════ /proc/meminfo reader ═════════════════════════ */
 
 /**
@@ -565,8 +585,6 @@ bool ir_cache_register(ir_lru_cache_t *cache,
     /* Initialise fields outside the lock (node not yet visible to others). */
     node->func_id = func_id;
     sanitise_name(node->name, func_name, sizeof(node->name));
-    snprintf(node->disk_path, sizeof(node->disk_path),
-             "%s/%u_%s.ir", cache->ir_dir, func_id, node->name);
 
     node->ir_source      = strdup(ir_source);
     if (!node->ir_source) return false;
@@ -575,12 +593,14 @@ bool ir_cache_register(ir_lru_cache_t *cache,
     node->registered     = true;
 
     /* Write permanent backup to disk (outside lock; I/O can be slow). */
-    bool wrote = irc_write_to_disk(node->disk_path, ir_source);
+    char disk_path[IRC_PATH_MAX];
+    node_disk_path(cache, node, disk_path, sizeof(disk_path));
+    bool wrote = irc_write_to_disk(disk_path, ir_source);
     if (wrote)
         atomic_fetch_add_explicit(&cache->stat_disk_writes, 1, memory_order_relaxed);
     else
         fprintf(stderr, "[ir_cache] WARNING: cannot write IR for '%s' to '%s'\n",
-                func_name, node->disk_path);
+                func_name, disk_path);
 
     /* Insert into HOT generation under lock. */
     pthread_mutex_lock(&cache->lock);
@@ -633,17 +653,22 @@ char *ir_cache_get_ir(ir_lru_cache_t *cache, func_id_t func_id)
     }
 
     /* ── COLD: load from disk (drop lock during I/O) ─────────────────── */
-    char disk_path_copy[sizeof(node->disk_path)];
-    memcpy(disk_path_copy, node->disk_path, sizeof(disk_path_copy));
+    /*
+     * func_id and name are write-once at registration; they are stable and
+     * safe to read without the lock.  Reconstruct the path here so we avoid
+     * storing 512 bytes of disk_path per node.
+     */
+    char disk_path[IRC_PATH_MAX];
+    node_disk_path(cache, node, disk_path, sizeof(disk_path));
     pthread_mutex_unlock(&cache->lock);
 
     atomic_fetch_add_explicit(&cache->stat_cache_misses, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&cache->stat_disk_reads,   1, memory_order_relaxed);
 
-    char *loaded = irc_read_from_disk(disk_path_copy);
+    char *loaded = irc_read_from_disk(disk_path);
     if (!loaded) {
         fprintf(stderr, "[ir_cache] ERROR: failed to read IR for func %u from '%s'\n",
-                func_id, disk_path_copy);
+                func_id, disk_path);
         return NULL;
     }
 

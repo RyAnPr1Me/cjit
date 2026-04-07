@@ -57,8 +57,14 @@
 
 /* ─────────────────────────── constants ─────────────────────────────────────── */
 
-/** Maximum length (including NUL) of a function name. */
-#define CJIT_NAME_MAX 128
+/**
+ * Maximum length (including NUL) of a function name.
+ *
+ * 64 bytes covers every real-world C symbol name and keeps both
+ * func_table_entry_t and ir_node_t compact.  Reducing from the
+ * previous value of 128 saves 64 bytes per entry in each struct.
+ */
+#define CJIT_NAME_MAX 64
 
 /* ─────────────────────────── entry ─────────────────────────────────────────── */
 
@@ -77,7 +83,7 @@ typedef struct {
     _Alignas(64)
     _Atomic(jit_func_t)         func_ptr;   /**< Current compiled function.     */
     atomic_uint_fast64_t        call_cnt;   /**< Call counter (relaxed incr.).  */
-    atomic_uint_fast32_t        version;    /**< Recompile generation counter.  */
+    _Atomic uint32_t             version;    /**< Recompile generation counter.  */
     atomic_int                  cur_level;  /**< opt_level_t of loaded code.    */
 
     /*
@@ -98,24 +104,24 @@ typedef struct {
      * This prevents re-enqueuing before the previous compile has likely
      * completed.  Zero overhead on the hot path.
      */
-    atomic_uint_fast32_t        last_compile_duration_ms;
+    /**
+     * How long (ms) the most recent compilation took.
+     *
+     * uint32_t is sufficient: max representable duration is ~49 days.
+     * Using uint32_t instead of uint_fast32_t saves 4 bytes on LP64
+     * targets (where uint_fast32_t expands to 64 bits).
+     */
+    _Atomic uint32_t             last_compile_duration_ms;
 
     /**
      * Number of successful JIT recompilations of this function.
      *
      * Incremented by the compiler thread in func_table_swap() after each
      * successful compilation and pointer swap.  Read by the monitor thread
-     * (relaxed load) to scale promotion thresholds:
-     *   • Rate threshold rises by recompile_rate_scale_pct% per recompile.
-     *   • Required stability streak grows by extra_streak_per_recompile per
-     *     recompile.
-     *   • T2 min-calls gate multiplied by (1 + recompile_count).
-     *   • Hard cap at max_recompiles_per_func prevents infinite loops.
-     *
-     * This field is always zero on the hot path (runtime threads never
-     * read it) — zero cache pressure.
+     * (relaxed load) to scale promotion thresholds.  uint32_t is sufficient
+     * and saves 4 bytes vs uint_fast32_t on LP64.
      */
-    atomic_uint_fast32_t        recompile_count;
+    _Atomic uint32_t             recompile_count;
     pthread_mutex_t             compile_lock; /**< Serialises concurrent compiles.*/
     char                        name[CJIT_NAME_MAX]; /**< Function symbol name. */
 } func_table_entry_t;

@@ -58,6 +58,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include "../include/cjit.h"   /* func_id_t, mem_pressure_t */
+#include "func_table.h"        /* CJIT_NAME_MAX              */
 
 /* ═══════════════════════════ per-function node ════════════════════════════ */
 
@@ -74,12 +75,15 @@
  *   HOT  – linked in hot  list; ir_source != NULL
  *   WARM – linked in warm list; ir_source != NULL
  *   COLD – not in any list;     ir_source == NULL; disk file exists
+ *
+ * The on-disk path is NOT stored here; it is reconstructed on demand via
+ * node_disk_path() using the stable func_id and name fields.  This removes
+ * 512 bytes of per-node storage (saving ~512 KB for 1024 functions).
  */
 typedef struct ir_node {
     func_id_t        func_id;
-    char             name[128];       /**< Sanitised function name.           */
+    char             name[CJIT_NAME_MAX]; /**< Sanitised function name.           */
     char            *ir_source;       /**< Heap copy; NULL when COLD.         */
-    char             disk_path[512];  /**< Absolute path to on-disk .ir file. */
 
     uint64_t         access_cnt;      /**< Times get_ir() was called.         */
     uint64_t         last_access_ms;  /**< Monotonic timestamp (ms).          */

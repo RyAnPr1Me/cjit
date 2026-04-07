@@ -65,12 +65,12 @@ typedef struct retire_entry {
 /**
  * Number of pre-allocated retire_entry_t nodes in the embedded pool.
  *
- * At any moment the retire stack holds at most (compiler_threads × 2) +
- * in-flight-GC entries.  256 is generous even for the maximum 16 compiler
- * threads; the pool is intentionally oversized so malloc fallback is
- * essentially never triggered in practice.
+ * At any moment the retire stack holds at most (compiler_threads × 2)
+ * in-flight entries.  64 covers the maximum 16 compiler threads with a 2×
+ * safety margin, while using only 64 × sizeof(retire_entry_t) ≈ 1.5 KB
+ * instead of the previous 6 KB at DGC_POOL_SIZE=256.
  */
-#define DGC_POOL_SIZE 256u
+#define DGC_POOL_SIZE 64u
 
 /**
  * Deferred-GC context.
