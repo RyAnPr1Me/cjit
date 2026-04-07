@@ -4,7 +4,9 @@
  * See codegen.h for the design description.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "codegen.h"
 
 #include <stdio.h>       /* FILE, fopen, fclose, snprintf, fprintf */
@@ -233,7 +235,7 @@ bool codegen_compile(const char          *func_name,
 
     if (opts->verbose) {
         fprintf(stderr, "[cjit/codegen] compiled '%s' at O%d → %p\n",
-                func_name, (int)level, result->fn);
+                func_name, (int)level, (void *)(uintptr_t)result->fn);
     }
 
     return true;

@@ -90,7 +90,9 @@
  * compiler threads do not perform redundant work.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "../include/cjit.h"
 #include "work_queue.h"
 #include "deferred_gc.h"
@@ -104,6 +106,7 @@
 #include <pthread.h>
 #include <time.h>
 #include <unistd.h>
+#include <dlfcn.h>
 
 /* ══════════════════════════ engine structure ══════════════════════════════ */
 
@@ -288,9 +291,9 @@ static void *compiler_thread_fn(void *arg)
 
         if (engine->cfg.verbose) {
             fprintf(stderr,
-                    "[cjit/compiler] swapped '%s' → O%d (ver %u)\n",
+                    "[cjit/compiler] swapped '%s' → O%d (ver %lu)\n",
                     entry->name, (int)task.target_level,
-                    atomic_load_explicit(&entry->version, memory_order_relaxed));
+                    (unsigned long)atomic_load_explicit(&entry->version, memory_order_relaxed));
         }
     }
 

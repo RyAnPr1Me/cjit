@@ -4,7 +4,9 @@
  * See func_table.h for design notes and thread-safety guarantees.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "func_table.h"
 
 #include <stdlib.h>   /* malloc / free     */

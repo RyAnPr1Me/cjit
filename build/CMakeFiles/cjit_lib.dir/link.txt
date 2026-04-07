@@ -1,2 +1,0 @@
-/usr/bin/ar qc libcjit_lib.a CMakeFiles/cjit_lib.dir/src/work_queue.c.o CMakeFiles/cjit_lib.dir/src/deferred_gc.c.o CMakeFiles/cjit_lib.dir/src/func_table.c.o CMakeFiles/cjit_lib.dir/src/codegen.c.o CMakeFiles/cjit_lib.dir/src/cjit.c.o
-/usr/bin/ranlib libcjit_lib.a
