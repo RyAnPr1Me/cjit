@@ -483,50 +483,53 @@ static size_t generate_spec_wrapper(const char *func_name,
     /* Build the -D define string: func_name=internal_name */
     snprintf(spec_define_buf, define_sz, "%s=%s", func_name, internal_name);
 
-    /* Build the parameter string for the forward declaration and call site. */
-    char forward_params[512];
-    char call_args_generic[512];
-    char call_args_const[512];
-    char cond_expr[256];
-    forward_params[0] = call_args_generic[0] = call_args_const[0] = cond_expr[0] = '\0';
+    /*
+     * Build the parameter string for the forward declaration and call site
+     * using offset-tracked snprintf() writes — O(n), no repeated strlen().
+     */
+    char   forward_params[512];
+    char   call_args_generic[512];
+    char   call_args_const[512];
+    char   cond_expr[256];
+    size_t fp  = 0;  /* offset into forward_params   */
+    size_t cag = 0;  /* offset into call_args_generic */
+    size_t cac = 0;  /* offset into call_args_const   */
+    size_t ce  = 0;  /* offset into cond_expr         */
+
+#define APPEND(buf, pos, ...) \
+    do { \
+        int _n = snprintf((buf) + (pos), sizeof(buf) - (pos), __VA_ARGS__); \
+        if (_n > 0) (pos) += (size_t)_n; \
+        if ((pos) >= sizeof(buf)) (pos) = sizeof(buf) - 1; \
+    } while (0)
 
     bool first_cond = true;
     for (int i = 0; i < nparams; ++i) {
         if (i > 0) {
-            strncat(forward_params,  ", ", sizeof(forward_params)  - strlen(forward_params)  - 1);
-            strncat(call_args_generic, ", ", sizeof(call_args_generic) - strlen(call_args_generic) - 1);
-            strncat(call_args_const,   ", ", sizeof(call_args_const)   - strlen(call_args_const)   - 1);
+            APPEND(forward_params,    fp,  ", ");
+            APPEND(call_args_generic, cag, ", ");
+            APPEND(call_args_const,   cac, ", ");
         }
-        /* forward decl param: "type name" */
-        strncat(forward_params, pinfo[i].type, sizeof(forward_params) - strlen(forward_params) - 1);
-        strncat(forward_params, " ", sizeof(forward_params) - strlen(forward_params) - 1);
-        strncat(forward_params, pinfo[i].name, sizeof(forward_params) - strlen(forward_params) - 1);
-        /* generic call arg: just the name */
-        strncat(call_args_generic, pinfo[i].name,
-                sizeof(call_args_generic) - strlen(call_args_generic) - 1);
-        /* const call arg: literal value for specialised slots, name otherwise */
+        /* Forward declaration: "type name" */
+        APPEND(forward_params, fp, "%s %s", pinfo[i].type, pinfo[i].name);
+        /* Generic call: just the name */
+        APPEND(call_args_generic, cag, "%s", pinfo[i].name);
+        /* Specialised call: constant literal for hot slots, name otherwise */
         if (specialise[i]) {
-            char val_buf[32];
-            /* Cast to the parameter type and use the profiled literal value */
-            snprintf(val_buf, sizeof(val_buf), "(%s)%lld",
-                     pinfo[i].type,
-                     (long long)(int64_t)prof->slots[i].dominant_val);
-            strncat(call_args_const, val_buf,
-                    sizeof(call_args_const) - strlen(call_args_const) - 1);
-            /* Condition: param == literal */
-            char cond_part[64];
-            snprintf(cond_part, sizeof(cond_part), "%s%s == (%s)%lld",
-                     first_cond ? "" : " && ",
-                     pinfo[i].name,
-                     pinfo[i].type,
-                     (long long)(int64_t)prof->slots[i].dominant_val);
-            strncat(cond_expr, cond_part, sizeof(cond_expr) - strlen(cond_expr) - 1);
+            APPEND(call_args_const, cac, "(%s)%lld",
+                   pinfo[i].type,
+                   (long long)(int64_t)prof->slots[i].dominant_val);
+            APPEND(cond_expr, ce, "%s%s == (%s)%lld",
+                   first_cond ? "" : " && ",
+                   pinfo[i].name,
+                   pinfo[i].type,
+                   (long long)(int64_t)prof->slots[i].dominant_val);
             first_cond = false;
         } else {
-            strncat(call_args_const, pinfo[i].name,
-                    sizeof(call_args_const) - strlen(call_args_const) - 1);
+            APPEND(call_args_const, cac, "%s", pinfo[i].name);
         }
     }
+#undef APPEND
 
     /* bool is_void_return */
     bool is_void = (strncmp(ret_type, "void", 4) == 0 &&

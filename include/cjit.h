@@ -290,8 +290,11 @@ extern __thread uint8_t cjit_tls_counts[CJIT_MAX_FUNCTIONS];
  *   int r = CJIT_DISPATCH(engine, id, add_fn_t, a, b);
  *
  * The variadic arguments after `id` are the argument values cast to
- * uint64_t.  Up to CJIT_MAX_PROFILED_ARGS values are recorded; additional
- * values are silently ignored.
+ * uint64_t.  Exactly as many values as arguments you want to profile should
+ * be passed; up to CJIT_MAX_PROFILED_ARGS (8) values are recorded and
+ * additional values are silently ignored by cjit_record_arg_samples().
+ * Passing more than CJIT_MAX_PROFILED_ARGS arguments does NOT cause a
+ * buffer overrun — the count is clamped before any array access.
  *
  * Hot-path overhead (non-sample case):
  *   • CJIT_SHOULD_SAMPLE check: 1 TLS byte load + compare + branch ≈ 1 cycle
