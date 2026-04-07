@@ -516,11 +516,18 @@ void ir_cache_destroy(ir_lru_cache_t *cache)
 {
     if (!cache) return;
 
-    /* Stop I/O threads. */
+    /* Stop I/O threads.
+     *
+     * Setting stop_io_flag must happen INSIDE the mutex so there is no window
+     * between an I/O thread's stop_io_flag check and its pthread_cond_wait
+     * call where the flag could be set and the broadcast missed.  If the flag
+     * were set outside the mutex, an I/O thread that evaluated "!stop_io_flag"
+     * as false, then yielded before calling pthread_cond_wait, would sleep
+     * indefinitely after missing the broadcast.
+     */
     if (cache->num_io_threads > 0) {
-        atomic_store_explicit(&cache->stop_io_flag, true, memory_order_release);
-        /* Wake all I/O threads so they observe the stop flag. */
         pthread_mutex_lock(&cache->pf_mutex);
+        atomic_store_explicit(&cache->stop_io_flag, true, memory_order_relaxed);
         pthread_cond_broadcast(&cache->pf_cond);
         pthread_mutex_unlock(&cache->pf_mutex);
         for (uint32_t i = 0; i < cache->num_io_threads; ++i)

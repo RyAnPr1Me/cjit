@@ -371,7 +371,9 @@ static void *compiler_thread_fn(void *raw_arg)
             if (atomic_compare_exchange_strong_explicit(
                     &entry->in_queue, &exp, true,
                     memory_order_relaxed, memory_order_relaxed)) {
-                /* We reclaimed the slot; re-enqueue our task. */
+                /* We reclaimed the slot; re-enqueue to the affinity queue.
+                 * Routing uses (func_id % n), identical to engine_enqueue_task,
+                 * so tasks for the same function always land on the same queue. */
                 if (!mpmc_enqueue(&engine->work_queues[task.func_id % n], &task)) {
                     /* Queue full: clear in_queue so future enqueues can proceed. */
                     atomic_store_explicit(&entry->in_queue, false,
@@ -524,7 +526,10 @@ static void *monitor_thread_fn(void *arg)
     size_t monitor_block_sz =
         (size_t)max_funcs * (3 * sizeof(uint64_t) + sizeof(float) + sizeof(bool));
     void *monitor_block = calloc(1, monitor_block_sz);
-    if (!monitor_block) return NULL;
+    if (!monitor_block) {
+        fprintf(stderr, "[cjit/monitor] FATAL: cannot allocate monitor state (%zu B)\n", monitor_block_sz);
+        return NULL;
+    }
 
     uint64_t *prev_cnt       = (uint64_t *)monitor_block;
     uint64_t *cnt_at_compile = prev_cnt       + max_funcs;
@@ -558,10 +563,13 @@ static void *monitor_thread_fn(void *arg)
             uint64_t delta   = cur_cnt - prev_cnt[i];
             prev_cnt[i]      = cur_cnt;
 
-            /* Guard against overflow: clamp delta to avoid wrapping in
-             * delta * 1000ULL.  At 1 THz call rate (impossible in practice)
-             * delta over 50ms would be ~50e9, well within uint64_t/1000. */
-            if (delta > UINT64_MAX / 1000ULL) delta = UINT64_MAX / 1000ULL;
+            /* Guard against overflow in delta * 1000ULL and catch counter
+             * anomalies (e.g. bugs that produce runaway counters).
+             * 1e12 calls/sec over any interval is physically impossible;
+             * clamping here makes the rate saturate gracefully rather than
+             * wrap to a misleadingly small value. */
+            if (delta > (uint64_t)1000000000000ULL)
+                delta = (uint64_t)1000000000000ULL;
             uint64_t inst_rate = delta * 1000ULL / itvl_safe;  /* calls/sec */
             ema_rate[i] = ema_rate[i] + alpha * ((float)inst_rate - ema_rate[i]);
 

@@ -279,11 +279,16 @@ uint32_t dgc_sweep(deferred_gc_t *dgc, bool force)
             else
                 free(list);
         } else {
-            /* Not yet ready: compute remaining lifetime with underflow guard. */
+            /*
+             * Not yet ready: compute remaining lifetime.
+             *
+             * We know: (now - list->retire_ms) < grace_period_ms (from the
+             * if-condition above that decided NOT to free).  With CLOCK_MONOTONIC
+             * the subtraction cannot wrap, so age < grace_period_ms is guaranteed
+             * and the cast is safe.
+             */
             uint64_t age = now - list->retire_ms;
-            uint32_t remaining = (age < dgc->grace_period_ms)
-                                     ? (uint32_t)(dgc->grace_period_ms - age)
-                                     : 1u; /* defensive: treat as almost ready */
+            uint32_t remaining = (uint32_t)(dgc->grace_period_ms - age);
             if (min_remaining == 0 || remaining < min_remaining)
                 min_remaining = remaining;
 

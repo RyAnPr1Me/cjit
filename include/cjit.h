@@ -413,6 +413,9 @@ jit_func_t cjit_get_func_counted(cjit_engine_t *engine, func_id_t id);
  * The macro uses a GCC/Clang statement expression (__extension__({...})) to
  * ensure that `engine` and `id` are evaluated exactly once even if the
  * arguments have side effects (e.g. CJIT_DISPATCH(get_eng(), next_id++, ...)).
+ * Note: `cast_type` is used only as a type token (no side effects possible)
+ * and the variadic function arguments are passed through directly and evaluated
+ * once in the underlying function call — this is the expected C behaviour.
  * This extension is available in all GCC and Clang versions that support the
  * rest of this codebase.
  */
