@@ -83,8 +83,22 @@ static void node_disk_path(const ir_lru_cache_t *cache, const ir_node_t *node,
     snprintf(out, sz, "%s/%u_%s.ir", cache->ir_dir, node->func_id, node->name);
 }
 
-/* Maximum size of a reconstructed disk path (used for stack buffers). */
-#define IRC_PATH_MAX (sizeof(((ir_lru_cache_t *)0)->ir_dir) + 16 + CJIT_NAME_MAX + 4)
+/*
+ * Maximum length of a reconstructed on-disk IR path.
+ *
+ * Components:
+ *   sizeof(ir_dir)  — base directory (up to 256 chars including NUL)
+ *   + 1             — path separator '/'
+ *   + 10            — decimal representation of func_id (uint32_t max = 10 digits)
+ *   + 1             — '_' separator between func_id and name
+ *   + CJIT_NAME_MAX — sanitised function name (NUL included)
+ *   + 3             — ".ir" extension (no NUL; already covered by CJIT_NAME_MAX)
+ *
+ * Total = 256 + 1 + 10 + 1 + CJIT_NAME_MAX + 3 = 271 + CJIT_NAME_MAX.
+ * A value of 400 is used to provide a comfortable margin and round up to a
+ * convenient size.
+ */
+#define IRC_PATH_MAX 400u
 
 /* ═══════════════════════════ /proc/meminfo reader ═════════════════════════ */
 

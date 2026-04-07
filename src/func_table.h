@@ -103,13 +103,9 @@ typedef struct {
      * cooloff: max(cfg.compile_cooloff_ms, 2 × last_compile_duration_ms).
      * This prevents re-enqueuing before the previous compile has likely
      * completed.  Zero overhead on the hot path.
-     */
-    /**
-     * How long (ms) the most recent compilation took.
      *
-     * uint32_t is sufficient: max representable duration is ~49 days.
-     * Using uint32_t instead of uint_fast32_t saves 4 bytes on LP64
-     * targets (where uint_fast32_t expands to 64 bits).
+     * uint32_t (not uint_fast32_t) saves 4 bytes on LP64 targets where
+     * uint_fast32_t expands to 64 bits.  Max representable value is ~49 days.
      */
     _Atomic uint32_t             last_compile_duration_ms;
 
