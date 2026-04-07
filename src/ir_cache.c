@@ -373,20 +373,29 @@ static void *io_thread_fn(void *arg)
 {
     ir_lru_cache_t *cache = (ir_lru_cache_t *)arg;
 
-    while (!atomic_load_explicit(&cache->stop_io_flag, memory_order_acquire)) {
-        pthread_mutex_lock(&cache->pf_mutex);
-
-        /* Block until there is work or we are asked to stop. */
+    /*
+     * Keep the mutex held across the stop check and the wait so there is no
+     * window between "queue empty" and "pthread_cond_wait" where a broadcast
+     * from ir_cache_destroy() could be missed.
+     *
+     * Protocol:
+     *   1. Lock mutex.
+     *   2. While queue empty AND not stopping: wait on condvar (atomically
+     *      releases mutex and sleeps; re-acquires on wake).
+     *   3. If stopping: unlock and exit.
+     *   4. Dequeue one item, unlock, do I/O, lock again.
+     */
+    pthread_mutex_lock(&cache->pf_mutex);
+    for (;;) {
+        /* Wait until there is work or we are asked to stop. */
         while (cache->pf_count == 0 &&
                !atomic_load_explicit(&cache->stop_io_flag, memory_order_relaxed))
             pthread_cond_wait(&cache->pf_cond, &cache->pf_mutex);
 
-        if (cache->pf_count == 0) {
-            pthread_mutex_unlock(&cache->pf_mutex);
-            break;  /* stop_io_flag was set while queue was empty */
-        }
+        if (atomic_load_explicit(&cache->stop_io_flag, memory_order_relaxed))
+            break;
 
-        /* Dequeue one request. */
+        /* Dequeue one request while still holding the mutex. */
         func_id_t id    = cache->pf_buf[cache->pf_head];
         cache->pf_head  = (cache->pf_head + 1) % IRC_PREFETCH_CAP;
         --cache->pf_count;
@@ -400,8 +409,10 @@ static void *io_thread_fn(void *arg)
          */
         char *ir = ir_cache_get_ir(cache, id);
         free(ir);
-    }
 
+        pthread_mutex_lock(&cache->pf_mutex);
+    }
+    pthread_mutex_unlock(&cache->pf_mutex);
     return NULL;
 }
 

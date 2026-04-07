@@ -410,11 +410,18 @@ jit_func_t cjit_get_func_counted(cjit_engine_t *engine, func_id_t id);
  *   typedef int (*add_fn_t)(int, int);
  *   int result = CJIT_DISPATCH(engine, id, add_fn_t, a, b);
  *
- * The macro expands to:
- *   ((CastType)cjit_get_func_counted(engine, id))(args…)
+ * The macro uses a GCC/Clang statement expression (__extension__({...})) to
+ * ensure that `engine` and `id` are evaluated exactly once even if the
+ * arguments have side effects (e.g. CJIT_DISPATCH(get_eng(), next_id++, ...)).
+ * This extension is available in all GCC and Clang versions that support the
+ * rest of this codebase.
  */
-#define CJIT_DISPATCH(engine, id, cast_type, ...)                         \
-    ((cast_type)cjit_get_func_counted((engine), (id)))(__VA_ARGS__)
+#define CJIT_DISPATCH(engine, id, cast_type, ...)                             \
+    __extension__({                                                            \
+        cjit_engine_t *_cjit_e = (engine);                                    \
+        func_id_t      _cjit_i = (id);                                        \
+        ((cast_type)cjit_get_func_counted(_cjit_e, _cjit_i))(__VA_ARGS__);   \
+    })
 
 /**
  * Forcibly enqueue a function for recompilation at the given tier.

@@ -128,6 +128,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#ifdef __linux__
+#include <sched.h>    /* sched_getaffinity, CPU_COUNT */
+#endif
 
 /* ══════════════════════════ engine structure ══════════════════════════════ */
 
@@ -369,7 +372,11 @@ static void *compiler_thread_fn(void *raw_arg)
                     &entry->in_queue, &exp, true,
                     memory_order_relaxed, memory_order_relaxed)) {
                 /* We reclaimed the slot; re-enqueue our task. */
-                mpmc_enqueue(&engine->work_queues[task.func_id % n], &task);
+                if (!mpmc_enqueue(&engine->work_queues[task.func_id % n], &task)) {
+                    /* Queue full: clear in_queue so future enqueues can proceed. */
+                    atomic_store_explicit(&entry->in_queue, false,
+                                          memory_order_relaxed);
+                }
             }
             /* else: monitor's fresh copy is already in the queue; drop ours. */
             continue;
@@ -500,20 +507,30 @@ static void *monitor_thread_fn(void *arg)
      * hot_confirm_cycles >= 1 enforced by cjit_create. */
     float alpha = 2.0f / (float)(engine->cfg.hot_confirm_cycles + 1);
 
-    /* Per-function monitoring state, private to this thread. */
-    uint64_t *prev_cnt       = calloc(max_funcs, sizeof(uint64_t));
-    float    *ema_rate       = calloc(max_funcs, sizeof(float));
-    uint64_t *cnt_at_compile = calloc(max_funcs, sizeof(uint64_t));
-    uint64_t *last_queued_ms = calloc(max_funcs, sizeof(uint64_t));
-    bool     *prefetch_done  = calloc(max_funcs, sizeof(bool));
+    /*
+     * Per-function monitoring state, private to this thread.
+     *
+     * Allocated as ONE contiguous block so that the monitor scan loop
+     * (which steps through all arrays in lockstep) benefits from spatial
+     * locality: prefetching one cache line from prev_cnt also prefetches
+     * adjacent elements.  Layout (high-alignment types first):
+     *
+     *   [uint64_t × max_funcs] prev_cnt
+     *   [uint64_t × max_funcs] cnt_at_compile
+     *   [uint64_t × max_funcs] last_queued_ms
+     *   [float    × max_funcs] ema_rate
+     *   [bool     × max_funcs] prefetch_done
+     */
+    size_t monitor_block_sz =
+        (size_t)max_funcs * (3 * sizeof(uint64_t) + sizeof(float) + sizeof(bool));
+    void *monitor_block = calloc(1, monitor_block_sz);
+    if (!monitor_block) return NULL;
 
-    /* Free all on partial allocation failure (free(NULL) is a no-op). */
-    if (!prev_cnt || !ema_rate || !cnt_at_compile ||
-        !last_queued_ms || !prefetch_done) {
-        free(prev_cnt); free(ema_rate); free(cnt_at_compile);
-        free(last_queued_ms); free(prefetch_done);
-        return NULL;
-    }
+    uint64_t *prev_cnt       = (uint64_t *)monitor_block;
+    uint64_t *cnt_at_compile = prev_cnt       + max_funcs;
+    uint64_t *last_queued_ms = cnt_at_compile + max_funcs;
+    float    *ema_rate       = (float *)(void *)(last_queued_ms + max_funcs);
+    bool     *prefetch_done  = (bool  *)(void *)(ema_rate       + max_funcs);
 
     struct timespec interval;
     interval.tv_sec  = itvl_ms / 1000;
@@ -541,6 +558,10 @@ static void *monitor_thread_fn(void *arg)
             uint64_t delta   = cur_cnt - prev_cnt[i];
             prev_cnt[i]      = cur_cnt;
 
+            /* Guard against overflow: clamp delta to avoid wrapping in
+             * delta * 1000ULL.  At 1 THz call rate (impossible in practice)
+             * delta over 50ms would be ~50e9, well within uint64_t/1000. */
+            if (delta > UINT64_MAX / 1000ULL) delta = UINT64_MAX / 1000ULL;
             uint64_t inst_rate = delta * 1000ULL / itvl_safe;  /* calls/sec */
             ema_rate[i] = ema_rate[i] + alpha * ((float)inst_rate - ema_rate[i]);
 
@@ -579,8 +600,11 @@ static void *monitor_thread_fn(void *arg)
             uint32_t last_dur = atomic_load_explicit(
                 &entry->last_compile_duration_ms, memory_order_relaxed);
             uint32_t effective_cooloff = engine->cfg.compile_cooloff_ms;
-            if (last_dur * 2 > effective_cooloff)
-                effective_cooloff = last_dur * 2;
+            /* Saturating multiply: last_dur * 2, clamped to UINT32_MAX. */
+            uint32_t last_dur_x2 = (last_dur <= UINT32_MAX / 2)
+                                       ? last_dur * 2 : UINT32_MAX;
+            if (last_dur_x2 > effective_cooloff)
+                effective_cooloff = last_dur_x2;
 
             if ((now - last_queued_ms[i]) < effective_cooloff) continue;
 
@@ -623,8 +647,7 @@ static void *monitor_thread_fn(void *arg)
         }
     }
 
-    free(prev_cnt); free(ema_rate); free(cnt_at_compile);
-    free(last_queued_ms); free(prefetch_done);
+    free(monitor_block);
     return NULL;
 }
 
@@ -637,12 +660,23 @@ cjit_config_t cjit_default_config(void)
     cfg.max_functions = CJIT_MAX_FUNCTIONS;
 
     /*
-     * Default compiler thread count: (online CPUs - 1) so one CPU is always
-     * available for the caller.  Clamped to [1, CJIT_COMPILER_THREADS].
-     * sysconf returns -1 on error; (ncpu > 1) handles -1, 0, and 1 correctly —
-     * all fall back to nthreads = 1 via the ternary.
+     * Default compiler thread count: (online CPUs - 1) reserved for callers.
+     *
+     * We use sched_getaffinity() first: in containers and cgroup-restricted
+     * environments it returns the number of CPUs actually *available* to this
+     * process, which may be less than the total online count reported by
+     * sysconf(_SC_NPROCESSORS_ONLN).  Falls back to sysconf on error.
      */
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    long ncpu = -1;
+#ifdef __linux__
+    {
+        cpu_set_t cs;
+        if (sched_getaffinity(0, sizeof(cs), &cs) == 0)
+            ncpu = (long)CPU_COUNT(&cs);
+    }
+#endif
+    if (ncpu <= 0)
+        ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     uint32_t nthreads = (ncpu > 1) ? (uint32_t)(ncpu - 1) : 1;
     if (nthreads > CJIT_COMPILER_THREADS) nthreads = CJIT_COMPILER_THREADS;
     cfg.compiler_threads = nthreads;
