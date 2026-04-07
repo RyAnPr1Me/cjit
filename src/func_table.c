@@ -29,6 +29,8 @@ static void entry_init(func_table_entry_t *e, func_id_t id)
     atomic_init(&e->version,    0);
     atomic_init(&e->cur_level,  (int)OPT_NONE);
     atomic_init(&e->in_queue,   false);
+    atomic_init(&e->last_compile_duration_ms, 0);
+    atomic_init(&e->recompile_count,          0);
 
     e->id        = id;
     e->dl_handle = NULL;
@@ -141,7 +143,8 @@ void *func_table_swap(func_table_t *ft,
      */
     atomic_store_explicit(&e->func_ptr,  new_fn,             memory_order_release);
     atomic_store_explicit(&e->cur_level, (int)new_level,     memory_order_relaxed);
-    atomic_fetch_add_explicit(&e->version, 1,                memory_order_relaxed);
+    atomic_fetch_add_explicit(&e->version,         1,        memory_order_relaxed);
+    atomic_fetch_add_explicit(&e->recompile_count, 1,        memory_order_relaxed);
 
     return old_handle;
 }

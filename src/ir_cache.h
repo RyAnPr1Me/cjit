@@ -58,8 +58,14 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include "../include/cjit.h"   /* func_id_t, mem_pressure_t */
+#include "func_table.h"        /* CJIT_NAME_MAX              */
 
 /* ═══════════════════════════ per-function node ════════════════════════════ */
+
+/** IR generation tags. */
+#define IRC_GEN_HOT  ((uint8_t)0)  /**< In memory; most-recently-used tier.  */
+#define IRC_GEN_WARM ((uint8_t)1)  /**< In memory; less-recently-used tier.  */
+#define IRC_GEN_COLD ((uint8_t)2)  /**< On disk only; IR freed from heap.    */
 
 /**
  * One LRU node per registered function.
@@ -69,12 +75,15 @@
  *   HOT  – linked in hot  list; ir_source != NULL
  *   WARM – linked in warm list; ir_source != NULL
  *   COLD – not in any list;     ir_source == NULL; disk file exists
+ *
+ * The on-disk path is NOT stored here; it is reconstructed on demand via
+ * node_disk_path() using the stable func_id and name fields.  This removes
+ * 512 bytes of per-node storage (saving ~512 KB for 1024 functions).
  */
 typedef struct ir_node {
     func_id_t        func_id;
-    char             name[128];       /**< Sanitised function name.           */
+    char             name[CJIT_NAME_MAX]; /**< Sanitised function name.           */
     char            *ir_source;       /**< Heap copy; NULL when COLD.         */
-    char             disk_path[512];  /**< Absolute path to on-disk .ir file. */
 
     uint64_t         access_cnt;      /**< Times get_ir() was called.         */
     uint64_t         last_access_ms;  /**< Monotonic timestamp (ms).          */
@@ -142,6 +151,32 @@ typedef struct {
     /** Background pressure-monitor thread handle. */
     pthread_t    pressure_thread;
 
+    /* ── Async I/O prefetch pool ─────────────────────────────────────────── */
+
+    /**
+     * Mutex-protected bounded FIFO for prefetch requests.
+     *
+     * The monitor thread calls ir_cache_prefetch() which non-blockingly pushes
+     * a func_id_t onto this queue.  Dedicated I/O threads drain it by calling
+     * ir_cache_get_ir() which promotes COLD IR into the WARM generation.
+     *
+     * Using a mutex FIFO (not a lock-free queue) is correct and efficient here:
+     * prefetch submissions are rare (once per function, at warm-up time) so
+     * there is no contention.  The mutex is never held on the hot path.
+     */
+#define IRC_PREFETCH_CAP 128u
+    func_id_t        pf_buf[IRC_PREFETCH_CAP]; /**< Ring-buffer of func ids.   */
+    uint32_t         pf_head, pf_count;
+    pthread_mutex_t  pf_mutex;
+    pthread_cond_t   pf_cond;
+
+    /** Background I/O thread pool (heap array of num_io_threads handles). */
+    pthread_t       *io_threads;
+    uint32_t         num_io_threads;
+
+    /** Set to true to stop all I/O threads. */
+    atomic_bool      stop_io_flag;
+
     /* ── Statistics (lock-free reads at any time) ────────────────────────── */
     atomic_uint_fast64_t stat_disk_writes;
     atomic_uint_fast64_t stat_disk_reads;
@@ -167,6 +202,12 @@ typedef struct {
     uint32_t    mem_low_pct;          /**< % avail → MEDIUM  (def: 20).      */
     uint32_t    mem_high_pct;         /**< % avail → HIGH    (def: 10).      */
     uint32_t    mem_critical_pct;     /**< % avail → CRITICAL (def:  5).     */
+    /**
+     * Number of dedicated async I/O threads for IR prefetch.
+     * 0 = disable (reads are done synchronously in the compiler thread).
+     * Default: 2.
+     */
+    uint32_t    num_io_threads;
 } ir_cache_config_t;
 
 /* ═══════════════════════════ public API ═══════════════════════════════════ */
@@ -205,6 +246,21 @@ bool ir_cache_register(ir_lru_cache_t *cache,
  * Returns NULL on error.
  */
 char *ir_cache_get_ir(ir_lru_cache_t *cache, func_id_t func_id);
+
+/**
+ * Submit a non-blocking async prefetch request for a function whose IR may
+ * be COLD (on disk only).
+ *
+ * Returns immediately without doing any I/O.  An I/O thread will pick up
+ * the request and promote the IR to WARM in the background.  If the prefetch
+ * queue is full the request is silently dropped (the compiler thread will
+ * do the disk load synchronously instead — correctness is preserved).
+ *
+ * @param cache    The IR cache.
+ * @param func_id  ID of the function to prefetch.
+ * @return true if the request was enqueued, false if the queue was full.
+ */
+bool ir_cache_prefetch(ir_lru_cache_t *cache, func_id_t func_id);
 
 /**
  * Return the current generation of a function's IR (lock-free, may be stale

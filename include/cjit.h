@@ -55,8 +55,14 @@ extern "C" {
 /** Maximum number of concurrently registered functions. */
 #define CJIT_MAX_FUNCTIONS      1024
 
-/** Number of background compilation threads. */
-#define CJIT_COMPILER_THREADS   3
+/**
+ * Maximum number of background compilation threads.
+ *
+ * The actual number started is set by cjit_config_t.compiler_threads and
+ * defaults to (nproc - 1) as detected by cjit_default_config().  This
+ * constant is the hard upper bound; values above it are clamped.
+ */
+#define CJIT_COMPILER_THREADS   16
 
 /** Number of calls before a function is considered "hot" (tier-1). */
 #define CJIT_HOT_THRESHOLD_T1   500ULL
@@ -66,6 +72,80 @@ extern "C" {
 
 /** Milliseconds to keep a retired function handle alive before dlclose. */
 #define CJIT_GRACE_PERIOD_MS    100
+
+/* ── Hot-function detection defaults ──────────────────────────────────────── */
+
+/** Default minimum sustained calls/sec to trigger O2 compilation. */
+#define CJIT_DEFAULT_HOT_RATE_T1        1000ULL
+
+/** Default minimum sustained calls/sec to trigger O3 compilation. */
+#define CJIT_DEFAULT_HOT_RATE_T2        5000ULL
+
+/**
+ * Default EMA smoothing: number of scan cycles whose equivalent weight is
+ * used to compute α = 2 / (CJIT_DEFAULT_HOT_CONFIRM_CYCLES + 1).
+ * A value of 3 gives α = 0.5; a single cold scan drops the EMA by 50%.
+ */
+#define CJIT_DEFAULT_HOT_CONFIRM_CYCLES 3U
+
+/** Default minimum calls since last O2 compilation before trying O3. */
+#define CJIT_DEFAULT_MIN_CALLS_T2       2000ULL
+
+/** Default minimum ms between tier promotions of the same function. */
+#define CJIT_DEFAULT_COMPILE_COOLOFF_MS 500U
+
+/** Default number of async I/O threads for IR prefetch (inside ir_cache). */
+#define CJIT_DEFAULT_IO_THREADS         2U
+
+/**
+ * Default hard cap on per-function JIT recompilations.
+ *
+ * Once a function has been recompiled this many times the monitor stops
+ * promoting it entirely, preventing infinite recompilation loops.  The
+ * practical maximum useful tier promotions are OPT_O2 and OPT_O3, so the
+ * default of 8 leaves significant headroom for manual recompile requests.
+ */
+#define CJIT_DEFAULT_MAX_RECOMPILES     8U
+
+/**
+ * Default rate-threshold scale factor per recompile (percent).
+ *
+ * The effective EMA rate threshold = base × (1 + recompile_count × pct/100).
+ * At the default of 50%:
+ *   0 recompiles → 1.0× base    (no extra evidence needed yet)
+ *   1 recompile  → 1.5× base    (must be 50% hotter than the original gate)
+ *   2 recompiles → 2.0× base
+ *   4 recompiles → 3.0× base
+ * This ensures each successive recompile is only triggered when the call
+ * rate is meaningfully higher than the previous trigger level, preventing
+ * oscillation and cache thrashing for tiny potential gains.
+ */
+#define CJIT_DEFAULT_RECOMPILE_RATE_SCALE_PCT  50U
+
+/**
+ * Default minimum engine uptime (ms) before O3 compilations are allowed.
+ *
+ * Programs exhibit call-pattern spikes in the first few seconds (class
+ * loading, JIT-compiler warmup, application init).  Suppressing O3 during
+ * this window prevents expensive compilations triggered by transient
+ * startup hotness that will never recur in steady state.
+ *
+ * Default: 5 000 ms (5 seconds).
+ */
+#define CJIT_DEFAULT_MIN_UPTIME_T2_MS          5000U
+
+/**
+ * Default extra required consecutive-above-threshold scan cycles per
+ * recompile count.
+ *
+ * Required stability streak = hot_confirm_cycles + recompile_count × N.
+ * At N = 2: after 3 recompiles the monitor needs 6 more consecutive
+ * above-threshold scans than the baseline hot_confirm_cycles.  This
+ * ensures that each successive promotion requires a proportionally
+ * longer window of observed sustained hotness, preventing decisions
+ * based on insufficient data.
+ */
+#define CJIT_DEFAULT_EXTRA_STREAK_PER_RECOMPILE  2U
 
 /* ══════════════════════════════ public types ══════════════════════════════ */
 
@@ -148,6 +228,145 @@ typedef struct {
     uint32_t mem_pressure_low_pct;      /**< % avail → MEDIUM  (def 20).        */
     uint32_t mem_pressure_high_pct;     /**< % avail → HIGH    (def 10).        */
     uint32_t mem_pressure_critical_pct; /**< % avail → CRITICAL (def  5).       */
+
+    /* ── Hot-function detection tuning ──────────────────────────────────── */
+
+    /**
+     * Minimum sustained call rate (calls/second) to consider a function
+     * ready for tier-1 (O2) compilation.
+     *
+     * The monitor computes rate = delta_calls / interval_ms * 1000 each
+     * scan cycle.  Using rate instead of a raw total count means a function
+     * that was heavily used last hour but has since cooled is NOT promoted,
+     * preventing wasteful O3 compilations of effectively cold code.
+     *
+     * Default: 1 000 calls/sec.
+     */
+    uint64_t hot_rate_t1;
+
+    /**
+     * Minimum sustained call rate (calls/second) to consider a function
+     * ready for tier-2 (O3) compilation.  Must be ≥ hot_rate_t1.
+     *
+     * Default: 5 000 calls/sec.
+     */
+    uint64_t hot_rate_t2;
+
+    /**
+     * Number of consecutive monitor scan cycles the function must stay above
+     * the rate threshold before a promotion is issued.
+     *
+     * This acts as a confidence filter: brief call spikes (e.g. a single
+     * burst loop that finishes quickly) do not trigger expensive O3
+     * compilation.  Only functions that are *continuously* hot over at least
+     * hot_confirm_cycles × monitor_interval_ms milliseconds are promoted.
+     *
+     * Default: 3 cycles (e.g. 150 ms at the 50 ms default interval).
+     */
+    uint32_t hot_confirm_cycles;
+
+    /**
+     * Minimum number of calls that must have occurred since the previous
+     * promotion before an O2 → O3 upgrade is issued.
+     *
+     * Ensures that O3 is only attempted when there is enough evidence that
+     * the function's hot window will persist long enough to recoup the
+     * extra compilation cost.  If a function reaches O2 and is then barely
+     * called again, upgrading to O3 would be pure overhead.
+     *
+     * Default: 2 000 calls.
+     */
+    uint64_t min_calls_for_tier2;
+
+    /**
+     * Minimum milliseconds that must elapse between consecutive promotion
+     * attempts for the same function (cooloff period).
+     *
+     * The monitor also enforces max(compile_cooloff_ms, 2 × last_compile_duration_ms)
+     * so that re-enqueuing cannot happen before the previous compilation has
+     * likely completed.  last_compile_duration_ms is written by the background
+     * compiler thread into the function-table entry — zero hot-path overhead.
+     *
+     * Default: CJIT_DEFAULT_COMPILE_COOLOFF_MS (500 ms).
+     */
+    uint32_t compile_cooloff_ms;
+
+    /**
+     * Number of background I/O threads dedicated to async IR prefetch.
+     *
+     * When the monitor observes a function's call rate crossing hot_rate_t1/10
+     * for the first time and the function's IR is COLD (on disk only), it
+     * submits a non-blocking prefetch request.  An I/O thread loads the IR
+     * from disk into the WARM generation so that by the time hot_confirm_cycles
+     * scan cycles later the compile task fires, the IR is already in memory —
+     * hiding disk-read latency from the compiler thread entirely.
+     *
+     * Setting this to 0 disables async prefetch (reads happen synchronously
+     * in the compiler thread, as before).
+     *
+     * Default: CJIT_DEFAULT_IO_THREADS (2).
+     */
+    uint32_t io_threads;
+
+    /* ── Data-driven recompile throttling ───────────────────────────────── */
+
+    /**
+     * Hard cap on the number of successful JIT recompilations per function.
+     *
+     * Once a function's recompile_count reaches this limit the monitor
+     * stops promoting it entirely, preventing endless recompilation loops
+     * and DL-cache thrashing for progressively smaller gains.  Manual
+     * cjit_request_recompile() calls are not affected by this limit.
+     *
+     * Default: CJIT_DEFAULT_MAX_RECOMPILES (8).
+     */
+    uint32_t max_recompiles_per_func;
+
+    /**
+     * Percentage by which the effective EMA rate threshold increases for
+     * each additional recompile already performed on the function.
+     *
+     * Effective threshold = base_thresh × (1 + recompile_count × pct / 100).
+     *
+     * Higher values make the monitor demand proportionally stronger evidence
+     * of sustained hotness before attempting another recompile, preventing
+     * the engine from repeatedly recompiling a function for tiny gains.
+     * Setting this to 0 disables the per-recompile threshold scaling.
+     *
+     * Default: CJIT_DEFAULT_RECOMPILE_RATE_SCALE_PCT (50).
+     */
+    uint32_t recompile_rate_scale_pct;
+
+    /**
+     * Minimum engine uptime (ms) before tier-2 (O3) compilations are issued.
+     *
+     * Programs exhibit artificial call-rate spikes during initialisation
+     * (module loading, internal warmup, memory layout settling).  Suppressing
+     * O3 promotions until the engine has been running for at least this long
+     * prevents expensive O3 compilations from being triggered by transient
+     * startup hotness that will never recur once the program reaches steady
+     * state.
+     *
+     * Default: CJIT_DEFAULT_MIN_UPTIME_T2_MS (5 000 ms).
+     */
+    uint32_t min_uptime_for_tier2_ms;
+
+    /**
+     * Extra consecutive above-threshold scan cycles required per additional
+     * recompile already performed.
+     *
+     * Required stability streak = hot_confirm_cycles
+     *                           + recompile_count × extra_streak_per_recompile.
+     *
+     * A function that has been recompiled multiple times must demonstrate
+     * sustained hotness over a proportionally longer observation window before
+     * the next recompile is issued.  Setting this to 0 keeps the streak
+     * requirement constant (equal to hot_confirm_cycles) regardless of how
+     * many times the function has been recompiled.
+     *
+     * Default: CJIT_DEFAULT_EXTRA_STREAK_PER_RECOMPILE (2).
+     */
+    uint32_t extra_streak_per_recompile;
 } cjit_config_t;
 
 /* ══════════════════════════════ runtime stats ═════════════════════════════ */
@@ -162,6 +381,14 @@ typedef struct {
     uint64_t retired_handles;       /**< Total handles enqueued for deferred GC.*/
     uint64_t freed_handles;         /**< Total handles already freed.           */
     uint32_t queue_depth;           /**< Current depth of the compile queue.    */
+
+    /**
+     * Highest recompile_count seen across all registered functions.
+     *
+     * Useful for diagnosing whether the hard cap is being hit or whether
+     * the scaled thresholds are having the desired effect.
+     */
+    uint32_t max_recompile_count;   /**< Highest per-function recompile count.  */
 
     /* ── IR LRU cache ────────────────────────────────────────────────── */
     uint32_t ir_hot_count;          /**< Entries in HOT  generation (memory).  */
@@ -248,8 +475,7 @@ func_id_t cjit_register_function(cjit_engine_t *engine,
 /**
  * Retrieve the current function pointer for the given ID.
  *
- * This is the HOT PATH.  The implementation is a single
- * atomic_load_explicit(..., memory_order_acquire).
+ * This is a single atomic_load_explicit(..., memory_order_acquire).
  *
  * The returned pointer is guaranteed to remain valid for at least
  * CJIT_GRACE_PERIOD_MS milliseconds even if it is replaced concurrently.
@@ -273,19 +499,50 @@ jit_func_t cjit_get_func(cjit_engine_t *engine, func_id_t id);
 void cjit_record_call(cjit_engine_t *engine, func_id_t id);
 
 /**
- * Convenience macro: atomic dispatch with a single load + indirect call.
+ * HOT PATH: retrieve the current function pointer AND increment the call
+ * counter in a single function-table lookup.
+ *
+ * This is strictly faster than calling cjit_get_func() + cjit_record_call()
+ * separately because it performs only ONE table lookup (one atomic bounds-check
+ * load + one stable-pointer dereference) instead of two.
+ *
+ * Atomicity guarantees:
+ *   • call_cnt increment : relaxed (approximation is sufficient for the
+ *                          monitor; no ordering with other variables needed).
+ *   • func_ptr load      : acquire (ensures the function and its data are
+ *                          fully visible before the indirect call).
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @return        Current function pointer; never NULL after registration.
+ */
+jit_func_t cjit_get_func_counted(cjit_engine_t *engine, func_id_t id);
+
+/**
+ * Convenience macro: single-lookup atomic dispatch.
+ *
+ * Uses cjit_get_func_counted() so only ONE table lookup is performed per
+ * dispatch, compared to the naive separate get_func + record_call pattern.
  *
  * Usage:
  *   typedef int (*add_fn_t)(int, int);
  *   int result = CJIT_DISPATCH(engine, id, add_fn_t, a, b);
  *
- * The macro expands to exactly:
- *   ((CastType)cjit_get_func(engine, id))(args…)
- * followed by cjit_record_call().
+ * The macro uses a GCC/Clang statement expression (__extension__({...})) to
+ * ensure that `engine` and `id` are evaluated exactly once even if the
+ * arguments have side effects (e.g. CJIT_DISPATCH(get_eng(), next_id++, ...)).
+ * Note: `cast_type` is used only as a type token (no side effects possible)
+ * and the variadic function arguments are passed through directly and evaluated
+ * once in the underlying function call — this is the expected C behaviour.
+ * This extension is available in all GCC and Clang versions that support the
+ * rest of this codebase.
  */
-#define CJIT_DISPATCH(engine, id, cast_type, ...)                    \
-    ( cjit_record_call((engine), (id)),                              \
-      ((cast_type)cjit_get_func((engine), (id)))(__VA_ARGS__) )
+#define CJIT_DISPATCH(engine, id, cast_type, ...)                             \
+    __extension__({                                                            \
+        cjit_engine_t *_cjit_e = (engine);                                    \
+        func_id_t      _cjit_i = (id);                                        \
+        ((cast_type)cjit_get_func_counted(_cjit_e, _cjit_i))(__VA_ARGS__);   \
+    })
 
 /**
  * Forcibly enqueue a function for recompilation at the given tier.
@@ -326,6 +583,20 @@ uint64_t cjit_get_call_count(const cjit_engine_t *engine, func_id_t id);
  */
 opt_level_t cjit_get_current_opt_level(const cjit_engine_t *engine,
                                         func_id_t            id);
+
+/**
+ * Return the number of successful JIT recompilations performed for the
+ * given function.
+ *
+ * Incremented atomically each time a compiled .so is loaded and the
+ * function pointer is swapped.  Useful for diagnosing whether the
+ * data-driven recompile throttle (max_recompiles_per_func) is being hit.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @return        Recompile count, or 0 if id is invalid.
+ */
+uint32_t cjit_get_recompile_count(const cjit_engine_t *engine, func_id_t id);
 
 #ifdef __cplusplus
 }

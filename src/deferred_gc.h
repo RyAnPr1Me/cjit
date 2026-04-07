@@ -16,11 +16,15 @@
  *    it onto a lock-free LIFO stack together with the current timestamp.
  *    This operation is O(1) and entirely wait-free (a single CAS loop).
  *
- * 2. A background GC thread wakes periodically (every CJIT_GRACE_PERIOD_MS/4
- *    milliseconds), harvests the retire stack atomically (a single CAS of
- *    the head to NULL), and for each entry:
+ * 2. A background GC thread wakes adaptively:
+ *      • If the retire stack has pending (not-yet-freeable) entries it sleeps
+ *        exactly until the youngest entry becomes freeable.
+ *      • If the stack was empty last sweep it backs off exponentially
+ *        (doubling up to grace_period_ms/2) to avoid burning CPU when idle.
+ *    On each wake it harvests the stack atomically (a single CAS of the head
+ *    to NULL) and for each entry:
  *      a. If (now - retire_time) ≥ grace_period_ms: call dlclose().
- *      b. Otherwise: push the entry back onto the stack for the next round.
+ *      b. Otherwise: push the entry back and record its remaining age.
  *
  * 3. The grace period is chosen to exceed the maximum time any runtime
  *    thread can remain inside a JIT-compiled function call.  100 ms is the
@@ -59,6 +63,16 @@ typedef struct retire_entry {
 } retire_entry_t;
 
 /**
+ * Number of pre-allocated retire_entry_t nodes in the embedded pool.
+ *
+ * At any moment the retire stack holds at most (compiler_threads × 2)
+ * in-flight entries.  64 covers the maximum 16 compiler threads with a 2×
+ * safety margin, while using only 64 × sizeof(retire_entry_t) ≈ 1.5 KB
+ * instead of the previous 6 KB at DGC_POOL_SIZE=256.
+ */
+#define DGC_POOL_SIZE 64u
+
+/**
  * Deferred-GC context.
  *
  * One instance is embedded inside cjit_engine_t.  The GC thread is started
@@ -68,11 +82,28 @@ typedef struct {
     /** Lock-free retire stack (NULL = empty). */
     _Atomic(retire_entry_t *) head;
 
+    /**
+     * Lock-free freelist of pre-allocated retire_entry_t nodes.
+     *
+     * dgc_retire() pops a node from this list instead of calling malloc().
+     * dgc_sweep() returns freed nodes to the list instead of calling free().
+     * On pool exhaustion dgc_retire() falls back to malloc() transparently.
+     *
+     * Uses the same CAS-loop LIFO pattern as the retire stack itself.
+     */
+    _Atomic(retire_entry_t *) pool_head;
+
+    /**
+     * Heap-allocated backing storage for the pool nodes.
+     *
+     * Allocated in dgc_init(), freed in dgc_stop() after the final sweep.
+     * May be NULL if the initial allocation failed (graceful degradation to
+     * malloc-only mode).
+     */
+    retire_entry_t *pool_storage;
+
     /** Milliseconds to wait before freeing a retired handle. */
     uint32_t  grace_period_ms;
-
-    /** GC thread sleeps for this many milliseconds between sweeps. */
-    uint32_t  sweep_interval_ms;
 
     /** Set to true to request the GC thread to exit. */
     atomic_bool stop_flag;
@@ -126,7 +157,12 @@ void dgc_retire(deferred_gc_t *dgc, void *handle);
 /**
  * Run a single GC sweep synchronously (for testing / shutdown).
  *
- * Harvests the retire stack and immediately frees any entry older than the
- * grace period.  If force is true, all entries are freed unconditionally.
+ * Harvests the retire stack and frees any entry older than the grace period.
+ * If force is true, all entries are freed unconditionally.
+ *
+ * @return The minimum milliseconds until the next pending entry will become
+ *         freeable, or 0 if nothing is pending (stack was empty or everything
+ *         was freed).  The GC thread uses this to schedule its next wake-up
+ *         precisely, avoiding both over-sleeping and busy-polling.
  */
-void dgc_sweep(deferred_gc_t *dgc, bool force);
+uint32_t dgc_sweep(deferred_gc_t *dgc, bool force);
