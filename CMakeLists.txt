@@ -39,6 +39,11 @@ add_executable(demo examples/demo.c)
 target_link_libraries(demo PRIVATE cjit_lib)
 target_compile_definitions(demo PRIVATE _GNU_SOURCE)
 
+# ─────────────────────────── cjit CLI ─────────────────────────────────────
+add_executable(cjit src/cli.c)
+target_link_libraries(cjit PRIVATE cjit_lib)
+target_compile_definitions(cjit PRIVATE _GNU_SOURCE)
+
 # ─────────────────────────── install ──────────────────────────────────────
-install(TARGETS demo RUNTIME DESTINATION bin)
+install(TARGETS cjit RUNTIME DESTINATION bin)
 install(DIRECTORY include/ DESTINATION include/cjit)

@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: cjit-linux-x86_64
+          - os: ubuntu-22.04-arm
+            artifact: cjit-linux-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu)
+        run: sudo apt-get update && sudo apt-get install -y cmake gcc
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=dist
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Install to staging dir
+        run: cmake --install build
+
+      - name: Package binary
+        run: |
+          cp dist/bin/cjit ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: cjit ${{ github.ref_name }}
+          body: |
+            ## cjit ${{ github.ref_name }}
+
+            ### What's included
+            | File | Platform |
+            |------|----------|
+            | `cjit-linux-x86_64` | Linux x86-64 |
+            | `cjit-linux-aarch64` | Linux AArch64 |
+
+            ### Usage
+            ```sh
+            chmod +x cjit-linux-x86_64
+            ./cjit-linux-x86_64 your_file.c
+            ```
+
+            See the [README](README.md) for full documentation.
+          files: |
+            artifacts/cjit-linux-x86_64/cjit-linux-x86_64
+            artifacts/cjit-linux-aarch64/cjit-linux-aarch64
