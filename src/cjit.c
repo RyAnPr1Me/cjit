@@ -15,27 +15,47 @@
  * │   Background threads (started by cjit_start)                           │
  * │   ─────────────────────────────────────────                             │
  * │                                                                         │
- * │   ┌──────────────────────────────────────────────────┐                 │
- * │   │  Monitor thread (×1)                             │                 │
- * │   │   • Wakes every monitor_interval_ms              │                 │
- * │   │   • Scans call_cnt of all registered functions   │                 │
- * │   │   • Detects hot functions (cnt ≥ hot_threshold)  │                 │
- * │   │   • Enqueues compile_task onto MPMC work-queue   │                 │
- * │   └──────────────────────────┬───────────────────────┘                 │
- * │                              │  (lock-free MPMC queue)                 │
- * │   ┌──────────────────────────▼───────────────────────┐                 │
- * │   │  Compiler threads (×3, CJIT_COMPILER_THREADS)   │                 │
- * │   │   • Spin-sleep waiting for compile_task          │                 │
- * │   │   • Call codegen_compile(ir_source, level, …)    │                 │
- * │   │   • On success: func_table_swap(new_fn, handle)  │                 │
- * │   │   • Retire old handle via dgc_retire()           │                 │
- * │   └──────────────────────────┬───────────────────────┘                 │
- * │                              │  (lock-free retire stack)               │
- * │   ┌──────────────────────────▼───────────────────────┐                 │
- * │   │  GC thread (×1, inside deferred_gc)              │                 │
- * │   │   • Wakes every sweep_interval_ms                │                 │
- * │   │   • dlclose handles older than grace_period_ms   │                 │
- * │   └──────────────────────────────────────────────────┘                 │
+ * │   ┌──────────────────────────────────────────────────────────────┐  │
+ * │   │  Monitor thread (×1)                                         │  │
+ * │   │   • Wakes every monitor_interval_ms (nanosleep, low CPU)     │  │
+ * │   │   • Maintains per-function EMA of call rate                  │  │
+ * │   │   • Promotes functions to O2/O3 only after hot_confirm_cycles│  │
+ * │   │     consecutive above-threshold scans (rejects brief spikes) │  │
+ * │   │   • Adaptive cooloff: max(cfg.cooloff, 2×last_compile_ms)    │  │
+ * │   │   • Non-blocking async IR prefetch via ir_cache_prefetch()   │  │
+ * │   └─────────────────────────────┬────────────────────────────────┘  │
+ * │                                 │  (per-thread lock-free MPMC queues)│
+ * │   ┌─────────────────────────────▼────────────────────────────────┐  │
+ * │   │  Compiler threads (×[1..CJIT_COMPILER_THREADS], dynamic)     │  │
+ * │   │   • Each owns one MPMC queue; tasks routed by func_id%%n      │  │
+ * │   │   • Work-steals from neighbours when own queue empty         │  │
+ * │   │   • Blocks on shared condvar (instant wake on enqueue)       │  │
+ * │   │   • Fetches IR via ir_cache_get_ir() (COLD→WARM on miss)     │  │
+ * │   │   • Compiles via posix_spawnp(cc) — no shell overhead        │  │
+ * │   │   • Atomic func_table_swap + dgc_retire(old_handle)          │  │
+ * │   │   • Writes last_compile_duration_ms for adaptive cooloff      │  │
+ * │   └─────────────────────────────┬────────────────────────────────┘  │
+ * │                                 │  (lock-free retire stack)          │
+ * │   ┌─────────────────────────────▼────────────────────────────────┐  │
+ * │   │  GC thread (×1, inside deferred_gc)                          │  │
+ * │   │   • Pre-allocated pool of retire_entry_t nodes (no malloc)   │  │
+ * │   │   • Sleeps exactly until next handle becomes freeable        │  │
+ * │   │   • Exponential back-off when retire stack is empty          │  │
+ * │   │   • dlclose handles older than grace_period_ms               │  │
+ * │   └──────────────────────────────────────────────────────────────┘  │
+ * │                                                                       │
+ * │   IR cache (per engine, background threads)                           │
+ * │   ──────────────────────────────────────                              │
+ * │   ┌─────────────────────────────────────────────────────────────┐    │
+ * │   │  I/O prefetch pool (×[0..cfg.io_threads])                   │    │
+ * │   │   • Drains pf_buf FIFO of prefetch requests                 │    │
+ * │   │   • Promotes COLD IR → WARM in background (hides disk I/O)  │    │
+ * │   └─────────────────────────────────────────────────────────────┘    │
+ * │   ┌─────────────────────────────────────────────────────────────┐    │
+ * │   │  Memory-pressure monitor thread (×1)                        │    │
+ * │   │   • Polls /proc/meminfo; adjusts HOT/WARM cache capacities  │    │
+ * │   │   • Proactively evicts HOT→WARM / WARM→COLD under pressure  │    │
+ * │   └─────────────────────────────────────────────────────────────┘    │
  * │                                                                         │
  * └─────────────────────────────────────────────────────────────────────────┘
  *
@@ -329,9 +349,29 @@ static void *compiler_thread_fn(void *raw_arg)
 
         /* Acquire per-entry compile lock (non-blocking trylock). */
         if (pthread_mutex_trylock(&entry->compile_lock) != 0) {
-            /* Another thread is compiling this function; re-enqueue to its
-             * affinity queue so it is not lost. */
-            mpmc_enqueue(&engine->work_queues[task.func_id % n], &task);
+            /*
+             * Another thread is already compiling this function.
+             *
+             * Problem without a fix: in_queue was cleared above, so the
+             * monitor may independently enqueue a fresh copy of this task.
+             * If we also re-enqueue our copy, there will be two tasks for
+             * the same function → queue bloat → repeated trylock failures
+             * until the first compilation finishes and version increments.
+             *
+             * Fix: try to reclaim in_queue atomically before re-enqueuing.
+             *   CAS succeeds → we own in_queue; re-enqueue our copy as the
+             *                  canonical pending task; monitor won't add more.
+             *   CAS fails    → monitor already set in_queue=true and enqueued
+             *                  a fresh copy; our copy is redundant — discard.
+             */
+            bool exp = false;
+            if (atomic_compare_exchange_strong_explicit(
+                    &entry->in_queue, &exp, true,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                /* We reclaimed the slot; re-enqueue our task. */
+                mpmc_enqueue(&engine->work_queues[task.func_id % n], &task);
+            }
+            /* else: monitor's fresh copy is already in the queue; drop ours. */
             continue;
         }
 
@@ -959,7 +999,7 @@ void cjit_print_stats(const cjit_engine_t *engine)
 uint64_t cjit_get_call_count(const cjit_engine_t *engine, func_id_t id)
 {
     const func_table_entry_t *e =
-        func_table_get((func_table_t *)engine->ftable, id);
+        func_table_get(engine->ftable, id);
     if (!e) return 0;
     return atomic_load_explicit(&e->call_cnt, memory_order_relaxed);
 }
@@ -968,7 +1008,7 @@ opt_level_t cjit_get_current_opt_level(const cjit_engine_t *engine,
                                         func_id_t id)
 {
     const func_table_entry_t *e =
-        func_table_get((func_table_t *)engine->ftable, id);
+        func_table_get(engine->ftable, id);
     if (!e) return OPT_NONE;
     return (opt_level_t)atomic_load_explicit(&e->cur_level, memory_order_relaxed);
 }

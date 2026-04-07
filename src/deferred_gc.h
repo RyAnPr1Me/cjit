@@ -63,6 +63,16 @@ typedef struct retire_entry {
 } retire_entry_t;
 
 /**
+ * Number of pre-allocated retire_entry_t nodes in the embedded pool.
+ *
+ * At any moment the retire stack holds at most (compiler_threads × 2) +
+ * in-flight-GC entries.  256 is generous even for the maximum 16 compiler
+ * threads; the pool is intentionally oversized so malloc fallback is
+ * essentially never triggered in practice.
+ */
+#define DGC_POOL_SIZE 256u
+
+/**
  * Deferred-GC context.
  *
  * One instance is embedded inside cjit_engine_t.  The GC thread is started
@@ -71,6 +81,26 @@ typedef struct retire_entry {
 typedef struct {
     /** Lock-free retire stack (NULL = empty). */
     _Atomic(retire_entry_t *) head;
+
+    /**
+     * Lock-free freelist of pre-allocated retire_entry_t nodes.
+     *
+     * dgc_retire() pops a node from this list instead of calling malloc().
+     * dgc_sweep() returns freed nodes to the list instead of calling free().
+     * On pool exhaustion dgc_retire() falls back to malloc() transparently.
+     *
+     * Uses the same CAS-loop LIFO pattern as the retire stack itself.
+     */
+    _Atomic(retire_entry_t *) pool_head;
+
+    /**
+     * Heap-allocated backing storage for the pool nodes.
+     *
+     * Allocated in dgc_init(), freed in dgc_stop() after the final sweep.
+     * May be NULL if the initial allocation failed (graceful degradation to
+     * malloc-only mode).
+     */
+    retire_entry_t *pool_storage;
 
     /** Milliseconds to wait before freeing a retired handle. */
     uint32_t  grace_period_ms;

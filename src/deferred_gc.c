@@ -15,6 +15,55 @@
 #include <dlfcn.h>    /* dlclose       */
 #include <errno.h>
 
+/* ─────────────────────── pool helpers ──────────────────────────────────────── */
+
+/**
+ * Push a node onto the pre-allocated freelist (lock-free LIFO, same CAS
+ * pattern as the retire stack).
+ */
+static void pool_push(deferred_gc_t *dgc, retire_entry_t *entry)
+{
+    retire_entry_t *old_head;
+    do {
+        old_head    = atomic_load_explicit(&dgc->pool_head, memory_order_relaxed);
+        entry->next = old_head;
+    } while (!atomic_compare_exchange_weak_explicit(
+                 &dgc->pool_head, &old_head, entry,
+                 memory_order_release, memory_order_relaxed));
+}
+
+/**
+ * Pop one node from the pre-allocated freelist.
+ *
+ * Returns NULL if the pool is exhausted (caller falls back to malloc).
+ */
+static retire_entry_t *pool_pop(deferred_gc_t *dgc)
+{
+    retire_entry_t *head;
+    head = atomic_load_explicit(&dgc->pool_head, memory_order_acquire);
+    for (;;) {
+        if (!head) return NULL;
+        if (atomic_compare_exchange_weak_explicit(
+                &dgc->pool_head, &head, head->next,
+                memory_order_acquire, memory_order_relaxed))
+            return head;
+    }
+}
+
+/**
+ * Return true if entry is within the pre-allocated pool backing storage.
+ *
+ * Used by dgc_sweep() to decide whether to pool_push() or free() a node.
+ */
+static bool pool_owns(const deferred_gc_t *dgc, const retire_entry_t *entry)
+{
+    if (!dgc->pool_storage) return false;
+    return entry >= dgc->pool_storage &&
+           entry <  dgc->pool_storage + DGC_POOL_SIZE;
+}
+
+
+
 /* ─────────────────────── internal helpers ──────────────────────────────────── */
 
 /**
@@ -145,12 +194,23 @@ void dgc_init(deferred_gc_t *dgc, uint32_t grace_period_ms)
 {
     memset(dgc, 0, sizeof(*dgc));
     atomic_init(&dgc->head,          NULL);
+    atomic_init(&dgc->pool_head,     NULL);
     atomic_init(&dgc->stop_flag,     false);
     atomic_init(&dgc->total_retired,  0);
     atomic_init(&dgc->total_freed,    0);
 
     dgc->grace_period_ms = grace_period_ms;
-    /* sweep_interval_ms is gone; gc_thread_fn manages its own adaptive sleep. */
+
+    /*
+     * Pre-allocate the node pool.  Push all DGC_POOL_SIZE nodes onto the
+     * freelist so dgc_retire() can pop them without calling malloc().
+     * If allocation fails we degrade gracefully to malloc-only mode.
+     */
+    dgc->pool_storage = malloc(DGC_POOL_SIZE * sizeof(retire_entry_t));
+    if (dgc->pool_storage) {
+        for (uint32_t i = 0; i < DGC_POOL_SIZE; ++i)
+            pool_push(dgc, &dgc->pool_storage[i]);
+    }
 }
 
 void dgc_start(deferred_gc_t *dgc)
@@ -164,18 +224,30 @@ void dgc_stop(deferred_gc_t *dgc)
     atomic_store_explicit(&dgc->stop_flag, true, memory_order_release);
     pthread_join(dgc->thread, NULL);
     /* gc_thread_fn already called dgc_sweep(force=true) before exit. */
+
+    /* Free the pre-allocated node pool backing storage. */
+    free(dgc->pool_storage);
+    dgc->pool_storage = NULL;
 }
 
 void dgc_retire(deferred_gc_t *dgc, void *handle)
 {
     if (!handle) return;
 
-    retire_entry_t *entry = malloc(sizeof(*entry));
+    /*
+     * Obtain a retire_entry_t node from the pre-allocated pool if possible,
+     * falling back to malloc() only when the pool is exhausted (extremely
+     * rare: requires >DGC_POOL_SIZE concurrent in-flight retirements).
+     */
+    retire_entry_t *entry = pool_pop(dgc);
     if (!entry) {
-        /* Allocation failure is non-fatal; leak the handle rather than crash.
-         * In production, a pre-allocated pool would be used instead.       */
-        dlclose(handle);
-        return;
+        entry = malloc(sizeof(*entry));
+        if (!entry) {
+            /* Allocation failure is non-fatal; dlclose immediately rather
+             * than crash or leak.                                         */
+            dlclose(handle);
+            return;
+        }
     }
     entry->handle     = handle;
     entry->retire_ms  = now_ms();
@@ -200,7 +272,12 @@ uint32_t dgc_sweep(deferred_gc_t *dgc, bool force)
             /* Safe to reclaim. */
             if (list->handle) dlclose(list->handle);
             atomic_fetch_add_explicit(&dgc->total_freed, 1, memory_order_relaxed);
-            free(list);
+            /* Return the node to the pool if it came from there; otherwise
+             * free() it (it was malloc'd as a pool-exhaustion fallback).  */
+            if (pool_owns(dgc, list))
+                pool_push(dgc, list);
+            else
+                free(list);
         } else {
             /* Not yet ready: compute remaining lifetime with underflow guard. */
             uint64_t age = now - list->retire_ms;

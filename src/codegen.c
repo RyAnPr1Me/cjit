@@ -17,6 +17,9 @@
 #include <pthread.h>     /* pthread_self                           */
 #include <dlfcn.h>       /* dlopen, dlsym, dlerror                */
 #include <sys/types.h>
+#include <sys/wait.h>     /* waitpid           */
+#include <spawn.h>        /* posix_spawnp      */
+#include <fcntl.h>        /* O_WRONLY etc.     */
 
 /* ─────────────────────────── preamble injected before user IR ─────────────── */
 
@@ -74,72 +77,73 @@ static const char CODEGEN_PREAMBLE[] =
 /* ─────────────────────────── optimisation flags ───────────────────────────── */
 
 /**
- * Build the compiler flag string for the given optimisation tier.
+ * Maximum number of arguments passed to the compiler subprocess.
  *
- * The resulting string is appended to the cc command after "-shared -fPIC".
+ * cc(1) + -shared + -fPIC + opt-level + up to 7 optional flags + -w +
+ * -o + so_path + src_path + NULL = at most 16 entries; 24 gives headroom.
  */
-static void build_opt_flags(char *buf, size_t bufsz,
-                             opt_level_t level, const codegen_opts_t *opts)
+#define MAX_CC_ARGS 24
+
+/**
+ * Build the compiler argv array for posix_spawnp().
+ *
+ * Fills argv[0..n] where argv[n] == NULL and returns n.
+ * All string pointers are either string literals (stable) or the caller-
+ * supplied so_path / src_path (valid for the duration of codegen_compile).
+ */
+static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
+                                const char *so_path,
+                                const char *src_path,
+                                opt_level_t level,
+                                const codegen_opts_t *opts)
 {
     int n = 0;
+    argv[n++] = "cc";
+    argv[n++] = "-shared";
+    argv[n++] = "-fPIC";
 
     /* Base optimisation level */
     switch (level) {
-    case OPT_NONE: n += snprintf(buf + n, bufsz - n, " -O0"); break;
-    case OPT_O1:   n += snprintf(buf + n, bufsz - n, " -O1"); break;
-    case OPT_O2:   n += snprintf(buf + n, bufsz - n, " -O2"); break;
-    case OPT_O3:   n += snprintf(buf + n, bufsz - n, " -O3"); break;
-    default:       n += snprintf(buf + n, bufsz - n, " -O2"); break;
+    case OPT_NONE: argv[n++] = "-O0"; break;
+    case OPT_O1:   argv[n++] = "-O1"; break;
+    case OPT_O2:   argv[n++] = "-O2"; break;
+    case OPT_O3:   argv[n++] = "-O3"; break;
+    default:       argv[n++] = "-O2"; break;
     }
-    if (n < 0) n = 0;
 
-    /* Optional flags controlled by codegen_opts_t */
     if (opts->enable_inlining && level >= OPT_O2)
-        n += snprintf(buf + n, bufsz - n, " -finline-functions");
+        argv[n++] = "-finline-functions";
 
     if (opts->enable_loop_unroll && level >= OPT_O2)
-        n += snprintf(buf + n, bufsz - n, " -funroll-loops");
+        argv[n++] = "-funroll-loops";
 
     if (opts->enable_vectorization && level >= OPT_O2)
-        n += snprintf(buf + n, bufsz - n, " -ftree-vectorize");
+        argv[n++] = "-ftree-vectorize";
 
-    if (level >= OPT_O2)
-        n += snprintf(buf + n, bufsz - n, " -fomit-frame-pointer");
+    if (level >= OPT_O2) {
+        argv[n++] = "-fomit-frame-pointer";
+        /*
+         * Disable ELF symbol interposition for shared-library symbols.
+         * With -fPIC the compiler otherwise assumes any call may be
+         * intercepted by LD_PRELOAD, preventing inlining and devirt.
+         * Each cjit .so is RTLD_LOCAL + single translation unit, so
+         * interposition cannot happen.  GCC ≥ 8 / Clang ≥ 6.
+         */
+        argv[n++] = "-fno-semantic-interposition";
+    }
 
-    /*
-     * Disable ELF symbol interposition for shared-library symbols.
-     * With -fPIC the compiler is otherwise forced to assume that any
-     * call or global access might be redirected by LD_PRELOAD, which
-     * prevents inlining of non-static functions and devirtualization.
-     * Since each cjit .so is opened with RTLD_LOCAL and contains only
-     * a single translation unit, interposition cannot happen and this
-     * restriction is safe to lift.  The flag is available in GCC ≥ 8
-     * and Clang ≥ 6.
-     */
-    if (level >= OPT_O2)
-        n += snprintf(buf + n, bufsz - n, " -fno-semantic-interposition");
-
-    /* march=native only at the most aggressive tier to avoid ABI issues */
     if (opts->enable_native_arch && level >= OPT_O3)
-        n += snprintf(buf + n, bufsz - n, " -march=native");
+        argv[n++] = "-march=native";
 
-    /*
-     * Fast-math: allows reassociation and approximations that are not
-     * IEEE-754 strictly conformant.  Enabled only when the caller opts in
-     * and only at the most aggressive tier.
-     */
     if (opts->enable_fast_math && level >= OPT_O3)
-        n += snprintf(buf + n, bufsz - n, " -ffast-math");
+        argv[n++] = "-ffast-math";
 
-    /* Always hide non-exported symbols to avoid clash across multiple .so.
-     * We do NOT use -fvisibility=hidden here: each .so is dlopened with
-     * RTLD_LOCAL and contains exactly one function; there is no collision
-     * risk, and hiding symbols would make dlsym() fail to find the entry. */
-
-    /* Suppress warnings – we may be compiling user snippets */
-    n += snprintf(buf + n, bufsz - n, " -w");
-
-    (void)n;
+    argv[n++] = "-w";   /* suppress warnings from user snippets */
+    argv[n++] = "-o";
+    argv[n++] = so_path;
+    argv[n++] = src_path;
+    argv[n]   = NULL;
+    return n;
 }
 
 /* ─────────────────────────── unique temp-file naming ───────────────────────── */
@@ -195,23 +199,50 @@ bool codegen_compile(const char          *func_name,
     fputc('\n', f);
     fclose(f);
 
-    /* ── 3. Build compiler command ────────────────────────────────────── */
-    char opt_flags[512] = {0};
-    build_opt_flags(opt_flags, sizeof(opt_flags), level, opts);
-
-    char cmd[2048];
+    /* ── 3. Build compiler argv ──────────────────────────────────────── */
+    const char *cc_argv[MAX_CC_ARGS];
     char err_path[304];
     snprintf(err_path, sizeof(err_path), "%s.err", prefix);
-    snprintf(cmd, sizeof(cmd),
-             "cc -shared -fPIC%s -o '%s' '%s' 2>'%s'",
-             opt_flags, so_path, src_path, err_path);
+    build_compiler_argv(cc_argv, so_path, src_path, level, opts);
 
     if (opts->verbose) {
-        fprintf(stderr, "[cjit/codegen] compile: %s\n", cmd);
+        fprintf(stderr, "[cjit/codegen] compile:");
+        for (int _i = 0; cc_argv[_i]; ++_i)
+            fprintf(stderr, " %s", cc_argv[_i]);
+        fprintf(stderr, " 2>%s\n", err_path);
     }
 
-    /* ── 4. Run the compiler ──────────────────────────────────────────── */
-    int rc = system(cmd);
+    /* ── 4. Spawn the compiler (no shell intermediate) ────────────────── */
+    /*
+     * posix_spawnp avoids the /bin/sh intermediate step that system() requires
+     * (fork → exec /bin/sh → exec cc → waitpid becomes fork → exec cc → waitpid).
+     * stderr is redirected to err_path via posix_spawn_file_actions; stdout
+     * is inherited from the engine process (same behaviour as system(cmd)).
+     *
+     * extern char **environ is declared in <unistd.h> when _GNU_SOURCE is set.
+     */
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, err_path,
+                                     O_WRONLY | O_CREAT | O_TRUNC, 0600);
+
+    pid_t cc_pid;
+    int spawn_err = posix_spawnp(&cc_pid, "cc", &fa, NULL,
+                                  (char *const *)cc_argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+
+    int rc;
+    if (spawn_err != 0) {
+        snprintf(result->errmsg, sizeof(result->errmsg),
+                 "codegen: posix_spawnp failed: %s", strerror(spawn_err));
+        unlink(src_path);
+        return false;
+    }
+    {
+        int status = 0;
+        waitpid(cc_pid, &status, 0);
+        rc = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : 1;
+    }
 
     /* Source file is no longer needed. */
     unlink(src_path);
