@@ -230,25 +230,28 @@ static bool engine_enqueue_task(cjit_engine_t *engine,
 /**
  * Main loop of a background compiler thread.
  *
- * The thread blocks on a condition variable when the work queue is empty.
- * engine_enqueue_task() signals the condvar immediately after enqueue so
- * compilation begins with minimal latency (no polling delay).
+ * Dequeue strategy (zero-contention fast path, graceful fallback):
+ *   1. Try own queue first (only consumer — never contends with peers).
+ *   2. If empty, round-robin work-steal from each other thread's queue.
+ *   3. If all queues empty, block on the shared condvar.
  *
  * Stale-task detection:
- *   If entry->version has advanced past task.version_req, this task was
- *   generated before the last successful compilation.  The entry is already
- *   at least as optimised as requested; discard and continue.
+ *   entry->version > task.version_req  →  a newer compilation already happened;
+ *   discard and continue.
  *
  * Concurrent compilation prevention:
- *   entry->compile_lock is a per-entry mutex.  trylock() is used so that if
- *   another compiler thread raced ahead on the same function, this thread
- *   simply skips it (the racing thread will perform the compilation).
+ *   compile_lock per entry: trylock(); if taken, re-enqueue to the affinity
+ *   queue and move on.  Because tasks are routed by (func_id % nthreads)
+ *   this almost always succeeds on the first attempt.
  */
-static void *compiler_thread_fn(void *arg)
+static void *compiler_thread_fn(void *raw_arg)
 {
-    cjit_engine_t *engine = (cjit_engine_t *)arg;
+    compiler_thread_arg_t *targ   = (compiler_thread_arg_t *)raw_arg;
+    cjit_engine_t         *engine = targ->engine;
+    uint32_t               me     = targ->thread_idx;
+    uint32_t               n      = engine->cfg.compiler_threads;
 
-    /* Build codegen options once – they don't change after cjit_start(). */
+    /* Build codegen options once – immutable after cjit_start(). */
     codegen_opts_t copts = {
         .enable_inlining      = engine->cfg.enable_inlining,
         .enable_vectorization = engine->cfg.enable_vectorization,
@@ -260,100 +263,99 @@ static void *compiler_thread_fn(void *arg)
 
     while (!atomic_load_explicit(&engine->stop_requested, memory_order_acquire)) {
 
+        /* Step 1: own queue – no peer contention. */
         compile_task_t task;
-        if (!mpmc_dequeue(&engine->work_queue, &task)) {
-            /*
-             * Queue is empty.  Block on the condition variable until either:
-             *   (a) engine_enqueue_task() signals us, or
-             *   (b) cjit_stop() broadcasts a shutdown.
-             *
-             * We hold work_cond_mutex while evaluating the predicate so the
-             * signal from engine_enqueue_task() cannot be lost between the
-             * mpmc_dequeue failure above and the pthread_cond_wait call.
-             */
-            pthread_mutex_lock(&engine->work_cond_mutex);
-            while (mpmc_size(&engine->work_queue) == 0 &&
-                   !atomic_load_explicit(&engine->stop_requested,
-                                         memory_order_relaxed)) {
-                pthread_cond_wait(&engine->work_cond, &engine->work_cond_mutex);
+        bool got = mpmc_dequeue(&engine->work_queues[me], &task);
+
+        /* Step 2: work-steal from neighbours round-robin. */
+        if (!got) {
+            for (uint32_t i = 1; i < n; ++i) {
+                if (mpmc_dequeue(&engine->work_queues[(me + i) % n], &task)) {
+                    got = true;
+                    break;
+                }
             }
-            pthread_mutex_unlock(&engine->work_cond_mutex);
-            continue; /* retry mpmc_dequeue – another thread may have won */
         }
 
+        /* Step 3: all queues empty – block on condvar. */
+        if (!got) {
+            pthread_mutex_lock(&engine->work_cond_mutex);
+            /*
+             * Re-check all queues under the mutex so we cannot miss a signal
+             * that arrived after the steal loop above but before the lock.
+             */
+            bool any = false;
+            for (uint32_t i = 0; i < n && !any; ++i)
+                any = (mpmc_size(&engine->work_queues[i]) > 0);
+            if (!any && !atomic_load_explicit(&engine->stop_requested,
+                                              memory_order_relaxed))
+                pthread_cond_wait(&engine->work_cond, &engine->work_cond_mutex);
+            pthread_mutex_unlock(&engine->work_cond_mutex);
+            continue;
+        }
+
+        /* Got a task. */
         func_table_entry_t *entry = func_table_get(engine->ftable, task.func_id);
         if (!entry) continue;
 
         /*
-         * Clear in_queue so the monitor thread can re-enqueue this function
-         * later if it keeps getting hotter.
-         * We clear it BEFORE compiling so that if compilation is slow, the
-         * monitor can queue another pass.
+         * Clear in_queue BEFORE compiling so the monitor can re-enqueue if
+         * the function stays hot while a slow compilation is in flight.
          */
         atomic_store_explicit(&entry->in_queue, false, memory_order_relaxed);
 
-        /* Stale-task check: discard if a newer compilation already happened. */
+        /* Discard stale tasks. */
         uint32_t cur_ver = atomic_load_explicit(&entry->version,
                                                  memory_order_relaxed);
         if (cur_ver > task.version_req) {
-            if (engine->cfg.verbose) {
+            if (engine->cfg.verbose)
                 fprintf(stderr,
-                        "[cjit/compiler] discard stale task for '%s' "
-                        "(ver %u > req %u)\n",
-                        entry->name, cur_ver, task.version_req);
-            }
+                        "[cjit/compiler#%u] discard stale '%s' (ver %u > req %u)\n",
+                        me, entry->name, cur_ver, task.version_req);
             continue;
         }
 
-        /* Check current optimisation level: skip if already at target. */
+        /* Skip if already at the requested tier or higher. */
         opt_level_t cur_level =
             (opt_level_t)atomic_load_explicit(&entry->cur_level,
                                                memory_order_relaxed);
         if (cur_level >= task.target_level) {
-            if (engine->cfg.verbose) {
+            if (engine->cfg.verbose)
                 fprintf(stderr,
-                        "[cjit/compiler] skip '%s': already at O%d >= O%d\n",
-                        entry->name, (int)cur_level, (int)task.target_level);
-            }
+                        "[cjit/compiler#%u] skip '%s': already O%d >= O%d\n",
+                        me, entry->name, (int)cur_level, (int)task.target_level);
             continue;
         }
 
-        /* Try to acquire the per-entry compile lock (non-blocking). */
+        /* Acquire per-entry compile lock (non-blocking trylock). */
         if (pthread_mutex_trylock(&entry->compile_lock) != 0) {
-            /*
-             * Another compiler thread is already compiling this function.
-             * Re-enqueue the task so it is not lost, then move on.
-             */
-            mpmc_enqueue(&engine->work_queue, &task);
+            /* Another thread is compiling this function; re-enqueue to its
+             * affinity queue so it is not lost. */
+            mpmc_enqueue(&engine->work_queues[task.func_id % n], &task);
             continue;
         }
 
-        /* ── Compilation ──────────────────────────────────────────────── */
-        if (engine->cfg.verbose) {
+        /* Compilation. */
+        if (engine->cfg.verbose)
             fprintf(stderr,
-                    "[cjit/compiler] compiling '%s' at O%d (call_cnt=%llu)\n",
-                    entry->name, (int)task.target_level,
+                    "[cjit/compiler#%u] compiling '%s' O%d "
+                    "(call_cnt=%llu rate=%llucps)\n",
+                    me, entry->name, (int)task.target_level,
                     (unsigned long long)
-                    atomic_load_explicit(&entry->call_cnt, memory_order_relaxed));
-        }
+                    atomic_load_explicit(&entry->call_cnt, memory_order_relaxed),
+                    (unsigned long long)task.call_rate);
 
-        /*
-         * Fetch IR from the LRU cache.
-         * ir_cache_get_ir() promotes the entry toward HOT, loading from disk
-         * if the function was cold.  Returns a malloc'd copy we must free.
-         * Falls back to entry->ir_source if the cache returns NULL (e.g. the
-         * cache was not initialised or the function was registered without it).
-         */
-        const char *ir_to_use = NULL;
+        /* Fetch IR (promotes COLD->WARM; loads from disk if cold). */
+        const char *ir_to_use    = NULL;
         char       *ir_cache_copy = NULL;
         if (engine->ir_cache) {
             ir_cache_copy = ir_cache_get_ir(engine->ir_cache, task.func_id);
             ir_to_use     = ir_cache_copy;
         }
-        if (!ir_to_use)
-            ir_to_use = entry->ir_source;  /* fallback: original pointer */
+        if (!ir_to_use) ir_to_use = entry->ir_source;
         if (!ir_to_use) {
-            fprintf(stderr, "[cjit/compiler] no IR for '%s'\n", entry->name);
+            fprintf(stderr, "[cjit/compiler#%u] no IR for '%s'\n",
+                    me, entry->name);
             pthread_mutex_unlock(&entry->compile_lock);
             free(ir_cache_copy);
             continue;
@@ -362,14 +364,13 @@ static void *compiler_thread_fn(void *arg)
         codegen_result_t cres;
         bool ok = codegen_compile(entry->name, ir_to_use,
                                    task.target_level, &copts, &cres);
-        free(ir_cache_copy);  /* safe to free; codegen already read it */
+        free(ir_cache_copy);
 
         if (!ok) {
             atomic_fetch_add_explicit(&engine->stat_failed, 1,
                                       memory_order_relaxed);
-            fprintf(stderr,
-                    "[cjit/compiler] FAILED to compile '%s': %s\n",
-                    entry->name, cres.errmsg);
+            fprintf(stderr, "[cjit/compiler#%u] FAILED '%s': %s\n",
+                    me, entry->name, cres.errmsg);
             pthread_mutex_unlock(&entry->compile_lock);
             continue;
         }
@@ -377,42 +378,23 @@ static void *compiler_thread_fn(void *arg)
         atomic_fetch_add_explicit(&engine->stat_compilations, 1,
                                   memory_order_relaxed);
 
-        /* ── Atomic pointer swap ───────────────────────────────────────── */
-        /*
-         * func_table_swap():
-         *   1. Saves entry->dl_handle (old handle).
-         *   2. Sets entry->dl_handle = cres.handle.
-         *   3. atomic_store(&entry->func_ptr, cres.fn, release).
-         *   4. Increments entry->version.
-         *   5. Returns old handle.
-         *
-         * After this store, all runtime threads that subsequently load
-         * entry->func_ptr will get cres.fn.  Threads already inside the
-         * old function continue executing old code safely because the old
-         * shared object is kept alive by the dgc grace period.
-         */
+        /* Atomic RCU-style pointer swap. */
         void *old_handle = func_table_swap(engine->ftable, task.func_id,
                                             cres.fn, cres.handle,
                                             task.target_level);
-
         atomic_fetch_add_explicit(&engine->stat_swaps, 1,
                                   memory_order_relaxed);
-
         pthread_mutex_unlock(&entry->compile_lock);
 
-        /*
-         * Retire the old shared-object handle.
-         * dgc_retire() is wait-free (single CAS loop) and does not block.
-         * The GC thread will dlclose() it after grace_period_ms.
-         */
+        /* Retire old handle – GC thread dlclose's after the grace period. */
         dgc_retire(&engine->dgc, old_handle);
 
-        if (engine->cfg.verbose) {
+        if (engine->cfg.verbose)
             fprintf(stderr,
-                    "[cjit/compiler] swapped '%s' → O%d (ver %lu)\n",
-                    entry->name, (int)task.target_level,
-                    (unsigned long)atomic_load_explicit(&entry->version, memory_order_relaxed));
-        }
+                    "[cjit/compiler#%u] swapped '%s' -> O%d (ver %lu)\n",
+                    me, entry->name, (int)task.target_level,
+                    (unsigned long)atomic_load_explicit(&entry->version,
+                                                        memory_order_relaxed));
     }
 
     return NULL;
@@ -423,66 +405,134 @@ static void *compiler_thread_fn(void *arg)
 /**
  * Main loop of the hot-function monitor thread.
  *
- * Wakes every monitor_interval_ms and scans the function table looking for
- * functions whose call_cnt has crossed a hot threshold.  Qualifying functions
- * are enqueued for recompilation at the appropriate optimisation tier.
+ * Algorithm: confidence-based tier promotion
+ * ──────────────────────────────────────────
+ * All state is LOCAL to this function (zero hot-path overhead):
  *
- * The monitor thread does NOT read or write function pointers; it only reads
- * call_cnt (relaxed) and cur_level (relaxed), then enqueues compile tasks.
+ *   prev_cnt[i]       – call_cnt at the previous scan (for delta / rate)
+ *   hot_streak[i]     – consecutive scan cycles above the rate threshold
+ *   cnt_at_compile[i] – call_cnt when the last compile task was enqueued
+ *   last_queued_ms[i] – monotonic timestamp when the last task was enqueued
  *
- * Two tiers:
- *   T1 (OPT_O2): triggered when call_cnt ≥ hot_threshold_t1
- *   T2 (OPT_O3): triggered when call_cnt ≥ hot_threshold_t2
+ * Per-scan decision for function i:
  *
- * De-duplication: in_queue is set atomically before enqueue to prevent
- * duplicate entries in the work queue.
+ *   delta = call_cnt[i] - prev_cnt[i]
+ *   rate  = delta * 1000 / interval_ms        (calls/sec)
+ *   prev_cnt[i] = call_cnt[i]
+ *
+ *   T1 (OPT_O2, first JIT compile):
+ *     if rate >= hot_rate_t1:
+ *       hot_streak[i]++
+ *       if hot_streak[i] >= hot_confirm_cycles  AND
+ *          (now - last_queued_ms[i]) >= compile_cooloff_ms:
+ *         enqueue O2
+ *     else:
+ *       hot_streak[i] = 0           // reset on any cold cycle
+ *
+ *   T2 (OPT_O3 upgrade from O2):
+ *     same streak/cooloff gate, PLUS:
+ *       (call_cnt[i] - cnt_at_compile[i]) >= min_calls_for_tier2
+ *     This ensures there is hard evidence that the function remained hot
+ *     long enough after O2 compilation to justify the extra O3 cost.
+ *
+ * The streak requirement rejects brief call spikes; the calls-since-compile
+ * requirement rejects functions that were hot once but have since cooled.
+ * Together they ensure every O3 compile has a realistic chance of paying off.
  */
 static void *monitor_thread_fn(void *arg)
 {
-    cjit_engine_t *engine = (cjit_engine_t *)arg;
+    cjit_engine_t *engine     = (cjit_engine_t *)arg;
+    uint32_t       max_funcs  = engine->cfg.max_functions;
+    uint32_t       itvl_ms    = engine->cfg.monitor_interval_ms;
+
+    /* Per-function monitoring state, private to this thread. */
+    uint64_t *prev_cnt        = calloc(max_funcs, sizeof(uint64_t));
+    uint32_t *hot_streak      = calloc(max_funcs, sizeof(uint32_t));
+    uint64_t *cnt_at_compile  = calloc(max_funcs, sizeof(uint64_t));
+    uint64_t *last_queued_ms  = calloc(max_funcs, sizeof(uint64_t));
+
+    if (!prev_cnt || !hot_streak || !cnt_at_compile || !last_queued_ms) {
+        free(prev_cnt); free(hot_streak);
+        free(cnt_at_compile); free(last_queued_ms);
+        return NULL;
+    }
 
     struct timespec interval;
-    interval.tv_sec  = engine->cfg.monitor_interval_ms / 1000;
-    interval.tv_nsec = (long)(engine->cfg.monitor_interval_ms % 1000) * 1000000L;
+    interval.tv_sec  = itvl_ms / 1000;
+    interval.tv_nsec = (long)(itvl_ms % 1000) * 1000000L;
+
+    /* Safe division: avoid divide-by-zero if interval_ms somehow 0. */
+    uint32_t itvl_safe = itvl_ms > 0 ? itvl_ms : 1;
 
     while (!atomic_load_explicit(&engine->stop_requested, memory_order_acquire)) {
         nanosleep(&interval, NULL);
 
-        uint32_t n = atomic_load_explicit(&engine->ftable->count,
-                                           memory_order_acquire);
+        uint64_t now = engine_now_ms();
+        uint32_t n   = atomic_load_explicit(&engine->ftable->count,
+                                             memory_order_acquire);
 
         for (uint32_t i = 0; i < n; ++i) {
             func_table_entry_t *entry = &engine->ftable->entries[i];
 
-            uint64_t cnt = atomic_load_explicit(&entry->call_cnt,
-                                                 memory_order_relaxed);
+            /* Read current call count (relaxed – approximation is fine). */
+            uint64_t cur_cnt = atomic_load_explicit(&entry->call_cnt,
+                                                     memory_order_relaxed);
+            uint64_t delta   = cur_cnt - prev_cnt[i];
+            prev_cnt[i]      = cur_cnt;
 
-            /* Determine the target optimisation tier. */
-            opt_level_t target;
-            if (cnt >= engine->cfg.hot_threshold_t2)
-                target = OPT_O3;
-            else if (cnt >= engine->cfg.hot_threshold_t1)
-                target = OPT_O2;
-            else
-                continue; /* Not hot enough yet. */
+            /* calls per second over this interval */
+            uint64_t rate = delta * 1000ULL / itvl_safe;
 
-            /* Skip if already compiled at this tier. */
-            opt_level_t cur =
+            opt_level_t cur_level =
                 (opt_level_t)atomic_load_explicit(&entry->cur_level,
                                                    memory_order_relaxed);
-            if (cur >= target) continue;
 
-            /*
-             * Atomically set in_queue = true.
-             * expected = false, desired = true.
-             * If it was already true, another enqueue is already pending.
-             */
+            /* Already at maximum tier – nothing to do. */
+            if (cur_level >= OPT_O3) {
+                hot_streak[i] = 0;
+                continue;
+            }
+
+            /* Determine target tier and required rate threshold. */
+            opt_level_t target;
+            uint64_t    rate_thresh;
+            if (cur_level < OPT_O2) {
+                target      = OPT_O2;
+                rate_thresh = engine->cfg.hot_rate_t1;
+            } else {
+                target      = OPT_O3;
+                rate_thresh = engine->cfg.hot_rate_t2;
+            }
+
+            /* Rate gate: must sustain above threshold for hot_confirm_cycles. */
+            if (rate >= rate_thresh) {
+                if (hot_streak[i] < engine->cfg.hot_confirm_cycles)
+                    hot_streak[i]++;
+            } else {
+                hot_streak[i] = 0;   /* any cold cycle resets the streak */
+                continue;
+            }
+
+            if (hot_streak[i] < engine->cfg.hot_confirm_cycles)
+                continue;            /* not yet confident enough */
+
+            /* Cooloff gate: don't thrash recompilation. */
+            if ((now - last_queued_ms[i]) < engine->cfg.compile_cooloff_ms)
+                continue;
+
+            /* T2-only gate: require enough calls since the O2 compilation. */
+            if (target == OPT_O3) {
+                uint64_t calls_since = cur_cnt - cnt_at_compile[i];
+                if (calls_since < engine->cfg.min_calls_for_tier2)
+                    continue;
+            }
+
+            /* All gates passed – try to enqueue. */
             bool expected = false;
             if (!atomic_compare_exchange_strong_explicit(
                     &entry->in_queue, &expected, true,
-                    memory_order_relaxed, memory_order_relaxed)) {
-                continue; /* Already queued. */
-            }
+                    memory_order_relaxed, memory_order_relaxed))
+                continue;   /* already queued */
 
             compile_task_t task = {
                 .func_id      = entry->id,
@@ -490,22 +540,32 @@ static void *monitor_thread_fn(void *arg)
                 .priority     = (target == OPT_O3) ? 2 : 1,
                 .version_req  = atomic_load_explicit(&entry->version,
                                                       memory_order_relaxed),
+                .call_rate    = rate,
             };
 
             if (!engine_enqueue_task(engine, &task)) {
-                /* Queue full: clear in_queue flag so we can retry later. */
+                /* Queue full: clear in_queue so we retry next scan. */
                 atomic_store_explicit(&entry->in_queue, false,
                                       memory_order_relaxed);
-            } else if (engine->cfg.verbose) {
-                fprintf(stderr,
-                        "[cjit/monitor] enqueued '%s' for O%d "
-                        "(call_cnt=%llu)\n",
-                        entry->name, (int)target,
-                        (unsigned long long)cnt);
+            } else {
+                cnt_at_compile[i] = cur_cnt;
+                last_queued_ms[i] = now;
+                hot_streak[i]     = 0;  /* reset; re-confirm before next tier */
+                if (engine->cfg.verbose)
+                    fprintf(stderr,
+                            "[cjit/monitor] enqueued '%s' for O%d "
+                            "(rate=%llucps streak=%u)\n",
+                            entry->name, (int)target,
+                            (unsigned long long)rate,
+                            engine->cfg.hot_confirm_cycles);
             }
         }
     }
 
+    free(prev_cnt);
+    free(hot_streak);
+    free(cnt_at_compile);
+    free(last_queued_ms);
     return NULL;
 }
 
@@ -515,34 +575,40 @@ cjit_config_t cjit_default_config(void)
 {
     cjit_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    cfg.max_functions    = CJIT_MAX_FUNCTIONS;
+    cfg.max_functions = CJIT_MAX_FUNCTIONS;
 
     /*
-     * Default compiler thread count: (online CPUs - 1), so one CPU is
-     * always available for the main/runtime threads.  Clamped to
-     * [1, CJIT_COMPILER_THREADS].  Falls back to 1 when sysconf fails.
+     * Default compiler thread count: (online CPUs - 1) so one CPU is always
+     * available for the caller.  Clamped to [1, CJIT_COMPILER_THREADS].
+     * Falls back to 1 when sysconf fails.
      */
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     uint32_t nthreads = (ncpu > 1) ? (uint32_t)(ncpu - 1) : 1;
     if (nthreads > CJIT_COMPILER_THREADS) nthreads = CJIT_COMPILER_THREADS;
-    cfg.compiler_threads     = nthreads;
+    cfg.compiler_threads = nthreads;
 
-    cfg.hot_threshold_t1     = CJIT_HOT_THRESHOLD_T1;
-    cfg.hot_threshold_t2     = CJIT_HOT_THRESHOLD_T2;
-    cfg.grace_period_ms      = CJIT_GRACE_PERIOD_MS;
-    cfg.monitor_interval_ms  = 50;
+    cfg.hot_threshold_t1    = CJIT_HOT_THRESHOLD_T1;
+    cfg.hot_threshold_t2    = CJIT_HOT_THRESHOLD_T2;
+    cfg.grace_period_ms     = CJIT_GRACE_PERIOD_MS;
+    cfg.monitor_interval_ms = 50;
+
+    /* Hot-function detection (confidence-based). */
+    cfg.hot_rate_t1         = 1000;   /* calls/sec to trigger O2 */
+    cfg.hot_rate_t2         = 5000;   /* calls/sec to trigger O3 */
+    cfg.hot_confirm_cycles  = 3;      /* consecutive hot scans before promoting */
+    cfg.min_calls_for_tier2 = 2000;   /* min calls since O2 before trying O3 */
+    cfg.compile_cooloff_ms  = 500;    /* min ms between promotions */
+
     cfg.enable_inlining      = true;
     cfg.enable_vectorization = true;
     cfg.enable_loop_unroll   = true;
     cfg.enable_const_fold    = true;
     cfg.enable_native_arch   = true;
-    cfg.enable_fast_math     = false; /* opt-in: may change FP semantics */
+    cfg.enable_fast_math     = false;
     cfg.verbose              = false;
-    /* IR LRU cache */
+
     cfg.hot_ir_cache_size         = 64;
     cfg.warm_ir_cache_size        = 128;
-    /* ir_disk_dir: empty → auto (/tmp/cjit_ir_<pid>) */
-    /* Memory pressure */
     cfg.mem_pressure_check_ms     = 500;
     cfg.mem_pressure_low_pct      = 20;
     cfg.mem_pressure_high_pct     = 10;
@@ -557,16 +623,19 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
 
     e->cfg = config ? *config : cjit_default_config();
 
-    /* Clamp compiler_threads to the compile-time maximum. */
+    /* Clamp / floor compiler_threads. */
     if (e->cfg.compiler_threads > CJIT_COMPILER_THREADS)
         e->cfg.compiler_threads = CJIT_COMPILER_THREADS;
     if (e->cfg.compiler_threads == 0)
         e->cfg.compiler_threads = 1;
 
+    /* Clamp hot-detection config to sane ranges. */
+    if (e->cfg.hot_confirm_cycles == 0) e->cfg.hot_confirm_cycles = 1;
+    if (e->cfg.compile_cooloff_ms == 0) e->cfg.compile_cooloff_ms = 1;
+
     e->ftable = func_table_create(e->cfg.max_functions);
     if (!e->ftable) { free(e); return NULL; }
 
-    /* Create the IR LRU cache with memory-pressure awareness. */
     ir_cache_config_t icc = {
         .max_funcs             = e->cfg.max_functions,
         .hot_cap               = e->cfg.hot_ir_cache_size,
@@ -578,20 +647,45 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
         .mem_critical_pct      = e->cfg.mem_pressure_critical_pct,
     };
     e->ir_cache = ir_cache_create(&icc);
-    if (!e->ir_cache) {
+    if (!e->ir_cache) { func_table_destroy(e->ftable); free(e); return NULL; }
+
+    /* Per-thread work queues. */
+    e->work_queues = calloc(e->cfg.compiler_threads, sizeof(mpmc_queue_t));
+    if (!e->work_queues) {
+        ir_cache_destroy(e->ir_cache);
+        func_table_destroy(e->ftable);
+        free(e);
+        return NULL;
+    }
+    for (uint32_t i = 0; i < e->cfg.compiler_threads; ++i)
+        mpmc_init(&e->work_queues[i]);
+
+    /* Condition variable for instant compiler wake-up. */
+    pthread_mutex_init(&e->work_cond_mutex, NULL);
+    pthread_cond_init(&e->work_cond, NULL);
+
+    /* Dynamic thread arrays. */
+    e->compiler_threads = calloc(e->cfg.compiler_threads, sizeof(pthread_t));
+    e->thread_args      = calloc(e->cfg.compiler_threads,
+                                  sizeof(compiler_thread_arg_t));
+    if (!e->compiler_threads || !e->thread_args) {
+        free(e->compiler_threads); free(e->thread_args);
+        free(e->work_queues);
+        pthread_cond_destroy(&e->work_cond);
+        pthread_mutex_destroy(&e->work_cond_mutex);
+        ir_cache_destroy(e->ir_cache);
         func_table_destroy(e->ftable);
         free(e);
         return NULL;
     }
 
-    mpmc_init(&e->work_queue);
     dgc_init(&e->dgc, e->cfg.grace_period_ms);
 
-    atomic_init(&e->running,          false);
-    atomic_init(&e->stop_requested,   false);
-    atomic_init(&e->stat_compilations, 0);
-    atomic_init(&e->stat_failed,       0);
-    atomic_init(&e->stat_swaps,        0);
+    atomic_init(&e->running,           false);
+    atomic_init(&e->stop_requested,    false);
+    atomic_init(&e->stat_compilations,  0);
+    atomic_init(&e->stat_failed,        0);
+    atomic_init(&e->stat_swaps,         0);
 
     return e;
 }
@@ -603,16 +697,15 @@ void cjit_start(cjit_engine_t *engine)
     atomic_store_explicit(&engine->stop_requested, false, memory_order_release);
     atomic_store_explicit(&engine->running,        true,  memory_order_release);
 
-    /* Start the deferred-GC thread. */
     dgc_start(&engine->dgc);
 
-    /* Start monitor thread. */
     pthread_create(&engine->monitor_thread, NULL, monitor_thread_fn, engine);
 
-    /* Start background compiler threads. */
     for (uint32_t i = 0; i < engine->cfg.compiler_threads; ++i) {
+        engine->thread_args[i].engine     = engine;
+        engine->thread_args[i].thread_idx = i;
         pthread_create(&engine->compiler_threads[i], NULL,
-                       compiler_thread_fn, engine);
+                       compiler_thread_fn, &engine->thread_args[i]);
     }
 }
 
@@ -622,13 +715,15 @@ void cjit_stop(cjit_engine_t *engine)
 
     atomic_store_explicit(&engine->stop_requested, true, memory_order_release);
 
-    /* Wait for all threads to exit. */
-    for (uint32_t i = 0; i < engine->cfg.compiler_threads; ++i) {
+    /* Wake all sleeping compiler threads so they observe stop_requested. */
+    pthread_mutex_lock(&engine->work_cond_mutex);
+    pthread_cond_broadcast(&engine->work_cond);
+    pthread_mutex_unlock(&engine->work_cond_mutex);
+
+    for (uint32_t i = 0; i < engine->cfg.compiler_threads; ++i)
         pthread_join(engine->compiler_threads[i], NULL);
-    }
     pthread_join(engine->monitor_thread, NULL);
 
-    /* Stop GC (this runs a final forced sweep to free all retired handles). */
     dgc_stop(&engine->dgc);
 
     atomic_store_explicit(&engine->running, false, memory_order_release);
@@ -640,29 +735,29 @@ void cjit_destroy(cjit_engine_t *engine)
 
     cjit_stop(engine);
 
-    /*
-     * dlclose all remaining handles that are currently active in the table.
-     * (The deferred GC has already freed retired ones.)
-     */
     uint32_t n = atomic_load_explicit(&engine->ftable->count,
                                        memory_order_relaxed);
     for (uint32_t i = 0; i < n; ++i) {
         func_table_entry_t *entry = &engine->ftable->entries[i];
-        if (entry->dl_handle) {
-            dlclose(entry->dl_handle);
-            entry->dl_handle = NULL;
-        }
+        if (entry->dl_handle) { dlclose(entry->dl_handle); entry->dl_handle = NULL; }
     }
 
     func_table_destroy(engine->ftable);
     ir_cache_destroy(engine->ir_cache);
+
+    pthread_cond_destroy(&engine->work_cond);
+    pthread_mutex_destroy(&engine->work_cond_mutex);
+
+    free(engine->work_queues);
+    free(engine->compiler_threads);
+    free(engine->thread_args);
     free(engine);
 }
 
 func_id_t cjit_register_function(cjit_engine_t *engine,
-                                  const char    *name,
-                                  const char    *ir_source,
-                                  jit_func_t     aot_fallback)
+                                   const char    *name,
+                                   const char    *ir_source,
+                                   jit_func_t     aot_fallback)
 {
     if (!engine || !name || !ir_source) return CJIT_INVALID_FUNC_ID;
 
@@ -670,7 +765,6 @@ func_id_t cjit_register_function(cjit_engine_t *engine,
                                         aot_fallback);
     if (id == CJIT_INVALID_FUNC_ID) return id;
 
-    /* Register with the IR LRU cache (makes a copy, writes to disk). */
     if (engine->ir_cache)
         ir_cache_register(engine->ir_cache, id, name, ir_source);
 
@@ -680,12 +774,8 @@ func_id_t cjit_register_function(cjit_engine_t *engine,
 /*
  * cjit_get_func – THE HOT PATH.
  *
- * This is a single atomic load.  On x86-64 with TSO memory model the acquire
- * ordering compiles to a plain MOV instruction (no fence needed because TSO
- * provides load-acquire for free).  On ARMv8 it compiles to LDAR.
- *
- * The returned function pointer is guaranteed valid for at least
- * grace_period_ms milliseconds even if the pointer is swapped concurrently.
+ * Single acquire-load on x86-64 compiles to plain MOV (TSO provides load-
+ * acquire for free); on ARMv8 it compiles to LDAR.
  */
 jit_func_t cjit_get_func(cjit_engine_t *engine, func_id_t id)
 {
@@ -698,39 +788,51 @@ void cjit_record_call(cjit_engine_t *engine, func_id_t id)
 {
     func_table_entry_t *e = func_table_get(engine->ftable, id);
     if (__builtin_expect(!e, 0)) return;
-    /*
-     * Relaxed: we only care about the approximate magnitude of the counter.
-     * No ordering with respect to any other variable is required.
-     */
     atomic_fetch_add_explicit(&e->call_cnt, 1, memory_order_relaxed);
 }
 
+/*
+ * cjit_get_func_counted – combined single-lookup hot path.
+ *
+ * Performs ONE func_table_get (one atomic bounds-check load + one
+ * stable-pointer dereference) instead of the two separate calls that
+ * cjit_get_func() + cjit_record_call() would require.
+ *
+ * Atomic ordering:
+ *   call_cnt  increment : relaxed  (approximation; no ordering needed)
+ *   func_ptr  load      : acquire  (ensures function body visible before call)
+ */
+jit_func_t cjit_get_func_counted(cjit_engine_t *engine, func_id_t id)
+{
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (__builtin_expect(!e, 0)) return NULL;
+    atomic_fetch_add_explicit(&e->call_cnt, 1, memory_order_relaxed);
+    return atomic_load_explicit(&e->func_ptr, memory_order_acquire);
+}
+
 void cjit_request_recompile(cjit_engine_t *engine,
-                             func_id_t      id,
-                             opt_level_t    level)
+                              func_id_t      id,
+                              opt_level_t    level)
 {
     func_table_entry_t *e = func_table_get(engine->ftable, id);
     if (!e) return;
 
-    /* Prevent duplicate enqueue. */
     bool expected = false;
     if (!atomic_compare_exchange_strong_explicit(
             &e->in_queue, &expected, true,
-            memory_order_relaxed, memory_order_relaxed)) {
-        return; /* Already queued. */
-    }
+            memory_order_relaxed, memory_order_relaxed))
+        return;   /* already queued */
 
     compile_task_t task = {
         .func_id      = id,
         .target_level = level,
-        .priority     = 3, /* manual request = highest priority */
+        .priority     = 3,   /* manual request = highest priority */
         .version_req  = atomic_load_explicit(&e->version, memory_order_relaxed),
+        .call_rate    = 0,   /* manual; rate unknown */
     };
 
-    if (!mpmc_enqueue(&engine->work_queue, &task)) {
-        /* Queue full; clear in_queue so it can be tried again. */
+    if (!engine_enqueue_task(engine, &task))
         atomic_store_explicit(&e->in_queue, false, memory_order_relaxed);
-    }
 }
 
 cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
@@ -751,7 +853,12 @@ cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
                                                    memory_order_relaxed);
     s.freed_handles        = atomic_load_explicit(&engine->dgc.total_freed,
                                                    memory_order_relaxed);
-    s.queue_depth          = mpmc_size(&engine->work_queue);
+
+    /* Sum queue depths across all per-thread queues. */
+    uint32_t qd = 0;
+    for (uint32_t i = 0; i < engine->cfg.compiler_threads; ++i)
+        qd += mpmc_size(&engine->work_queues[i]);
+    s.queue_depth = qd;
 
     if (engine->ir_cache) {
         ir_cache_stats_t cs = ir_cache_get_stats(engine->ir_cache);
@@ -778,32 +885,32 @@ void cjit_print_stats(const cjit_engine_t *engine)
     static const char *const pnames[] =
         { "NORMAL", "MEDIUM", "HIGH", "CRITICAL" };
     fprintf(stderr,
-            "╔══════════════════════════════════════════╗\n"
-            "║           CJIT Engine Statistics          ║\n"
-            "╠══════════════════════════════════════════╣\n"
-            "║  Registered functions  : %6u            ║\n"
-            "║  Total compilations    : %6llu            ║\n"
-            "║  Failed compilations   : %6llu            ║\n"
-            "║  Atomic pointer swaps  : %6llu            ║\n"
-            "║  Handles retired (GC)  : %6llu            ║\n"
-            "║  Handles freed   (GC)  : %6llu            ║\n"
-            "║  Work-queue depth now  : %6u            ║\n"
-            "╠══════════════════════════════════════════╣\n"
-            "║  Memory pressure       : %-8s          ║\n"
-            "║  Mem available         : %6llu MB         ║\n"
-            "║  Mem total             : %6llu MB         ║\n"
-            "╠══════════════════════════════════════════╣\n"
-            "║  IR HOT  (in memory)   : %6u            ║\n"
-            "║  IR WARM (in memory)   : %6u            ║\n"
-            "║  IR COLD (on disk)     : %6u            ║\n"
-            "║  IR cache hits         : %6llu            ║\n"
-            "║  IR cache misses       : %6llu            ║\n"
-            "║  IR disk writes        : %6llu            ║\n"
-            "║  IR disk reads         : %6llu            ║\n"
-            "║  IR LRU evictions      : %6llu            ║\n"
-            "║  IR pressure evictions : %6llu            ║\n"
-            "║  IR promotions         : %6llu            ║\n"
-            "╚══════════════════════════════════════════╝\n",
+            "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557\n"
+            "\u2551           CJIT Engine Statistics          \u2551\n"
+            "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n"
+            "\u2551  Registered functions  : %6u            \u2551\n"
+            "\u2551  Total compilations    : %6llu            \u2551\n"
+            "\u2551  Failed compilations   : %6llu            \u2551\n"
+            "\u2551  Atomic pointer swaps  : %6llu            \u2551\n"
+            "\u2551  Handles retired (GC)  : %6llu            \u2551\n"
+            "\u2551  Handles freed   (GC)  : %6llu            \u2551\n"
+            "\u2551  Work-queue depth now  : %6u            \u2551\n"
+            "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n"
+            "\u2551  Memory pressure       : %-8s          \u2551\n"
+            "\u2551  Mem available         : %6llu MB         \u2551\n"
+            "\u2551  Mem total             : %6llu MB         \u2551\n"
+            "\u2560\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2563\n"
+            "\u2551  IR HOT  (in memory)   : %6u            \u2551\n"
+            "\u2551  IR WARM (in memory)   : %6u            \u2551\n"
+            "\u2551  IR COLD (on disk)     : %6u            \u2551\n"
+            "\u2551  IR cache hits         : %6llu            \u2551\n"
+            "\u2551  IR cache misses       : %6llu            \u2551\n"
+            "\u2551  IR disk writes        : %6llu            \u2551\n"
+            "\u2551  IR disk reads         : %6llu            \u2551\n"
+            "\u2551  IR LRU evictions      : %6llu            \u2551\n"
+            "\u2551  IR pressure evictions : %6llu            \u2551\n"
+            "\u2551  IR promotions         : %6llu            \u2551\n"
+            "\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d\n",
             s.registered_functions,
             (unsigned long long)s.total_compilations,
             (unsigned long long)s.failed_compilations,

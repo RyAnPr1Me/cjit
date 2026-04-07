@@ -200,9 +200,11 @@ bool codegen_compile(const char          *func_name,
     build_opt_flags(opt_flags, sizeof(opt_flags), level, opts);
 
     char cmd[2048];
+    char err_path[304];
+    snprintf(err_path, sizeof(err_path), "%s.err", prefix);
     snprintf(cmd, sizeof(cmd),
-             "cc -shared -fPIC%s -o '%s' '%s' 2>/tmp/cjit_err_%d.txt",
-             opt_flags, so_path, src_path, (int)getpid());
+             "cc -shared -fPIC%s -o '%s' '%s' 2>'%s'",
+             opt_flags, so_path, src_path, err_path);
 
     if (opts->verbose) {
         fprintf(stderr, "[cjit/codegen] compile: %s\n", cmd);
@@ -215,23 +217,23 @@ bool codegen_compile(const char          *func_name,
     unlink(src_path);
 
     if (rc != 0) {
-        /* Try to capture compiler error output. */
-        char errlog[300];
-        snprintf(errlog, sizeof(errlog), "/tmp/cjit_err_%d.txt", (int)getpid());
-        FILE *ef = fopen(errlog, "r");
+        /* Capture compiler error output from the per-invocation error file. */
+        FILE *ef = fopen(err_path, "r");
         if (ef) {
             size_t nr = fread(result->errmsg,
                               1, sizeof(result->errmsg) - 1, ef);
             result->errmsg[nr] = '\0';
             fclose(ef);
-            unlink(errlog);
         } else {
             snprintf(result->errmsg, sizeof(result->errmsg),
                      "codegen: cc exited with code %d", rc);
         }
+        unlink(err_path);
         unlink(so_path);
         return false;
     }
+
+    unlink(err_path);  /* remove even on success (may not exist if cc was quiet) */
 
     /* ── 5. dlopen the shared object ─────────────────────────────────── */
     void *handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
