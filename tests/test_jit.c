@@ -27,6 +27,10 @@
  *   t10  Concurrent thread safety      – N threads each dispatch through the
  *                                        same JIT functions simultaneously with
  *                                        no data races or wrong answers.
+ *   t11  sum_range pre-warm + bounds   – boundary cases verified across 50 reps
+ *                                        after an explicit O1 pre-warm request.
+ *   t12  CRC32 tier progression        – CRC32 correctness verified at O1, O2,
+ *                                        and O3 against the reference.
  *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).

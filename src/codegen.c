@@ -550,7 +550,7 @@ static size_t generate_spec_wrapper(const char *func_name,
     if (is_void) {
         written = snprintf(out_buf, out_sz,
             "/* [JIT arg-specialisation wrapper: %s] */\n"
-            "%s %s(%s);\n"           /* forward decl (non-static: matches user def) */
+            "%s %s(%s);\n"  /* forward decl of internal name using parsed params */
             "%s %s(%s) {\n"
             "    if (__builtin_expect(%s, 1)) { %s(%s); return; }\n"
             "    %s(%s);\n"
@@ -563,7 +563,7 @@ static size_t generate_spec_wrapper(const char *func_name,
     } else {
         written = snprintf(out_buf, out_sz,
             "/* [JIT arg-specialisation wrapper: %s] */\n"
-            "%s %s(%s);\n"           /* forward decl (non-static: matches user def) */
+            "%s %s(%s);\n"  /* forward decl of internal name using parsed params */
             "%s %s(%s) {\n"
             "    if (__builtin_expect(%s, 1)) return %s(%s);\n"
             "    return %s(%s);\n"
