@@ -80,6 +80,7 @@
 
 #include <stdbool.h>
 #include "../include/cjit.h"  /* opt_level_t, jit_func_t */
+#include "arg_profile.h"      /* cjit_arg_profile_t */
 
 /* ─────────────────────────── result type ───────────────────────────────────── */
 
@@ -103,6 +104,19 @@ typedef struct {
     bool enable_native_arch;   /**< -march=native (only at OPT_O3)             */
     bool enable_fast_math;     /**< -ffast-math   (only at OPT_O3)             */
     bool verbose;              /**< Print compiler command to stderr            */
+
+    /**
+     * Optional argument profile for specialisation.
+     *
+     * When non-NULL and the profile contains at least one argument slot with
+     * a confident dominant value, codegen_compile() prepends a specialised
+     * wrapper to the user's source and renames the original function via a
+     * -D preprocessor flag.  The wrapper fast-paths the common argument value
+     * through an inlined call that GCC/Clang can constant-fold.
+     *
+     * NULL (the default) disables argument specialisation entirely.
+     */
+    const cjit_arg_profile_t  *arg_profile;
 } codegen_opts_t;
 
 /* ─────────────────────────── API ───────────────────────────────────────────── */

@@ -248,6 +248,71 @@ static inline uint64_t cjit_timestamp_ns(void)
          + (uint64_t)_ts.tv_nsec;
 }
 
+/* ══════════════════════ argument-value sampling helpers ═══════════════════ */
+
+/**
+ * @internal  Per-calling-thread call-count batch array.
+ *
+ * Defined (without static) in cjit.c; exposed here so that the
+ * CJIT_SHOULD_SAMPLE and CJIT_SAMPLE_ARGS macros can check the flush
+ * boundary without a function call.  Callers MUST NOT modify this array
+ * directly — use cjit_record_call() / cjit_get_func_counted() instead.
+ */
+extern __thread uint8_t cjit_tls_counts[CJIT_MAX_FUNCTIONS];
+
+/**
+ * Returns true if the next call to cjit_get_func_counted() (or any
+ * CJIT_DISPATCH variant) for function `id` is the flush-boundary call —
+ * i.e. it is the one-in-CJIT_TLS_FLUSH_THRESHOLD call that will increment
+ * the global atomic call counter.
+ *
+ * This is the cheapest possible sampling trigger: it reads one byte from
+ * the TLS array (already in L1 cache due to the co-located dispatch) and
+ * compares it against a compile-time constant.  On the common (non-sample)
+ * path the macro is predicted not-taken and contributes < 1 cycle amortised
+ * overhead.
+ *
+ * IMPORTANT: evaluate `id` only once to avoid side effects.
+ */
+#define CJIT_SHOULD_SAMPLE(id) \
+    (__builtin_expect( \
+        (id) < CJIT_MAX_FUNCTIONS && \
+        cjit_tls_counts[(id)] == (CJIT_TLS_FLUSH_THRESHOLD - 1u), 0))
+
+/**
+ * Sample argument values for function `id` on the TLS flush boundary.
+ *
+ * MUST be placed BEFORE the cjit_get_func_counted() / CJIT_DISPATCH call so
+ * that cjit_tls_counts[id] still reflects the pre-flush state.
+ *
+ * Usage:
+ *   CJIT_SAMPLE_ARGS(engine, id, (uint64_t)a, (uint64_t)b);
+ *   int r = CJIT_DISPATCH(engine, id, add_fn_t, a, b);
+ *
+ * The variadic arguments after `id` are the argument values cast to
+ * uint64_t.  Up to CJIT_MAX_PROFILED_ARGS values are recorded; additional
+ * values are silently ignored.
+ *
+ * Hot-path overhead (non-sample case):
+ *   • CJIT_SHOULD_SAMPLE check: 1 TLS byte load + compare + branch ≈ 1 cycle
+ *   • No other overhead
+ *
+ * Sample-path overhead (1 in CJIT_TLS_FLUSH_THRESHOLD calls per thread):
+ *   • Argument values already computed for the real call — no re-evaluation
+ *   • One call to cjit_record_arg_samples() ≈ 50–100 ns (cold cache miss
+ *     on the arg_profile cold cache line; amortised over THRESHOLD calls ≈
+ *     50 ns / 32 = 1.5 ns average additional overhead per call)
+ */
+#define CJIT_SAMPLE_ARGS(engine, id, ...)                                      \
+    do {                                                                        \
+        if (CJIT_SHOULD_SAMPLE(id)) {                                          \
+            uint64_t _cjit_sa_[] = {__VA_ARGS__};                              \
+            cjit_record_arg_samples((engine), (id),                            \
+                (uint8_t)(sizeof(_cjit_sa_) / sizeof(_cjit_sa_[0])),          \
+                _cjit_sa_);                                                     \
+        }                                                                       \
+    } while (0)
+
 /**
  * System memory pressure level, computed from /proc/meminfo by the IR cache's
  * background pressure-monitor thread.
@@ -785,6 +850,32 @@ void cjit_record_timed_call(cjit_engine_t *engine,
  * @return        Total nanoseconds accumulated, or 0 on error.
  */
 uint64_t cjit_get_elapsed_ns(const cjit_engine_t *engine, func_id_t id);
+
+/**
+ * Record argument values for function `id` at a sampling point.
+ *
+ * Intended to be called via the CJIT_SAMPLE_ARGS macro, which automatically
+ * gates the call to the TLS flush boundary (once per CJIT_TLS_FLUSH_THRESHOLD
+ * calls per thread).  Direct calls are also valid — e.g. after obtaining a
+ * manual timestamp — but the caller is then responsible for controlling
+ * sample frequency to avoid excessive overhead.
+ *
+ * Updates the per-function argument profile stored in func_table_entry_t
+ * using a Boyer-Moore majority-vote algorithm (O(1) per sample, no heap
+ * allocation).  The profile is later read by codegen_compile() when a
+ * recompilation is triggered; if a confident dominant value is found on any
+ * integer-typed argument, a specialised wrapper is generated that lets the
+ * compiler constant-fold through the hot path.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID.
+ * @param n_args  Number of values in vals[] (≤ CJIT_MAX_PROFILED_ARGS).
+ * @param vals    Array of argument values cast to uint64_t.
+ */
+void cjit_record_arg_samples(cjit_engine_t  *engine,
+                               func_id_t       id,
+                               uint8_t         n_args,
+                               const uint64_t *vals);
 
 /**
  * Forcibly enqueue a function for recompilation at the given tier.

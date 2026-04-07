@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #endif
 #include "codegen.h"
+#include "func_table.h"   /* CJIT_NAME_MAX */
 
 #include <stdio.h>       /* FILE, fopen, fclose, snprintf, fprintf */
 #include <stdlib.h>      /* free, system                           */
@@ -115,10 +116,11 @@ static const char CODEGEN_PREAMBLE[] =
  *
  * cc(1) + -shared + -fPIC + opt-level + up to 10 optional flags +
  * JIT-specific flags (-fno-stack-protector, -fno-asynchronous-unwind-tables) +
- * -w + -o + so_path + -x + c + src_path + NULL = at most 22 entries;
- * 32 gives comfortable headroom for future additions.
+ * -w + -o + so_path + -x + c + src_path + NULL = at most 22 entries.
+ * When argument specialisation is active, two more entries are added
+ * (-D <func=_cjit_i_func>).  40 gives comfortable headroom.
  */
-#define MAX_CC_ARGS 32
+#define MAX_CC_ARGS 40
 
 /**
  * Build the compiler argv array for posix_spawnp().
@@ -217,6 +219,351 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
     return n;
 }
 
+/* ─────────────── argument-profile specialisation helpers ──────────────────── */
+
+/*
+ * Per-parameter info extracted from a parsed C function signature.
+ *
+ * Limits: 64 bytes for the type string + 32 for the name — sufficient for any
+ * realistic JIT parameter.  Oversized tokens are truncated; in the worst case
+ * the wrapping step simply decides not to specialise that slot.
+ */
+#define SPEC_MAX_PARAMS   CJIT_MAX_PROFILED_ARGS   /* at most 8 params tracked */
+#define SPEC_TYPE_MAX     80
+#define SPEC_NAME_MAX     40
+
+typedef struct {
+    char type[SPEC_TYPE_MAX];
+    char name[SPEC_NAME_MAX];
+    bool valid;
+} param_info_t;
+
+/*
+ * Copy up to `n` non-whitespace-leading, non-whitespace-trailing characters
+ * of [begin, end) into `out` (NUL-terminated).
+ */
+static void copy_trimmed(char *out, size_t outsz, const char *begin, const char *end)
+{
+    while (begin < end && (*begin == ' ' || *begin == '\t' || *begin == '\n' || *begin == '\r'))
+        begin++;
+    while (end > begin && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r'))
+        end--;
+    size_t len = (size_t)(end - begin);
+    if (len >= outsz) len = outsz - 1;
+    memcpy(out, begin, len);
+    out[len] = '\0';
+}
+
+/*
+ * Return true if the type string is a plain integer type (suitable for
+ * constant specialisation).  We look for known integer keywords and reject
+ * anything containing '*' (pointer), "float", "double", or "void".
+ *
+ * This is intentionally conservative: it is safer to miss a specialisation
+ * opportunity than to produce a specialisation for a non-integer argument.
+ */
+static bool is_integer_type(const char *type)
+{
+    if (strstr(type, "*"))      return false;
+    if (strstr(type, "float"))  return false;
+    if (strstr(type, "double")) return false;
+    if (strstr(type, "void"))   return false;
+    /* Accept any of the standard integer-like keywords */
+    if (strstr(type, "int"))    return true;
+    if (strstr(type, "long"))   return true;
+    if (strstr(type, "short"))  return true;
+    if (strstr(type, "char"))   return true;
+    if (strstr(type, "size_t")) return true;
+    if (strstr(type, "uint"))   return true;
+    if (strstr(type, "int8"))   return true;
+    if (strstr(type, "int16"))  return true;
+    if (strstr(type, "int32"))  return true;
+    if (strstr(type, "int64"))  return true;
+    if (strstr(type, "bool"))   return true;
+    return false;
+}
+
+/*
+ * Parse a comma-separated parameter list of the form:
+ *   "int a, const float *b, unsigned long c"
+ * into an array of param_info_t structs.
+ *
+ * Returns the number of params successfully parsed (≥ 0).
+ * Stops at SPEC_MAX_PARAMS even if the source has more.
+ * A parameter with an unnamed argument (e.g. "int") sets .valid = false.
+ */
+static int parse_param_list(const char *params, param_info_t *out, int max_out)
+{
+    int count = 0;
+    const char *p = params;
+    while (*p && count < max_out) {
+        /* Find end of this parameter (next comma at depth 0) */
+        const char *start = p;
+        int depth = 0;
+        while (*p && !(*p == ',' && depth == 0)) {
+            if (*p == '(') depth++;
+            else if (*p == ')') { if (depth > 0) depth--; else break; }
+            p++;
+        }
+        const char *end = p;
+        if (*p == ',') p++; /* consume comma */
+
+        /* Trim the parameter token */
+        while (start < end && (*start == ' ' || *start == '\t')) start++;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        if (start == end) continue;  /* empty token */
+
+        /*
+         * Split "type name" at the last identifier boundary.
+         * Scan backwards for the end of the parameter name.
+         */
+        const char *name_end = end;
+        /* Skip trailing [] if any (array params) */
+        while (name_end > start && name_end[-1] == ']') {
+            while (name_end > start && name_end[-1] != '[') name_end--;
+            if (name_end > start) name_end--;  /* skip '[' */
+        }
+        const char *name_start = name_end;
+        while (name_start > start &&
+               (*(name_start-1) == '_' ||
+                (*(name_start-1) >= 'a' && *(name_start-1) <= 'z') ||
+                (*(name_start-1) >= 'A' && *(name_start-1) <= 'Z') ||
+                (*(name_start-1) >= '0' && *(name_start-1) <= '9')))
+            name_start--;
+
+        if (name_start == start) {
+            /* No separate name found — either "int" with no name, or parsing
+             * edge case.  Mark as invalid but still count the slot. */
+            out[count].valid = false;
+            out[count].type[0] = out[count].name[0] = '\0';
+            count++;
+            continue;
+        }
+
+        copy_trimmed(out[count].type, sizeof(out[count].type), start, name_start);
+        copy_trimmed(out[count].name, sizeof(out[count].name), name_start, name_end);
+        out[count].valid = (out[count].type[0] != '\0' && out[count].name[0] != '\0');
+        count++;
+    }
+    return count;
+}
+
+/*
+ * Parse the function signature from the C source text.
+ *
+ * Searches for:   <return_type> <func_name> ( <params> ) {
+ * Extracts return type (ret_buf) and parameter list string (par_buf).
+ *
+ * Returns true on success.  False is returned (and buffers left empty) if:
+ *   • func_name is not found in ir_source
+ *   • the signature cannot be reliably parsed
+ *   • func_name appears too many times (risk of -D substitution side effects)
+ */
+static bool parse_func_sig(const char *ir, const char *func_name,
+                            char *ret_buf, size_t ret_sz,
+                            char *par_buf, size_t par_sz)
+{
+    ret_buf[0] = par_buf[0] = '\0';
+
+    /* Count occurrences of func_name as a whole identifier to detect
+     * ambiguous sources (e.g. multiple definitions, recursive helpers). */
+    size_t fn_len = strlen(func_name);
+    unsigned occurrences = 0;
+    const char *scan = ir;
+    while ((scan = strstr(scan, func_name)) != NULL) {
+        /* Check word boundaries to avoid matching substrings. */
+        bool lbound = (scan == ir ||
+                       !(*(scan-1) == '_' ||
+                         (*(scan-1) >= 'a' && *(scan-1) <= 'z') ||
+                         (*(scan-1) >= 'A' && *(scan-1) <= 'Z') ||
+                         (*(scan-1) >= '0' && *(scan-1) <= '9')));
+        const char *after = scan + fn_len;
+        bool rbound = (!(*after == '_' ||
+                         (*after >= 'a' && *after <= 'z') ||
+                         (*after >= 'A' && *after <= 'Z') ||
+                         (*after >= '0' && *after <= '9')));
+        if (lbound && rbound) occurrences++;
+        scan += fn_len;
+    }
+    if (occurrences == 0 || occurrences > CJIT_SPEC_MAX_NAME_OCCURRENCES)
+        return false;
+
+    /* Find the function DEFINITION: func_name immediately followed by '('. */
+    const char *def = ir;
+    while ((def = strstr(def, func_name)) != NULL) {
+        /* Check left word boundary */
+        bool lbound = (def == ir ||
+                       !(*(def-1) == '_' ||
+                         (*(def-1) >= 'a' && *(def-1) <= 'z') ||
+                         (*(def-1) >= 'A' && *(def-1) <= 'Z') ||
+                         (*(def-1) >= '0' && *(def-1) <= '9')));
+        const char *after = def + fn_len;
+        /* Skip whitespace to find '(' */
+        while (*after == ' ' || *after == '\t' || *after == '\n') after++;
+        if (lbound && *after == '(') break;
+        def += fn_len;
+    }
+    if (!def) return false;
+
+    /* Extract return type: text on the same line before func_name, going back
+     * past whitespace to the previous newline or start-of-file. */
+    const char *line_start = def;
+    while (line_start > ir && *(line_start-1) != '\n') line_start--;
+    /* Skip leading whitespace / storage class keywords we don't want to copy */
+    while (*line_start == ' ' || *line_start == '\t') line_start++;
+    /* The return type is everything from line_start to def, trimmed. */
+    copy_trimmed(ret_buf, ret_sz, line_start, def);
+    if (ret_buf[0] == '\0') return false;  /* couldn't find return type */
+
+    /* Extract parameter list between '(' and matching ')'. */
+    const char *after = def + fn_len;
+    while (*after == ' ' || *after == '\t' || *after == '\n') after++;
+    if (*after != '(') return false;
+    after++; /* skip '(' */
+
+    const char *par_start = after;
+    int depth = 1;
+    while (*after && depth > 0) {
+        if (*after == '(') depth++;
+        else if (*after == ')') depth--;
+        after++;
+    }
+    if (depth != 0) return false;
+    const char *par_end = after - 1; /* points just after ')' → back up one */
+
+    copy_trimmed(par_buf, par_sz, par_start, par_end);
+
+    /* Verify there is a '{' following (it's a definition, not a declaration). */
+    const char *body = after;
+    while (*body == ' ' || *body == '\t' || *body == '\n' || *body == '\r') body++;
+    return (*body == '{');
+}
+
+/*
+ * Generate a specialisation wrapper for func_name.
+ *
+ * Writes the generated C source into out_buf.
+ * Sets spec_define (e.g. "my_func=_cjit_i_my_func") if a -D flag is needed.
+ *
+ * Returns number of bytes written, 0 if no specialisation is possible.
+ */
+static size_t generate_spec_wrapper(const char *func_name,
+                                     const char *ret_type,
+                                     const char *params_str,
+                                     const cjit_arg_profile_t *prof,
+                                     char *out_buf, size_t out_sz,
+                                     char *spec_define_buf, size_t define_sz)
+{
+    spec_define_buf[0] = '\0';
+
+    /* Parse the parameter list. */
+    param_info_t pinfo[SPEC_MAX_PARAMS];
+    memset(pinfo, 0, sizeof(pinfo));
+    int nparams = parse_param_list(params_str, pinfo, SPEC_MAX_PARAMS);
+    if (nparams <= 0) return 0;
+
+    /* Identify which params have a confident dominant integer value. */
+    bool specialise[SPEC_MAX_PARAMS];
+    memset(specialise, 0, sizeof(specialise));
+    bool any = false;
+    int n_to_check = nparams < (int)prof->n_profiled ? nparams : (int)prof->n_profiled;
+    for (int i = 0; i < n_to_check; ++i) {
+        if (!pinfo[i].valid) continue;
+        if (!is_integer_type(pinfo[i].type)) continue;
+        if (!cjit_arg_slot_confident(&prof->slots[i])) continue;
+        specialise[i] = true;
+        any = true;
+    }
+    if (!any) return 0;
+
+    /* Build the internal symbol name: _cjit_i_<func_name> (max CJIT_NAME_MAX). */
+    char internal_name[CJIT_NAME_MAX + 10];
+    snprintf(internal_name, sizeof(internal_name), "_cjit_i_%s", func_name);
+
+    /* Build the -D define string: func_name=internal_name */
+    snprintf(spec_define_buf, define_sz, "%s=%s", func_name, internal_name);
+
+    /* Build the parameter string for the forward declaration and call site. */
+    char forward_params[512];
+    char call_args_generic[512];
+    char call_args_const[512];
+    char cond_expr[256];
+    forward_params[0] = call_args_generic[0] = call_args_const[0] = cond_expr[0] = '\0';
+
+    bool first_cond = true;
+    for (int i = 0; i < nparams; ++i) {
+        if (i > 0) {
+            strncat(forward_params,  ", ", sizeof(forward_params)  - strlen(forward_params)  - 1);
+            strncat(call_args_generic, ", ", sizeof(call_args_generic) - strlen(call_args_generic) - 1);
+            strncat(call_args_const,   ", ", sizeof(call_args_const)   - strlen(call_args_const)   - 1);
+        }
+        /* forward decl param: "type name" */
+        strncat(forward_params, pinfo[i].type, sizeof(forward_params) - strlen(forward_params) - 1);
+        strncat(forward_params, " ", sizeof(forward_params) - strlen(forward_params) - 1);
+        strncat(forward_params, pinfo[i].name, sizeof(forward_params) - strlen(forward_params) - 1);
+        /* generic call arg: just the name */
+        strncat(call_args_generic, pinfo[i].name,
+                sizeof(call_args_generic) - strlen(call_args_generic) - 1);
+        /* const call arg: literal value for specialised slots, name otherwise */
+        if (specialise[i]) {
+            char val_buf[32];
+            /* Cast to the parameter type and use the profiled literal value */
+            snprintf(val_buf, sizeof(val_buf), "(%s)%lld",
+                     pinfo[i].type,
+                     (long long)(int64_t)prof->slots[i].dominant_val);
+            strncat(call_args_const, val_buf,
+                    sizeof(call_args_const) - strlen(call_args_const) - 1);
+            /* Condition: param == literal */
+            char cond_part[64];
+            snprintf(cond_part, sizeof(cond_part), "%s%s == (%s)%lld",
+                     first_cond ? "" : " && ",
+                     pinfo[i].name,
+                     pinfo[i].type,
+                     (long long)(int64_t)prof->slots[i].dominant_val);
+            strncat(cond_expr, cond_part, sizeof(cond_expr) - strlen(cond_expr) - 1);
+            first_cond = false;
+        } else {
+            strncat(call_args_const, pinfo[i].name,
+                    sizeof(call_args_const) - strlen(call_args_const) - 1);
+        }
+    }
+
+    /* bool is_void_return */
+    bool is_void = (strncmp(ret_type, "void", 4) == 0 &&
+                    (ret_type[4] == '\0' || ret_type[4] == ' '));
+
+    /* Emit the wrapper. */
+    int written;
+    if (is_void) {
+        written = snprintf(out_buf, out_sz,
+            "/* [JIT arg-specialisation wrapper: %s] */\n"
+            "static %s %s(%s);\n"
+            "%s %s(%s) {\n"
+            "    if (__builtin_expect(%s, 1)) { %s(%s); return; }\n"
+            "    %s(%s);\n"
+            "}\n",
+            func_name,
+            ret_type, internal_name, forward_params,
+            ret_type, func_name,     params_str,
+            cond_expr, internal_name, call_args_const,
+            internal_name, call_args_generic);
+    } else {
+        written = snprintf(out_buf, out_sz,
+            "/* [JIT arg-specialisation wrapper: %s] */\n"
+            "static %s %s(%s);\n"
+            "%s %s(%s) {\n"
+            "    if (__builtin_expect(%s, 1)) return %s(%s);\n"
+            "    return %s(%s);\n"
+            "}\n",
+            func_name,
+            ret_type, internal_name, forward_params,
+            ret_type, func_name,     params_str,
+            cond_expr, internal_name, call_args_const,
+            internal_name, call_args_generic);
+    }
+    return (written > 0 && (size_t)written < out_sz) ? (size_t)written : 0;
+}
+
 /* ─────────────────────────── unique temp-file naming ───────────────────────── */
 
 static atomic_uint_fast64_t codegen_serial = 0;
@@ -257,7 +604,54 @@ bool codegen_compile(const char          *func_name,
     char so_path[300];
     snprintf(so_path, sizeof(so_path), "%s.so", prefix);
 
-    /* ── 2. Write preamble + user source ─────────────────────────────── */
+    /* ── 2. Optionally generate an argument-specialisation wrapper ────── */
+    /*
+     * If opts->arg_profile is set and parse_func_sig() finds a confident
+     * dominant value on any integer-typed parameter, we:
+     *   (a) prepend a specialised wrapper that fast-paths the common value;
+     *   (b) rename the user's function to _cjit_i_<func_name> via a -D flag
+     *       so the compiler sees it as a static inlineable helper.
+     *
+     * With -finline-functions (O2+) the compiler inlines the helper into the
+     * hot path, constant-folds through the dominant argument, and eliminates
+     * dead branches — effectively giving us profile-guided specialisation
+     * without a PGO profile build.
+     *
+     * On parse failure or when no confident slot is found, wrapper_src stays
+     * NULL and we fall through to the ordinary (unspecialised) path.
+     */
+    char *wrapper_src    = NULL;   /* heap-allocated on success */
+    char  spec_define[CJIT_NAME_MAX * 2 + 4]; /* "func=_cjit_i_func\0" */
+    spec_define[0] = '\0';
+
+    if (opts->arg_profile && opts->arg_profile->n_profiled > 0 &&
+        level >= OPT_O2) {
+        char ret_type[128], params_str[512];
+        if (parse_func_sig(c_source, func_name,
+                           ret_type, sizeof(ret_type),
+                           params_str, sizeof(params_str))) {
+            /* Allocate a generous buffer; typical wrapper is < 512 bytes. */
+            size_t wsz = strlen(c_source) + 1024;
+            char  *wbuf = malloc(wsz);
+            if (wbuf) {
+                size_t wlen = generate_spec_wrapper(
+                    func_name, ret_type, params_str,
+                    opts->arg_profile, wbuf, wsz,
+                    spec_define, sizeof(spec_define));
+                if (wlen > 0) {
+                    wrapper_src = wbuf;
+                    if (opts->verbose)
+                        fprintf(stderr,
+                                "[cjit/codegen] specialising '%s': %s\n",
+                                func_name, spec_define);
+                } else {
+                    free(wbuf);
+                }
+            }
+        }
+    }
+
+    /* ── 3. Write preamble [+ wrapper] + user source ─────────────────── */
     /*
      * On Linux, write the source into an anonymous in-memory file created
      * with memfd_create(2).  The file is exposed to the compiler via its
@@ -292,13 +686,20 @@ bool codegen_compile(const char          *func_name,
         src_is_memfd = true;
         size_t plen = strlen(CODEGEN_PREAMBLE);
         size_t slen = strlen(c_source);
-        bool ok = ((size_t)write(src_fd, CODEGEN_PREAMBLE, plen) == plen &&
-                   (size_t)write(src_fd,          c_source, slen) == slen &&
-                   write(src_fd, "\n", 1) == 1);
-        if (!ok) {
+        bool write_ok =
+            ((size_t)write(src_fd, CODEGEN_PREAMBLE, plen) == plen);
+        if (write_ok && wrapper_src) {
+            size_t wlen = strlen(wrapper_src);
+            write_ok = ((size_t)write(src_fd, wrapper_src, wlen) == wlen);
+        }
+        if (write_ok)
+            write_ok = ((size_t)write(src_fd, c_source, slen) == slen &&
+                        write(src_fd, "\n", 1) == 1);
+        if (!write_ok) {
             snprintf(result->errmsg, sizeof(result->errmsg),
                      "codegen: write to in-memory source file failed");
             close(src_fd);
+            free(wrapper_src);
             return false;
         }
     }
@@ -311,19 +712,36 @@ bool codegen_compile(const char          *func_name,
         if (!f) {
             snprintf(result->errmsg, sizeof(result->errmsg),
                      "codegen: cannot create source file %s", src_path);
+            free(wrapper_src);
             return false;
         }
         fputs(CODEGEN_PREAMBLE, f);
+        if (wrapper_src) fputs(wrapper_src, f);
         fputs(c_source, f);
         fputc('\n', f);
         fclose(f);
     }
 
-    /* ── 3. Build compiler argv ──────────────────────────────────────── */
+    /* ── 4. Build compiler argv ──────────────────────────────────────── */
     const char *cc_argv[MAX_CC_ARGS];
     char err_path[304];
     snprintf(err_path, sizeof(err_path), "%s.err", prefix);
-    build_compiler_argv(cc_argv, so_path, src_path, level, opts);
+    int cc_argc = build_compiler_argv(cc_argv, so_path, src_path, level, opts);
+    /*
+     * If a specialisation wrapper was generated, insert the -D renaming flag
+     * BEFORE the source path (which is always last before NULL).
+     * build_compiler_argv leaves cc_argv[cc_argc] == NULL and cc_argc ≤
+     * MAX_CC_ARGS - 3, so there is always room for two more entries.
+     */
+    if (spec_define[0] != '\0') {
+        /* Shift src_path and terminator up by two to make room for -D <define>. */
+        cc_argv[cc_argc + 2] = NULL;
+        cc_argv[cc_argc + 1] = cc_argv[cc_argc];     /* NULL → + 2 */
+        cc_argv[cc_argc]     = cc_argv[cc_argc - 1]; /* src_path → cc_argc */
+        cc_argv[cc_argc - 1] = spec_define;           /* define string */
+        cc_argv[cc_argc - 2] = "-D";
+        cc_argc += 2;
+    }
 
     if (opts->verbose) {
         fprintf(stderr, "[cjit/codegen] compile:");
@@ -356,6 +774,7 @@ bool codegen_compile(const char          *func_name,
         snprintf(result->errmsg, sizeof(result->errmsg),
                  "codegen: posix_spawnp failed: %s", strerror(spawn_err));
         if (src_is_memfd) close(src_fd); else unlink(src_path);
+        free(wrapper_src);
         return false;
     }
     {
@@ -366,6 +785,8 @@ bool codegen_compile(const char          *func_name,
 
     /* Source file is no longer needed. */
     if (src_is_memfd) close(src_fd); else unlink(src_path);
+    free(wrapper_src);
+    wrapper_src = NULL;
 
     if (rc != 0) {
         /* Capture compiler error output from the per-invocation error file. */

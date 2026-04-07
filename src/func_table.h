@@ -18,6 +18,9 @@
  *   • dl_handle – dlopen handle of the currently loaded shared object; the
  *                 compiler thread stores this so it can be retired (via
  *                 deferred_gc) when the pointer is swapped out.
+ *   • arg_profile – statistical profile of argument values observed at call
+ *                 sites (populated via CJIT_SAMPLE_ARGS; used by codegen to
+ *                 generate specialised function wrappers).
  *
  * Hot path (read, called by runtime threads):
  *   jit_func_t f = atomic_load_explicit(&entry->func_ptr, memory_order_acquire);
@@ -54,6 +57,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include "../include/cjit.h"
+#include "arg_profile.h"
 
 /* ─────────────────────────── constants ─────────────────────────────────────── */
 
@@ -153,6 +157,19 @@ typedef struct {
     _Atomic uint32_t             recompile_count;
     pthread_mutex_t             compile_lock; /**< Serialises concurrent compiles.*/
     char                        name[CJIT_NAME_MAX]; /**< Function symbol name. */
+
+    /**
+     * Argument-value profile (populated by CJIT_SAMPLE_ARGS).
+     *
+     * Written by calling threads at the TLS-flush sample boundary (once per
+     * CJIT_TLS_FLUSH_THRESHOLD calls per thread); read by the compiler thread
+     * during codegen_compile() to decide whether to generate a specialised
+     * wrapper.  Access is intentionally lock-free: the data is statistical
+     * and a momentarily inconsistent snapshot causes no safety issue — the
+     * compiler simply falls back to unspecialised compilation if the snapshot
+     * looks ambiguous.
+     */
+    cjit_arg_profile_t          arg_profile;
 } func_table_entry_t;
 
 /* ─────────────────────────── table ─────────────────────────────────────────── */

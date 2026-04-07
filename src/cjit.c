@@ -159,10 +159,14 @@
  * accumulated count is flushed to the global atomic call_cnt with a
  * single relaxed fetch_add and the local counter is reset to zero.
  *
+ * Declared extern in cjit.h so that the CJIT_SHOULD_SAMPLE / CJIT_SAMPLE_ARGS
+ * macros can read it inline without a function call.  The cjit_tls_elapsed
+ * array remains private to this translation unit.
+ *
  * uint8_t × CJIT_MAX_FUNCTIONS = 1 024 bytes of TLS per calling thread.
  * TLS variables are zero-initialised by the C runtime.
  */
-static __thread uint8_t  cjit_tls_counts[CJIT_MAX_FUNCTIONS];
+__thread uint8_t  cjit_tls_counts[CJIT_MAX_FUNCTIONS];
 
 /*
  * Per-calling-thread elapsed-nanoseconds accumulator.
@@ -470,8 +474,19 @@ static void *compiler_thread_fn(void *raw_arg)
 
         uint64_t t0_compile = engine_now_ms();
         codegen_result_t cres;
+        /*
+         * Pass the current argument profile snapshot to codegen.  The profile
+         * is stored on the cold cache line of func_table_entry_t; this read
+         * is lock-free and the compiler thread may see a slightly stale
+         * snapshot — this is intentional (statistical data, not requiring
+         * coherence).  The arg_profile pointer is only valid until the end of
+         * this codegen_compile() call (entry remains live throughout since we
+         * hold compile_lock).
+         */
+        copts.arg_profile = &entry->arg_profile;
         bool ok = codegen_compile(entry->name, ir_to_use,
                                    task.target_level, &copts, &cres);
+        copts.arg_profile = NULL; /* clear for next task */
         free(ir_cache_copy);
 
         /* Record how long this compilation took (relaxed store, read by monitor
@@ -1256,6 +1271,31 @@ uint64_t cjit_get_elapsed_ns(const cjit_engine_t *engine, func_id_t id)
     return atomic_load_explicit(&e->total_elapsed_ns, memory_order_relaxed);
 }
 
+void cjit_record_arg_samples(cjit_engine_t  *engine,
+                               func_id_t       id,
+                               uint8_t         n_args,
+                               const uint64_t *vals)
+{
+    if (__builtin_expect(!engine || id >= CJIT_MAX_FUNCTIONS || n_args == 0, 0))
+        return;
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (__builtin_expect(!e, 0)) return;
+
+    cjit_arg_profile_t *prof = &e->arg_profile;
+    if (n_args > CJIT_MAX_PROFILED_ARGS) n_args = CJIT_MAX_PROFILED_ARGS;
+
+    /*
+     * Update n_profiled on first observation.  A plain (non-atomic) write is
+     * safe here: the value only ever increases and is read by the compiler
+     * thread under a roughly once-per-compilation basis, where a stale zero
+     * simply means no specialisation is attempted on that recompile.
+     */
+    if (n_args > prof->n_profiled) prof->n_profiled = n_args;
+
+    for (uint8_t i = 0; i < n_args; ++i)
+        cjit_arg_slot_update(&prof->slots[i], vals[i]);
+}
+
 void cjit_request_recompile(cjit_engine_t *engine,
                               func_id_t      id,
                               opt_level_t    level)
@@ -1303,6 +1343,7 @@ cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
     /* Sum queue depths and find highest recompile count across all functions. */
     uint32_t qd  = 0;
     uint32_t max_rc = 0;
+    uint64_t total_elapsed = 0;
     uint32_t nf  = s.registered_functions;
     for (uint32_t i = 0; i < engine->cfg.compiler_threads; ++i)
         qd += mpmc_size(&engine->work_queues[i]);
@@ -1310,9 +1351,12 @@ cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
         uint32_t rc = atomic_load_explicit(
             &engine->ftable->entries[i].recompile_count, memory_order_relaxed);
         if (rc > max_rc) max_rc = rc;
+        total_elapsed += atomic_load_explicit(
+            &engine->ftable->entries[i].total_elapsed_ns, memory_order_relaxed);
     }
-    s.queue_depth        = qd;
+    s.queue_depth         = qd;
     s.max_recompile_count = max_rc;
+    s.total_elapsed_ns    = total_elapsed;
 
     if (engine->ir_cache) {
         ir_cache_stats_t cs = ir_cache_get_stats(engine->ir_cache);
