@@ -480,8 +480,18 @@ static size_t generate_spec_wrapper(const char *func_name,
     char internal_name[CJIT_NAME_MAX + 10];
     snprintf(internal_name, sizeof(internal_name), "_cjit_i_%s", func_name);
 
-    /* Build the -D define string: func_name=internal_name */
-    snprintf(spec_define_buf, define_sz, "%s=%s", func_name, internal_name);
+    /*
+     * Build a preprocessor directive to inject BETWEEN the wrapper and the
+     * user's source.  This renames `func_name` to `internal_name` only for
+     * the text that follows (i.e. the user's implementation), leaving the
+     * wrapper above the directive completely unaffected.
+     *
+     * Using an inline `#define` rather than a `-D` command-line flag avoids
+     * the problem where the `-D` would rename occurrences of `func_name`
+     * inside the wrapper itself (causing a redefinition error).
+     */
+    snprintf(spec_define_buf, define_sz,
+             "#define %s %s\n", func_name, internal_name);
 
     /*
      * Build the parameter string for the forward declaration and call site
@@ -540,7 +550,7 @@ static size_t generate_spec_wrapper(const char *func_name,
     if (is_void) {
         written = snprintf(out_buf, out_sz,
             "/* [JIT arg-specialisation wrapper: %s] */\n"
-            "static %s %s(%s);\n"
+            "%s %s(%s);\n"           /* forward decl (non-static: matches user def) */
             "%s %s(%s) {\n"
             "    if (__builtin_expect(%s, 1)) { %s(%s); return; }\n"
             "    %s(%s);\n"
@@ -553,7 +563,7 @@ static size_t generate_spec_wrapper(const char *func_name,
     } else {
         written = snprintf(out_buf, out_sz,
             "/* [JIT arg-specialisation wrapper: %s] */\n"
-            "static %s %s(%s);\n"
+            "%s %s(%s);\n"           /* forward decl (non-static: matches user def) */
             "%s %s(%s) {\n"
             "    if (__builtin_expect(%s, 1)) return %s(%s);\n"
             "    return %s(%s);\n"
@@ -612,19 +622,23 @@ bool codegen_compile(const char          *func_name,
      * If opts->arg_profile is set and parse_func_sig() finds a confident
      * dominant value on any integer-typed parameter, we:
      *   (a) prepend a specialised wrapper that fast-paths the common value;
-     *   (b) rename the user's function to _cjit_i_<func_name> via a -D flag
-     *       so the compiler sees it as a static inlineable helper.
+     *   (b) inject a `#define func_name _cjit_i_func_name` directive between
+     *       the wrapper and the user's source, so only the user's implementation
+     *       is renamed.  Using an inline #define (rather than a -D command-line
+     *       flag) ensures the wrapper text above the directive is unaffected —
+     *       a -D flag would rename func_name everywhere in the file, including
+     *       in the wrapper itself, causing a redefinition error.
      *
-     * With -finline-functions (O2+) the compiler inlines the helper into the
-     * hot path, constant-folds through the dominant argument, and eliminates
-     * dead branches — effectively giving us profile-guided specialisation
-     * without a PGO profile build.
+     * With -finline-functions (O2+) the compiler inlines the renamed helper
+     * into the hot path, constant-folds through the dominant argument, and
+     * eliminates dead branches.
      *
      * On parse failure or when no confident slot is found, wrapper_src stays
      * NULL and we fall through to the ordinary (unspecialised) path.
      */
     char *wrapper_src    = NULL;   /* heap-allocated on success */
-    char  spec_define[CJIT_NAME_MAX * 2 + 4]; /* "func=_cjit_i_func\0" */
+    /* spec_define holds the `#define name internal\n` text to inject. */
+    char  spec_define[CJIT_NAME_MAX * 2 + 16];
     spec_define[0] = '\0';
 
     if (opts->arg_profile && opts->arg_profile->n_profiled > 0 &&
@@ -695,6 +709,12 @@ bool codegen_compile(const char          *func_name,
             size_t wlen = strlen(wrapper_src);
             write_ok = ((size_t)write(src_fd, wrapper_src, wlen) == wlen);
         }
+        /* Inject the `#define func_name _cjit_i_func_name` between wrapper
+         * and user source so only the implementation is renamed. */
+        if (write_ok && spec_define[0] != '\0') {
+            size_t dlen = strlen(spec_define);
+            write_ok = ((size_t)write(src_fd, spec_define, dlen) == dlen);
+        }
         if (write_ok)
             write_ok = ((size_t)write(src_fd, c_source, slen) == slen &&
                         write(src_fd, "\n", 1) == 1);
@@ -720,6 +740,9 @@ bool codegen_compile(const char          *func_name,
         }
         fputs(CODEGEN_PREAMBLE, f);
         if (wrapper_src) fputs(wrapper_src, f);
+        /* Inject the `#define func_name _cjit_i_func_name` between wrapper
+         * and user source so only the implementation is renamed. */
+        if (spec_define[0] != '\0') fputs(spec_define, f);
         fputs(c_source, f);
         fputc('\n', f);
         fclose(f);
@@ -729,22 +752,7 @@ bool codegen_compile(const char          *func_name,
     const char *cc_argv[MAX_CC_ARGS];
     char err_path[304];
     snprintf(err_path, sizeof(err_path), "%s.err", prefix);
-    int cc_argc = build_compiler_argv(cc_argv, so_path, src_path, level, opts);
-    /*
-     * If a specialisation wrapper was generated, insert the -D renaming flag
-     * BEFORE the source path (which is always last before NULL).
-     * build_compiler_argv leaves cc_argv[cc_argc] == NULL and cc_argc ≤
-     * MAX_CC_ARGS - 3, so there is always room for two more entries.
-     */
-    if (spec_define[0] != '\0') {
-        /* Shift src_path and terminator up by two to make room for -D <define>. */
-        cc_argv[cc_argc + 2] = NULL;
-        cc_argv[cc_argc + 1] = cc_argv[cc_argc];     /* NULL → + 2 */
-        cc_argv[cc_argc]     = cc_argv[cc_argc - 1]; /* src_path → cc_argc */
-        cc_argv[cc_argc - 1] = spec_define;           /* define string */
-        cc_argv[cc_argc - 2] = "-D";
-        cc_argc += 2;
-    }
+    build_compiler_argv(cc_argv, so_path, src_path, level, opts);
 
     if (opts->verbose) {
         fprintf(stderr, "[cjit/codegen] compile:");
