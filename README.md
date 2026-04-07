@@ -184,6 +184,12 @@ Options:
 Arguments after -- are forwarded to the JIT-compiled function as argv.
 ```
 
+> **Note on `-f`:** The `-f` prefix is also used by many C compilers for
+> feature flags (e.g. `-ffast-math`).  `cjit` stops argument parsing at `--`,
+> so any compiler-style flags that need to reach the *JIT-compiled program's*
+> `argv` must be placed after the `--` separator.  `cjit`'s own options are
+> always consumed before that separator.
+
 ### Examples
 
 ```sh
@@ -360,7 +366,7 @@ Obtain defaults with `cjit_default_config()` and override individual fields:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_functions` | 1024 | Maximum concurrently registered functions (≤ `CJIT_MAX_FUNCTIONS`). |
+| `max_functions` | 1024 | Maximum concurrently registered functions (≤ `CJIT_MAX_FUNCTIONS`, defined as `1024` in `include/cjit.h`). |
 | `compiler_threads` | 3 | Background compilation worker threads. |
 | `hot_threshold_t1` | 500 | Call count that triggers tier-1 recompilation (`-O2`). |
 | `hot_threshold_t2` | 5000 | Call count that triggers tier-2 recompilation (`-O3`). |
@@ -458,8 +464,8 @@ Key fields per entry:
 **Files:** `src/work_queue.h`, `src/work_queue.c`
 
 A lock-free bounded MPMC (multi-producer / multi-consumer) ring buffer based
-on Dmitry Vyukov's well-known algorithm.  Capacity is 256 slots (a
-power-of-two, compile-time constant `WQ_CAPACITY`).
+on [Dmitry Vyukov's well-known bounded MPMC queue algorithm](https://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue).
+Capacity is 256 slots (a power-of-two, compile-time constant `WQ_CAPACITY`).
 
 Each slot carries an atomic sequence counter alongside the `compile_task_t`
 payload.  Producers and consumers use CAS loops on their respective position
@@ -505,6 +511,12 @@ Optimisation flags by tier:
 | `OPT_O1` | `-O1` |
 | `OPT_O2` | `-O2 -finline-functions -fno-semantic-interposition` |
 | `OPT_O3` | `-O3 -finline-functions -funroll-loops -ftree-vectorize -fomit-frame-pointer -fno-semantic-interposition` + optionally `-march=native` and `-ffast-math` |
+
+`-fomit-frame-pointer` is applied only at `OPT_O3` because it makes stack
+traces harder to read and is generally not worthwhile at lower tiers.  If you
+need debuggable symbols even at `OPT_O3`, you can set `enable_native_arch` and
+`enable_fast_math` to `false` and rely on the system debuginfo rather than
+frame pointers, or simply stay at `OPT_O2` for production diagnostics.
 
 Thread safe: each call uses uniquely-named temp files and maintains no shared
 mutable state.
