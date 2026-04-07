@@ -20,6 +20,40 @@
 #include <sys/wait.h>     /* waitpid           */
 #include <spawn.h>        /* posix_spawnp      */
 #include <fcntl.h>        /* O_WRONLY etc.     */
+#ifdef __linux__
+#include <sys/syscall.h>  /* SYS_memfd_create  */
+#endif
+
+/* ─────────────────────────── memfd helper (Linux) ─────────────────────────── */
+
+#ifdef __linux__
+/**
+ * Thin wrapper around the memfd_create(2) kernel interface.
+ *
+ * Using a raw syscall avoids a glibc version dependency: the libc wrapper for
+ * memfd_create was added in glibc 2.27 (2018), but the kernel syscall has
+ * been available since Linux 3.17 (2014).  Both GCC and Clang are happy with
+ * syscall() here.
+ *
+ * We do NOT set MFD_CLOEXEC because the file descriptor must remain open in
+ * the compiler child process so that /proc/<ppid>/fd/<fd> continues to refer
+ * to a valid, open file while cc reads the source.  The fd is closed
+ * explicitly by codegen_compile() after waitpid() returns.
+ *
+ * Returns a valid file descriptor on success, or -1 on any failure (old
+ * kernel, seccomp restriction, etc.).  Callers must check for -1 and fall
+ * back to the ordinary /tmp tmpfile path.
+ */
+#  ifdef __NR_memfd_create
+static int cg_memfd_create(const char *name)
+{
+    return (int)syscall(__NR_memfd_create, name, 0u);
+}
+#  else
+/* Kernel too old to support memfd_create — fall back to tmpfile. */
+static int cg_memfd_create(const char *name) { (void)name; return -1; }
+#  endif /* __NR_memfd_create */
+#endif /* __linux__ */
 
 /* ─────────────────────────── preamble injected before user IR ─────────────── */
 
@@ -79,10 +113,12 @@ static const char CODEGEN_PREAMBLE[] =
 /**
  * Maximum number of arguments passed to the compiler subprocess.
  *
- * cc(1) + -shared + -fPIC + opt-level + up to 7 optional flags + -w +
- * -o + so_path + src_path + NULL = at most 16 entries; 24 gives headroom.
+ * cc(1) + -shared + -fPIC + opt-level + up to 10 optional flags +
+ * JIT-specific flags (-fno-stack-protector, -fno-asynchronous-unwind-tables) +
+ * -w + -o + so_path + -x + c + src_path + NULL = at most 22 entries;
+ * 32 gives comfortable headroom for future additions.
  */
-#define MAX_CC_ARGS 24
+#define MAX_CC_ARGS 32
 
 /**
  * Build the compiler argv array for posix_spawnp().
@@ -111,6 +147,24 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
     default:       argv[n++] = "-O2"; break;
     }
 
+    /*
+     * Flags applied from O1 upward.
+     *
+     * -fomit-frame-pointer: omit the frame pointer register save/restore in
+     *   function prologues and epilogues, freeing an extra general-purpose
+     *   register and reducing stack frame setup cost.  Always safe for JIT
+     *   functions since we never need to unwind through them at the C level.
+     *
+     * -fno-semantic-interposition: assume that symbols in this translation
+     *   unit cannot be interposed by LD_PRELOAD, allowing the compiler to
+     *   inline and devirtualize calls to locally-defined functions.  Correct
+     *   because every JIT .so is loaded with RTLD_LOCAL.
+     */
+    if (level >= OPT_O1) {
+        argv[n++] = "-fomit-frame-pointer";
+        argv[n++] = "-fno-semantic-interposition";
+    }
+
     if (opts->enable_inlining && level >= OPT_O2)
         argv[n++] = "-finline-functions";
 
@@ -120,27 +174,44 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
     if (opts->enable_vectorization && level >= OPT_O2)
         argv[n++] = "-ftree-vectorize";
 
-    if (level >= OPT_O2) {
-        argv[n++] = "-fomit-frame-pointer";
-        /*
-         * Disable ELF symbol interposition for shared-library symbols.
-         * With -fPIC the compiler otherwise assumes any call may be
-         * intercepted by LD_PRELOAD, preventing inlining and devirt.
-         * Each cjit .so is RTLD_LOCAL + single translation unit, so
-         * interposition cannot happen.  GCC ≥ 8 / Clang ≥ 6.
-         */
-        argv[n++] = "-fno-semantic-interposition";
-    }
-
     if (opts->enable_native_arch && level >= OPT_O3)
         argv[n++] = "-march=native";
 
     if (opts->enable_fast_math && level >= OPT_O3)
         argv[n++] = "-ffast-math";
 
+    /*
+     * JIT-specific flags applied at every optimisation level.
+     *
+     * -fno-stack-protector: disable the stack-smashing canary.  Every JIT
+     *   function otherwise gets 2-4 extra instructions (load guard, compare,
+     *   conditional branch) in its prologue and epilogue.  The canary is
+     *   irrelevant for JIT code because the IR is trusted/controlled by the
+     *   calling application.
+     *
+     * -fno-asynchronous-unwind-tables: omit the .eh_frame section from the
+     *   compiled .so.  This section is required for C++ exception unwinding
+     *   and debugger backtraces through JIT frames, neither of which applies
+     *   here.  Removing it reduces .so binary size (often 20-30% for small
+     *   functions), which lowers dlopen overhead and improves I-cache density.
+     */
+    argv[n++] = "-fno-stack-protector";
+    argv[n++] = "-fno-asynchronous-unwind-tables";
+
     argv[n++] = "-w";   /* suppress warnings from user snippets */
     argv[n++] = "-o";
     argv[n++] = so_path;
+    /*
+     * Explicit language specification before the source path.
+     *
+     * When the source file is an in-memory (memfd) path such as
+     * /proc/self/fd/3, the compiler cannot infer "C source" from the file
+     * extension.  Adding "-x c" before the path is safe even when the file
+     * has a ".c" extension — it is redundant but harmless in that case, so
+     * we always emit it to keep the logic unconditional.
+     */
+    argv[n++] = "-x";
+    argv[n++] = "c";
     argv[n++] = src_path;
     argv[n]   = NULL;
     return n;
@@ -183,21 +254,70 @@ bool codegen_compile(const char          *func_name,
     char prefix[256];
     make_temp_prefix(prefix, sizeof(prefix));
 
-    char src_path[300], so_path[300];
-    snprintf(src_path, sizeof(src_path), "%s.c",  prefix);
-    snprintf(so_path,  sizeof(so_path),  "%s.so", prefix);
+    char so_path[300];
+    snprintf(so_path, sizeof(so_path), "%s.so", prefix);
 
-    /* ── 2. Write preamble + user source to temp .c file ──────────────── */
-    FILE *f = fopen(src_path, "w");
-    if (!f) {
-        snprintf(result->errmsg, sizeof(result->errmsg),
-                 "codegen: cannot create source file %s: (errno)", src_path);
-        return false;
+    /* ── 2. Write preamble + user source ─────────────────────────────── */
+    /*
+     * On Linux, write the source into an anonymous in-memory file created
+     * with memfd_create(2).  The file is exposed to the compiler via its
+     * /proc/self/fd/<fd> symlink, eliminating all filesystem writes for the
+     * source step (no inode creation, no unlink, no tmpfs I/O).
+     *
+     * memfd_create is a raw syscall (no glibc dependency) that has been
+     * present since Linux 3.17 (2014).  On failure (very old kernel or
+     * seccomp restriction) we fall back to the traditional /tmp tmpfile.
+     *
+     * On non-Linux systems the traditional tmpfile path is used directly.
+     */
+    char src_path[300];
+    bool src_is_memfd = false;
+    int  src_fd = -1;
+
+#ifdef __linux__
+    src_fd = cg_memfd_create("cjit_src");
+    if (src_fd >= 0) {
+        /*
+         * Use /proc/<parent_pid>/fd/<fd> rather than /proc/self/fd/<fd>.
+         *
+         * /proc/self resolves in the CALLING process's context.  When the
+         * compiler subprocess opens the path, "self" refers to the compiler
+         * process, which has no fd <src_fd>.  Using the parent's PID
+         * (/proc/<ppid>/fd/<fd>) makes the path valid from any process that
+         * has permission to inspect the parent — which the compiler child
+         * always does (same UID, no seccomp restriction on /proc reads).
+         */
+        snprintf(src_path, sizeof(src_path), "/proc/%d/fd/%d",
+                 (int)getpid(), src_fd);
+        src_is_memfd = true;
+        size_t plen = strlen(CODEGEN_PREAMBLE);
+        size_t slen = strlen(c_source);
+        bool ok = ((size_t)write(src_fd, CODEGEN_PREAMBLE, plen) == plen &&
+                   (size_t)write(src_fd,          c_source, slen) == slen &&
+                   write(src_fd, "\n", 1) == 1);
+        if (!ok) {
+            snprintf(result->errmsg, sizeof(result->errmsg),
+                     "codegen: write to in-memory source file failed");
+            close(src_fd);
+            return false;
+        }
     }
-    fputs(CODEGEN_PREAMBLE, f);
-    fputs(c_source, f);
-    fputc('\n', f);
-    fclose(f);
+#endif /* __linux__ */
+
+    if (!src_is_memfd) {
+        /* Traditional /tmp tmpfile fallback. */
+        snprintf(src_path, sizeof(src_path), "%s.c", prefix);
+        FILE *f = fopen(src_path, "w");
+        if (!f) {
+            snprintf(result->errmsg, sizeof(result->errmsg),
+                     "codegen: cannot create source file %s", src_path);
+            return false;
+        }
+        fputs(CODEGEN_PREAMBLE, f);
+        fputs(c_source, f);
+        fputc('\n', f);
+        fclose(f);
+    }
 
     /* ── 3. Build compiler argv ──────────────────────────────────────── */
     const char *cc_argv[MAX_CC_ARGS];
@@ -235,7 +355,7 @@ bool codegen_compile(const char          *func_name,
     if (spawn_err != 0) {
         snprintf(result->errmsg, sizeof(result->errmsg),
                  "codegen: posix_spawnp failed: %s", strerror(spawn_err));
-        unlink(src_path);
+        if (src_is_memfd) close(src_fd); else unlink(src_path);
         return false;
     }
     {
@@ -245,7 +365,7 @@ bool codegen_compile(const char          *func_name,
     }
 
     /* Source file is no longer needed. */
-    unlink(src_path);
+    if (src_is_memfd) close(src_fd); else unlink(src_path);
 
     if (rc != 0) {
         /* Capture compiler error output from the per-invocation error file. */
