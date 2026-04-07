@@ -124,12 +124,34 @@ struct cjit_engine {
     /* Single compile work-queue shared by all compiler threads. */
     mpmc_queue_t    work_queue;
 
+    /*
+     * Condition variable used to wake compiler threads the instant a task
+     * is enqueued.  This eliminates the old exponential-backoff sleep loop,
+     * which could delay compilation startup by up to 8 ms.
+     *
+     * Protocol:
+     *   Enqueue side : mpmc_enqueue → lock → cond_signal → unlock
+     *   Consume side : lock → while (empty && !stop) cond_wait → unlock
+     *                  → mpmc_dequeue (retry if another thread won the race)
+     *
+     * The brief mutex acquisition on the producer side is acceptable because
+     * JIT compilation itself takes >> 1 ms; the signal overhead is negligible.
+     */
+    pthread_mutex_t work_cond_mutex;
+    pthread_cond_t  work_cond;
+
     /* Deferred GC for safe dlclose of retired handles. */
     deferred_gc_t   dgc;
 
-    /* Background thread handles. */
-    pthread_t       compiler_threads[CJIT_COMPILER_THREADS];
-    pthread_t       monitor_thread;
+    /*
+     * Background thread handles.
+     *
+     * compiler_threads is a heap-allocated array of cfg.compiler_threads
+     * elements, sized dynamically in cjit_create() so the actual thread count
+     * can be determined at runtime (e.g. from the online CPU count).
+     */
+    pthread_t  *compiler_threads;
+    pthread_t   monitor_thread;
 
     /* Lifecycle control. */
     atomic_bool     running;
@@ -141,14 +163,46 @@ struct cjit_engine {
     atomic_uint_fast64_t stat_swaps;
 };
 
+/* ══════════════════════════ internal helpers ══════════════════════════════ */
+
+/**
+ * Enqueue a compile task and immediately signal one waiting compiler thread.
+ *
+ * The signal is sent inside a brief mutex critical section so that the
+ * pthread_cond_wait / pthread_cond_signal pair is race-free:
+ *
+ *   Producer (this function):
+ *     mpmc_enqueue → lock → signal → unlock
+ *
+ *   Consumer (compiler_thread_fn):
+ *     lock → predicate check → [wait if empty] → unlock → mpmc_dequeue
+ *
+ * Because the consumer holds the mutex while evaluating the predicate, the
+ * producer's enqueue is always visible to the predicate check (the item is
+ * in the queue before the lock is acquired), so no wake-up can be lost.
+ *
+ * @return true if the task was accepted by the queue, false if full.
+ */
+static bool engine_enqueue_task(cjit_engine_t *engine,
+                                 const compile_task_t *task)
+{
+    bool ok = mpmc_enqueue(&engine->work_queue, task);
+    if (ok) {
+        pthread_mutex_lock(&engine->work_cond_mutex);
+        pthread_cond_signal(&engine->work_cond);
+        pthread_mutex_unlock(&engine->work_cond_mutex);
+    }
+    return ok;
+}
+
 /* ══════════════════════════ compiler thread ═══════════════════════════════ */
 
 /**
  * Main loop of a background compiler thread.
  *
- * The thread blocks in a tight spin-sleep on the MPMC queue.  When a task
- * arrives it attempts to compile the function's IR at the requested
- * optimisation level.
+ * The thread blocks on a condition variable when the work queue is empty.
+ * engine_enqueue_task() signals the condvar immediately after enqueue so
+ * compilation begins with minimal latency (no polling delay).
  *
  * Stale-task detection:
  *   If entry->version has advanced past task.version_req, this task was
@@ -174,22 +228,28 @@ static void *compiler_thread_fn(void *arg)
         .verbose              = engine->cfg.verbose,
     };
 
-    /* Backoff sleep: starts at 1 ms, doubles up to 8 ms on empty queue. */
-    const struct timespec backoff_min = { .tv_sec = 0, .tv_nsec =  500000L }; /* 0.5 ms */
-    const struct timespec backoff_max = { .tv_sec = 0, .tv_nsec = 8000000L }; /* 8 ms   */
-    struct timespec backoff = backoff_min;
-
     while (!atomic_load_explicit(&engine->stop_requested, memory_order_acquire)) {
 
         compile_task_t task;
         if (!mpmc_dequeue(&engine->work_queue, &task)) {
-            /* Queue empty: sleep with exponential backoff. */
-            nanosleep(&backoff, NULL);
-            if (backoff.tv_nsec < backoff_max.tv_nsec)
-                backoff.tv_nsec *= 2;
-            continue;
+            /*
+             * Queue is empty.  Block on the condition variable until either:
+             *   (a) engine_enqueue_task() signals us, or
+             *   (b) cjit_stop() broadcasts a shutdown.
+             *
+             * We hold work_cond_mutex while evaluating the predicate so the
+             * signal from engine_enqueue_task() cannot be lost between the
+             * mpmc_dequeue failure above and the pthread_cond_wait call.
+             */
+            pthread_mutex_lock(&engine->work_cond_mutex);
+            while (mpmc_size(&engine->work_queue) == 0 &&
+                   !atomic_load_explicit(&engine->stop_requested,
+                                         memory_order_relaxed)) {
+                pthread_cond_wait(&engine->work_cond, &engine->work_cond_mutex);
+            }
+            pthread_mutex_unlock(&engine->work_cond_mutex);
+            continue; /* retry mpmc_dequeue – another thread may have won */
         }
-        backoff = backoff_min; /* Reset backoff on successful dequeue. */
 
         func_table_entry_t *entry = func_table_get(engine->ftable, task.func_id);
         if (!entry) continue;
@@ -402,7 +462,7 @@ static void *monitor_thread_fn(void *arg)
                                                       memory_order_relaxed),
             };
 
-            if (!mpmc_enqueue(&engine->work_queue, &task)) {
+            if (!engine_enqueue_task(engine, &task)) {
                 /* Queue full: clear in_queue flag so we can retry later. */
                 atomic_store_explicit(&entry->in_queue, false,
                                       memory_order_relaxed);
@@ -425,8 +485,18 @@ cjit_config_t cjit_default_config(void)
 {
     cjit_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    cfg.max_functions        = CJIT_MAX_FUNCTIONS;
-    cfg.compiler_threads     = CJIT_COMPILER_THREADS;
+    cfg.max_functions    = CJIT_MAX_FUNCTIONS;
+
+    /*
+     * Default compiler thread count: (online CPUs - 1), so one CPU is
+     * always available for the main/runtime threads.  Clamped to
+     * [1, CJIT_COMPILER_THREADS].  Falls back to 1 when sysconf fails.
+     */
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    uint32_t nthreads = (ncpu > 1) ? (uint32_t)(ncpu - 1) : 1;
+    if (nthreads > CJIT_COMPILER_THREADS) nthreads = CJIT_COMPILER_THREADS;
+    cfg.compiler_threads     = nthreads;
+
     cfg.hot_threshold_t1     = CJIT_HOT_THRESHOLD_T1;
     cfg.hot_threshold_t2     = CJIT_HOT_THRESHOLD_T2;
     cfg.grace_period_ms      = CJIT_GRACE_PERIOD_MS;

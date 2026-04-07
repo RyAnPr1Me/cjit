@@ -55,8 +55,14 @@ extern "C" {
 /** Maximum number of concurrently registered functions. */
 #define CJIT_MAX_FUNCTIONS      1024
 
-/** Number of background compilation threads. */
-#define CJIT_COMPILER_THREADS   3
+/**
+ * Maximum number of background compilation threads.
+ *
+ * The actual number started is set by cjit_config_t.compiler_threads and
+ * defaults to (nproc - 1) as detected by cjit_default_config().  This
+ * constant is the hard upper bound; values above it are clamped.
+ */
+#define CJIT_COMPILER_THREADS   16
 
 /** Number of calls before a function is considered "hot" (tier-1). */
 #define CJIT_HOT_THRESHOLD_T1   500ULL
@@ -248,8 +254,7 @@ func_id_t cjit_register_function(cjit_engine_t *engine,
 /**
  * Retrieve the current function pointer for the given ID.
  *
- * This is the HOT PATH.  The implementation is a single
- * atomic_load_explicit(..., memory_order_acquire).
+ * This is a single atomic_load_explicit(..., memory_order_acquire).
  *
  * The returned pointer is guaranteed to remain valid for at least
  * CJIT_GRACE_PERIOD_MS milliseconds even if it is replaced concurrently.
@@ -273,19 +278,40 @@ jit_func_t cjit_get_func(cjit_engine_t *engine, func_id_t id);
 void cjit_record_call(cjit_engine_t *engine, func_id_t id);
 
 /**
- * Convenience macro: atomic dispatch with a single load + indirect call.
+ * HOT PATH: retrieve the current function pointer AND increment the call
+ * counter in a single function-table lookup.
+ *
+ * This is strictly faster than calling cjit_get_func() + cjit_record_call()
+ * separately because it performs only ONE table lookup (one atomic bounds-check
+ * load + one stable-pointer dereference) instead of two.
+ *
+ * Atomicity guarantees:
+ *   • call_cnt increment : relaxed (approximation is sufficient for the
+ *                          monitor; no ordering with other variables needed).
+ *   • func_ptr load      : acquire (ensures the function and its data are
+ *                          fully visible before the indirect call).
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @return        Current function pointer; never NULL after registration.
+ */
+jit_func_t cjit_get_func_counted(cjit_engine_t *engine, func_id_t id);
+
+/**
+ * Convenience macro: single-lookup atomic dispatch.
+ *
+ * Uses cjit_get_func_counted() so only ONE table lookup is performed per
+ * dispatch, compared to the naive separate get_func + record_call pattern.
  *
  * Usage:
  *   typedef int (*add_fn_t)(int, int);
  *   int result = CJIT_DISPATCH(engine, id, add_fn_t, a, b);
  *
- * The macro expands to exactly:
- *   ((CastType)cjit_get_func(engine, id))(args…)
- * followed by cjit_record_call().
+ * The macro expands to:
+ *   ((CastType)cjit_get_func_counted(engine, id))(args…)
  */
-#define CJIT_DISPATCH(engine, id, cast_type, ...)                    \
-    ( cjit_record_call((engine), (id)),                              \
-      ((cast_type)cjit_get_func((engine), (id)))(__VA_ARGS__) )
+#define CJIT_DISPATCH(engine, id, cast_type, ...)                         \
+    ((cast_type)cjit_get_func_counted((engine), (id)))(__VA_ARGS__)
 
 /**
  * Forcibly enqueue a function for recompilation at the given tier.
