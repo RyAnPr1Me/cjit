@@ -80,10 +80,10 @@
  *     per-thread TLS batch counting, this line is invalidated ONLY during an
  *     actual function-pointer swap — an extremely rare event.
  *
- *   Cache line 1 – call_cnt, version, cur_level (write-frequently or by
- *     compiler threads).  call_cnt is updated by calling threads via the TLS
- *     batch flush (every CJIT_TLS_FLUSH_THRESHOLD calls per thread), which is
- *     orders of magnitude less frequent than a direct per-call atomic.
+ *   Cache line 1 – call_cnt, version, cur_level (written infrequently, by
+ *     calling threads via TLS flush or by compiler threads).  call_cnt is
+ *     updated every CJIT_TLS_FLUSH_THRESHOLD calls per thread — orders of
+ *     magnitude less frequent than a direct per-call atomic.
  *
  *   Cache line 2+ – cold metadata (registration and compiler threads only).
  */

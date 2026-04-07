@@ -1086,7 +1086,7 @@ void cjit_record_call(cjit_engine_t *engine, func_id_t id)
     if (__builtin_expect(++cjit_tls_counts[id] >= CJIT_TLS_FLUSH_THRESHOLD, 0)) {
         cjit_tls_counts[id] = 0;
         func_table_entry_t *e = func_table_get(engine->ftable, id);
-        if (__builtin_expect(!!e, 1))
+        if (__builtin_expect(e != NULL, 1))
             atomic_fetch_add_explicit(&e->call_cnt, CJIT_TLS_FLUSH_THRESHOLD,
                                       memory_order_relaxed);
     }

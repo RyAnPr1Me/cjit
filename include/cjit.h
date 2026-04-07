@@ -91,7 +91,7 @@ extern "C" {
  *   rare (compilation events).  Previously, every call_cnt write (same line)
  *   forced a cache-line ownership transfer that also evicted func_ptr.
  * • Atomic flush to call_cnt (cache line 1) occurs once every
- *   CJIT_TLS_FLUSH_THRESHOLD calls per thread — a > 97 % reduction in
+ *   CJIT_TLS_FLUSH_THRESHOLD calls per thread — a > 96 % reduction in
  *   shared-memory traffic compared with a direct per-call atomic_fetch_add.
  *
  * Accuracy
