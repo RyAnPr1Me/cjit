@@ -45,6 +45,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <time.h>       /* struct timespec, clock_gettime (for cjit_timestamp_ns) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -188,6 +189,23 @@ extern "C" {
  */
 #define CJIT_DEFAULT_EXTRA_STREAK_PER_RECOMPILE  2U
 
+/**
+ * Default CPU-time threshold (nanoseconds per second) to trigger O2
+ * compilation based on measured execution time.
+ *
+ * 0 = disabled: the CPU-time signal is not used for tier promotion unless
+ * both cpu_hot_ns_per_sec_t1 and cpu_hot_ns_per_sec_t2 are set non-zero
+ * in cjit_config_t.
+ *
+ * When enabled, this threshold is used alongside (OR with) the call-rate
+ * threshold, allowing functions that are called infrequently but execute
+ * for a long time each call to be promoted purely on CPU time consumed.
+ */
+#define CJIT_DEFAULT_CPU_HOT_NS_T1   0ULL  /* disabled */
+
+/** Default CPU-time threshold (ns/sec) to trigger O3.  0 = disabled. */
+#define CJIT_DEFAULT_CPU_HOT_NS_T2   0ULL  /* disabled */
+
 /* ══════════════════════════════ public types ══════════════════════════════ */
 
 /** Opaque JIT engine handle. */
@@ -206,6 +224,29 @@ typedef uint32_t func_id_t;
 
 /** Sentinel value indicating an invalid function ID. */
 #define CJIT_INVALID_FUNC_ID ((func_id_t)UINT32_MAX)
+
+/* ═══════════════════════════ timing helper ════════════════════════════════ */
+
+/**
+ * Returns the current monotonic nanosecond timestamp.
+ *
+ * Used by CJIT_DISPATCH_TIMED and CJIT_DISPATCH_TIMED_VOID to measure
+ * per-call execution time with minimal overhead.  On Linux the call goes
+ * through the vDSO (no kernel entry), making the round-trip cost ≈ 25 ns.
+ *
+ * Two cjit_timestamp_ns() calls bracket a function invocation; the
+ * difference gives the elapsed nanoseconds, which are accumulated in a
+ * per-thread TLS buffer and flushed to the shared atomic counter every
+ * CJIT_TLS_FLUSH_THRESHOLD calls — so the amortised per-call overhead of
+ * the flush is negligible.
+ */
+static inline uint64_t cjit_timestamp_ns(void)
+{
+    struct timespec _ts;
+    clock_gettime(CLOCK_MONOTONIC, &_ts);
+    return (uint64_t)_ts.tv_sec * UINT64_C(1000000000)
+         + (uint64_t)_ts.tv_nsec;
+}
 
 /**
  * System memory pressure level, computed from /proc/meminfo by the IR cache's
@@ -408,6 +449,46 @@ typedef struct {
      * Default: CJIT_DEFAULT_EXTRA_STREAK_PER_RECOMPILE (2).
      */
     uint32_t extra_streak_per_recompile;
+
+    /* ── CPU-time-based tier promotion ─────────────────────────────────── */
+
+    /**
+     * Minimum sustained CPU time (nanoseconds per second) to consider a
+     * function ready for tier-1 (O2) compilation.
+     *
+     * When non-zero this threshold is checked in parallel with (OR alongside)
+     * the call-rate gate: a function is promoted to O2 if either:
+     *   • ema_rate       ≥ hot_rate_t1, OR
+     *   • ema_ns_per_sec ≥ cpu_hot_ns_per_sec_t1  (and this field > 0)
+     *
+     * This catches functions that are invoked infrequently but spend a
+     * significant wall-clock time each call (e.g. large parsers, image
+     * decoders) — functions whose call rate never crosses the call-rate
+     * threshold but whose CPU footprint clearly warrants optimisation.
+     *
+     * The EMA smoothing coefficient (alpha) is the same as for the call-rate
+     * EMA, so the two signals update at the same pace.  The per-recompile
+     * scaled threshold and streak gates also apply to the CPU-time path,
+     * preventing premature promotions based on transient spikes.
+     *
+     * Timing data is only accumulated when CJIT_DISPATCH_TIMED or
+     * CJIT_DISPATCH_TIMED_VOID is used for dispatch.  Functions dispatched
+     * through CJIT_DISPATCH or cjit_get_func_counted() contribute zero
+     * elapsed time; the CPU-time gate will never fire for them regardless
+     * of this threshold.
+     *
+     * 0 = disabled (default).  Units: nanoseconds/second.
+     */
+    uint64_t cpu_hot_ns_per_sec_t1;
+
+    /**
+     * Minimum sustained CPU time (nanoseconds per second) to consider a
+     * function ready for tier-2 (O3) compilation.  Must be ≥
+     * cpu_hot_ns_per_sec_t1 when both are non-zero.
+     *
+     * 0 = disabled (default).  Units: nanoseconds/second.
+     */
+    uint64_t cpu_hot_ns_per_sec_t2;
 } cjit_config_t;
 
 /* ══════════════════════════════ runtime stats ═════════════════════════════ */
@@ -447,6 +528,17 @@ typedef struct {
     mem_pressure_t mem_pressure;    /**< Current pressure level.               */
     uint64_t mem_available_mb;      /**< Last observed MemAvailable (MB).      */
     uint64_t mem_total_mb;          /**< Last observed MemTotal (MB).          */
+
+    /* ── Execution timing ────────────────────────────────────────────── */
+
+    /**
+     * Sum of per-function total_elapsed_ns across all registered functions.
+     *
+     * Only non-zero when CJIT_DISPATCH_TIMED / CJIT_DISPATCH_TIMED_VOID
+     * are used for at least some dispatches.  Useful for computing the
+     * overall fraction of wall-clock time spent inside JIT-compiled code.
+     */
+    uint64_t total_elapsed_ns;
 } cjit_stats_t;
 
 /* ══════════════════════════════ public API ════════════════════════════════ */
@@ -593,6 +685,108 @@ jit_func_t cjit_get_func_counted(cjit_engine_t *engine, func_id_t id);
     })
 
 /**
+ * HOT PATH: timed single-lookup dispatch for non-void functions.
+ *
+ * Identical to CJIT_DISPATCH but additionally measures the wall-clock time
+ * of the function call and accumulates it in the per-thread TLS elapsed
+ * buffer.  The buffer is flushed to the shared atomic
+ * func_table_entry_t::total_elapsed_ns every CJIT_TLS_FLUSH_THRESHOLD calls
+ * per thread — the same batch size used for call_cnt — so only one extra
+ * atomic operation (per THRESHOLD calls) is needed beyond the normal
+ * CJIT_DISPATCH overhead.
+ *
+ * The monitor reads total_elapsed_ns each scan cycle, computes an EMA of
+ * nanoseconds-per-second, and uses it alongside the call-rate EMA for tier-
+ * promotion decisions.  Functions that are called infrequently but execute
+ * for a long time each call (e.g. parsers, image decoders) will be promoted
+ * to O2/O3 based on their CPU time, not just their call frequency.
+ *
+ * Timer overhead: two clock_gettime(CLOCK_MONOTONIC) calls per dispatch
+ * ≈ 50 ns total (vDSO on Linux).  For functions that take < 200 ns to
+ * execute the overhead fraction can be significant; for functions ≥ 1 µs
+ * it is < 5 %.  Use CJIT_DISPATCH for sub-microsecond functions where
+ * call-rate-based promotion is sufficient.
+ *
+ * Usage (non-void return):
+ *   typedef int (*add_fn_t)(int, int);
+ *   int result = CJIT_DISPATCH_TIMED(engine, id, add_fn_t, a, b);
+ *
+ * @note  Uses GCC/Clang __typeof__ to capture the return value without
+ *        requiring a user-supplied result variable.  Not suitable for
+ *        void-returning functions; use CJIT_DISPATCH_TIMED_VOID instead.
+ */
+#define CJIT_DISPATCH_TIMED(engine, id, cast_type, ...)                       \
+    __extension__({                                                            \
+        cjit_engine_t *_cjit_e  = (engine);                                   \
+        func_id_t      _cjit_i  = (id);                                       \
+        jit_func_t     _cjit_fn = cjit_get_func(_cjit_e, _cjit_i);           \
+        uint64_t       _cjit_t0 = cjit_timestamp_ns();                        \
+        /* __typeof__ is unevaluated; (cast_type)0 is never dereferenced. */  \
+        __typeof__(((cast_type)0)(__VA_ARGS__)) _cjit_r =                     \
+            ((cast_type)_cjit_fn)(__VA_ARGS__);                               \
+        cjit_record_timed_call(_cjit_e, _cjit_i,                              \
+                               cjit_timestamp_ns() - _cjit_t0);               \
+        _cjit_r;                                                               \
+    })
+
+/**
+ * HOT PATH: timed single-lookup dispatch for void-returning functions.
+ *
+ * Identical to CJIT_DISPATCH_TIMED but for functions with no return value.
+ *
+ * Usage:
+ *   typedef void (*render_fn_t)(scene_t *);
+ *   CJIT_DISPATCH_TIMED_VOID(engine, id, render_fn_t, &scene);
+ */
+#define CJIT_DISPATCH_TIMED_VOID(engine, id, cast_type, ...)                  \
+    __extension__({                                                            \
+        cjit_engine_t *_cjit_e  = (engine);                                   \
+        func_id_t      _cjit_i  = (id);                                       \
+        jit_func_t     _cjit_fn = cjit_get_func(_cjit_e, _cjit_i);           \
+        uint64_t       _cjit_t0 = cjit_timestamp_ns();                        \
+        ((cast_type)_cjit_fn)(__VA_ARGS__);                                   \
+        cjit_record_timed_call(_cjit_e, _cjit_i,                              \
+                               cjit_timestamp_ns() - _cjit_t0);               \
+    })
+
+/**
+ * Record a call to function `id` along with `elapsed_ns` nanoseconds spent
+ * inside it.
+ *
+ * Increments the thread-local batch counter (same mechanism as
+ * cjit_record_call) and accumulates elapsed_ns in a parallel TLS buffer.
+ * Both are flushed to shared atomics every CJIT_TLS_FLUSH_THRESHOLD calls.
+ *
+ * Callers that prefer manual timing (e.g. when they already have their own
+ * high-resolution timer) can call this directly instead of using the
+ * CJIT_DISPATCH_TIMED macro.
+ *
+ * @param engine      The engine.
+ * @param id          Function ID.
+ * @param elapsed_ns  Nanoseconds spent inside the function on this call.
+ */
+void cjit_record_timed_call(cjit_engine_t *engine,
+                              func_id_t      id,
+                              uint64_t       elapsed_ns);
+
+/**
+ * Return the cumulative nanoseconds observed for function `id`.
+ *
+ * Only counts nanoseconds recorded via CJIT_DISPATCH_TIMED,
+ * CJIT_DISPATCH_TIMED_VOID, or cjit_record_timed_call().  Returns 0 if
+ * the function has only been dispatched through the non-timed paths.
+ *
+ * Thread safety: relaxed atomic read.  The value may lag by at most
+ *   N × (CJIT_TLS_FLUSH_THRESHOLD − 1) × avg_elapsed_ns
+ * where N is the number of active calling threads.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID.
+ * @return        Total nanoseconds accumulated, or 0 on error.
+ */
+uint64_t cjit_get_elapsed_ns(const cjit_engine_t *engine, func_id_t id);
+
+/**
  * Forcibly enqueue a function for recompilation at the given tier.
  *
  * If the function is already enqueued at an equal or higher tier, this is a
@@ -607,24 +801,27 @@ void cjit_request_recompile(cjit_engine_t *engine,
                              opt_level_t    level);
 
 /**
- * Flush this thread's pending TLS call-count batch to the engine.
+ * Flush this thread's pending TLS call-count and elapsed-time batches to the
+ * engine.
  *
- * Under normal operation calling threads never need to call this; the TLS
- * batch flushes automatically every CJIT_TLS_FLUSH_THRESHOLD calls.  However
+ * Under normal operation calling threads never need to call this; both TLS
+ * batches flush automatically every CJIT_TLS_FLUSH_THRESHOLD calls.  However
  * there are two situations where an explicit flush is needed:
  *
  *   1. Before the calling thread exits.  TLS storage is reclaimed by the
  *      C runtime when a thread terminates; any unflushed partial batch is
  *      silently lost.  Calling this function in a thread-exit hook (e.g.
- *      pthread_cleanup_push) preserves those call-count observations.
+ *      pthread_cleanup_push) preserves those call-count and elapsed-time
+ *      observations.
  *
  *   2. Before calling cjit_stop() / cjit_destroy() if you want the final
- *      call-count snapshot to be accurate (e.g. for logging / diagnostics).
+ *      call-count and elapsed-time snapshots to be accurate (e.g. for
+ *      logging / diagnostics).
  *
  * The function iterates over registered functions and flushes the partial
- * remainder (counts[i] % CJIT_TLS_FLUSH_THRESHOLD) for each one.  It is
+ * remainder for both cjit_tls_counts and cjit_tls_elapsed.  It is
  * O(registered_functions) and touches no shared memory for functions whose
- * local counter is currently zero.
+ * local counters are currently zero.
  *
  * Thread safety: safe to call from any thread at any time.  Only the calling
  * thread's TLS state is modified; no other threads are affected.

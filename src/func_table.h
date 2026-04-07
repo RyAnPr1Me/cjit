@@ -102,18 +102,22 @@ typedef struct {
     /*
      * COUNTERS LINE (cache line 1) – written by TLS flush + compiler threads.
      *
-     * call_cnt : incremented by calling threads via TLS batch flush
-     *            (every CJIT_TLS_FLUSH_THRESHOLD calls per thread).
-     * version  : incremented by compiler thread on each successful swap.
-     * cur_level: updated by compiler thread on each swap.
+     * call_cnt         : incremented by calling threads via TLS batch flush
+     *                    (every CJIT_TLS_FLUSH_THRESHOLD calls per thread).
+     * total_elapsed_ns : cumulative nanoseconds spent inside this function,
+     *                    flushed from the per-thread TLS accumulator alongside
+     *                    call_cnt.  Zero until CJIT_DISPATCH_TIMED is used.
+     * version          : incremented by compiler thread on each successful swap.
+     * cur_level        : updated by compiler thread on each swap.
      *
-     * The monitor thread reads all three fields on every scan cycle; keeping
+     * The monitor thread reads all four fields on every scan cycle; keeping
      * them together on one line is cache-friendly for its access pattern.
      */
     _Alignas(64)
-    atomic_uint_fast64_t        call_cnt;   /**< Call counter (TLS-batched).    */
-    _Atomic uint32_t             version;    /**< Recompile generation counter.  */
-    atomic_int                  cur_level;  /**< opt_level_t of loaded code.    */
+    atomic_uint_fast64_t        call_cnt;         /**< Call counter (TLS-batched).       */
+    atomic_uint_fast64_t        total_elapsed_ns; /**< Cumulative ns (TLS-batched).      */
+    _Atomic uint32_t             version;          /**< Recompile generation counter.     */
+    atomic_int                  cur_level;        /**< opt_level_t of loaded code.       */
 
     /*
      * COLD FIELDS (cache line 2+)

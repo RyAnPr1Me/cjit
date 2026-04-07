@@ -162,7 +162,22 @@
  * uint8_t × CJIT_MAX_FUNCTIONS = 1 024 bytes of TLS per calling thread.
  * TLS variables are zero-initialised by the C runtime.
  */
-static __thread uint8_t cjit_tls_counts[CJIT_MAX_FUNCTIONS];
+static __thread uint8_t  cjit_tls_counts[CJIT_MAX_FUNCTIONS];
+
+/*
+ * Per-calling-thread elapsed-nanoseconds accumulator.
+ *
+ * When CJIT_DISPATCH_TIMED or cjit_record_timed_call() is used, the
+ * measured nanoseconds for each call are added here.  The buffer is
+ * flushed to the global atomic total_elapsed_ns alongside cjit_tls_counts
+ * — both share the same CJIT_TLS_FLUSH_THRESHOLD trigger — so only one
+ * additional atomic_fetch_add per THRESHOLD calls is required beyond the
+ * normal call_cnt flush.
+ *
+ * uint64_t × CJIT_MAX_FUNCTIONS = 8 192 bytes of TLS per calling thread.
+ * Zero-initialised; stays zero for functions not dispatched via timed paths.
+ */
+static __thread uint64_t cjit_tls_elapsed[CJIT_MAX_FUNCTIONS];
 
 /* ══════════════════════════ engine structure ══════════════════════════════ */
 
@@ -562,7 +577,9 @@ static void *monitor_thread_fn(void *arg)
      *   [uint64_t × max_funcs] prev_cnt
      *   [uint64_t × max_funcs] cnt_at_compile
      *   [uint64_t × max_funcs] last_queued_ms
+     *   [uint64_t × max_funcs] prev_elapsed       ← nanosecond baseline
      *   [float    × max_funcs] ema_rate
+     *   [float    × max_funcs] ema_ns_per_sec      ← CPU-time EMA (ns/s)
      *   [uint32_t × max_funcs] hot_scan_streak
      *   [bool     × max_funcs] prefetch_done
      *
@@ -575,7 +592,7 @@ static void *monitor_thread_fn(void *arg)
      * insufficient or transient data.
      */
     size_t monitor_block_sz =
-        (size_t)max_funcs * (3 * sizeof(uint64_t) + sizeof(float)
+        (size_t)max_funcs * (4 * sizeof(uint64_t) + 2 * sizeof(float)
                              + sizeof(uint32_t) + sizeof(bool));
     void *monitor_block = calloc(1, monitor_block_sz);
     if (!monitor_block) {
@@ -586,8 +603,10 @@ static void *monitor_thread_fn(void *arg)
     uint64_t *prev_cnt        = (uint64_t *)monitor_block;
     uint64_t *cnt_at_compile  = prev_cnt        + max_funcs;
     uint64_t *last_queued_ms  = cnt_at_compile  + max_funcs;
-    float    *ema_rate        = (float   *)(void *)(last_queued_ms  + max_funcs);
-    uint32_t *hot_scan_streak = (uint32_t *)(void *)(ema_rate       + max_funcs);
+    uint64_t *prev_elapsed    = last_queued_ms  + max_funcs;
+    float    *ema_rate        = (float   *)(void *)(prev_elapsed    + max_funcs);
+    float    *ema_ns_per_sec  = (float   *)(void *)(ema_rate        + max_funcs);
+    uint32_t *hot_scan_streak = (uint32_t *)(void *)(ema_ns_per_sec + max_funcs);
     bool     *prefetch_done   = (bool    *)(void *)(hot_scan_streak + max_funcs);
 
     struct timespec interval;
@@ -628,6 +647,26 @@ static void *monitor_thread_fn(void *arg)
                 delta = (uint64_t)1000000000000ULL;
             uint64_t inst_rate = delta * 1000ULL / itvl_safe;  /* calls/sec */
             ema_rate[i] = ema_rate[i] + alpha * ((float)inst_rate - ema_rate[i]);
+
+            /*
+             * Update the CPU-time EMA (nanoseconds/second).
+             *
+             * Read the cumulative elapsed nanoseconds for this function, take
+             * the delta since the last scan, and convert to ns/sec using the
+             * same interval divisor as the call-rate EMA.
+             *
+             * Clamped to 1e15 ns/sec (> 10^6 × CPU speed) to prevent overflow
+             * in the float EMA from impossible counter values.
+             */
+            uint64_t cur_elapsed = atomic_load_explicit(&entry->total_elapsed_ns,
+                                                         memory_order_relaxed);
+            uint64_t delta_ns    = cur_elapsed - prev_elapsed[i];
+            prev_elapsed[i]      = cur_elapsed;
+            if (delta_ns > (uint64_t)1000000000000000ULL)
+                delta_ns = (uint64_t)1000000000000000ULL;
+            uint64_t inst_ns_per_sec = delta_ns * 1000ULL / itvl_safe;
+            ema_ns_per_sec[i] = ema_ns_per_sec[i]
+                              + alpha * ((float)inst_ns_per_sec - ema_ns_per_sec[i]);
 
             opt_level_t cur_level =
                 (opt_level_t)atomic_load_explicit(&entry->cur_level,
@@ -671,34 +710,39 @@ static void *monitor_thread_fn(void *arg)
 
             opt_level_t target;
             uint64_t    rate_thresh;
+            uint64_t    ns_thresh;
             if (cur_level < OPT_O2) {
                 target      = OPT_O2;
                 rate_thresh = engine->cfg.hot_rate_t1;
+                ns_thresh   = engine->cfg.cpu_hot_ns_per_sec_t1;
             } else {
                 target      = OPT_O3;
                 rate_thresh = engine->cfg.hot_rate_t2;
+                ns_thresh   = engine->cfg.cpu_hot_ns_per_sec_t2;
             }
 
             /*
-             * Gate 2 – Scaled rate threshold.
+             * Gate 2 – Scaled rate threshold (call rate) AND/OR CPU-time
+             * threshold.
              *
-             * Effective threshold = base × (1 + rc × scale_pct / 100).
+             * The call-rate EMA path remains the primary signal and uses
+             * the same per-recompile scaled threshold as before.  In
+             * addition, when cpu_hot_ns_per_sec_t1/t2 is non-zero, the
+             * monitor also evaluates a CPU-time EMA gate: a function that
+             * is called infrequently but runs for a long time per call can
+             * be promoted based on nanoseconds-per-second even if it never
+             * crosses the call-rate threshold.
              *
-             * Each additional recompile raises the required EMA rate by
-             * scale_pct percent, ensuring the monitor only triggers again
-             * when the function is proportionally hotter than the previous
-             * trigger level.  This prevents re-promotions for marginal gains
-             * (e.g. 0.00001% faster) that do not justify the compilation cost
-             * or the I-cache pressure of swapping in new code.
+             * The same recompile-count scale factor is applied to the ns
+             * threshold, preventing repeated O3 promotions for diminishing
+             * CPU-time gains.
              *
-             * Example with scale_pct=50:
-             *   rc=0 → 1.0× base  (first recompile: standard gate)
-             *   rc=1 → 1.5× base  (second: must be 50% hotter)
-             *   rc=2 → 2.0× base
-             *   rc=4 → 3.0× base
+             * Both EMAs use the same alpha (smoothing period), so they
+             * track on the same time scale.
              *
-             * Cap at 64× base to avoid overflow; the hard cap above terminates
-             * the loop long before rc would reach such values.
+             * "Hot" condition: rate_hot OR (ns_thresh > 0 AND ns_hot)
+             *
+             * Cap at 64× base (same as call-rate path) to avoid overflow.
              */
             uint64_t scaled_rate_thresh = rate_thresh;
             if (engine->cfg.recompile_rate_scale_pct > 0 && rc > 0) {
@@ -711,9 +755,23 @@ static void *monitor_thread_fn(void *arg)
                 scaled_rate_thresh = rate_thresh + bump;
             }
 
-            /* EMA must be above the scaled threshold.
-             * If not, this scan is "cold" — reset the streak. */
-            if ((uint64_t)ema_rate[i] < scaled_rate_thresh) {
+            uint64_t scaled_ns_thresh = ns_thresh;
+            if (ns_thresh > 0 && engine->cfg.recompile_rate_scale_pct > 0 && rc > 0) {
+                uint64_t bump = ns_thresh
+                                * (uint64_t)rc
+                                * engine->cfg.recompile_rate_scale_pct
+                                / 100ULL;
+                uint64_t max_bump = ns_thresh * 63ULL;
+                if (bump > max_bump) bump = max_bump;
+                scaled_ns_thresh = ns_thresh + bump;
+            }
+
+            bool rate_hot = ((uint64_t)ema_rate[i] >= scaled_rate_thresh);
+            bool ns_hot   = (scaled_ns_thresh > 0 &&
+                             (uint64_t)ema_ns_per_sec[i] >= scaled_ns_thresh);
+
+            /* Neither signal crosses its threshold → cold scan, reset streak. */
+            if (!rate_hot && !ns_hot) {
                 hot_scan_streak[i] = 0;
                 continue;
             }
@@ -820,9 +878,10 @@ static void *monitor_thread_fn(void *arg)
                 if (engine->cfg.verbose)
                     fprintf(stderr,
                             "[cjit/monitor] enqueued '%s' for O%d "
-                            "(ema=%.0fcps streak=%u/%u rc=%u cooloff=%ums)\n",
+                            "(ema=%.0fcps ema_ns=%.0fns/s streak=%u/%u rc=%u cooloff=%ums)\n",
                             entry->name, (int)target,
                             (double)ema_rate[i],
+                            (double)ema_ns_per_sec[i],
                             hot_scan_streak[i], req_streak,
                             rc, effective_cooloff);
             }
@@ -880,6 +939,10 @@ cjit_config_t cjit_default_config(void)
     cfg.recompile_rate_scale_pct    = CJIT_DEFAULT_RECOMPILE_RATE_SCALE_PCT;
     cfg.min_uptime_for_tier2_ms     = CJIT_DEFAULT_MIN_UPTIME_T2_MS;
     cfg.extra_streak_per_recompile  = CJIT_DEFAULT_EXTRA_STREAK_PER_RECOMPILE;
+
+    /* CPU-time-based tier promotion (disabled by default; opt-in). */
+    cfg.cpu_hot_ns_per_sec_t1 = CJIT_DEFAULT_CPU_HOT_NS_T1;
+    cfg.cpu_hot_ns_per_sec_t2 = CJIT_DEFAULT_CPU_HOT_NS_T2;
 
     cfg.enable_inlining      = true;
     cfg.enable_vectorization = true;
@@ -1128,22 +1191,69 @@ void cjit_flush_local_counts(cjit_engine_t *engine)
      *
      * For each registered function, cjit_tls_counts[i] holds the number of
      * calls accumulated since the last flush (in [0, CJIT_TLS_FLUSH_THRESHOLD)).
-     * Full batches of CJIT_TLS_FLUSH_THRESHOLD have already been added to
-     * call_cnt by the threshold-compare path.  Only the sub-threshold remainder
-     * is pending here.
+     * Full batches have already been added to call_cnt by the threshold-compare
+     * path.  Only the sub-threshold remainder is pending here.
+     *
+     * cjit_tls_elapsed[i] holds accumulated nanoseconds from timed dispatches;
+     * it is flushed unconditionally when non-zero regardless of cjit_tls_counts.
      *
      * We scan only registered functions (count ≤ CJIT_MAX_FUNCTIONS), so the
-     * TLS array access is always in bounds.
+     * TLS array accesses are always in bounds.
      */
     uint32_t n = atomic_load_explicit(&engine->ftable->count,
                                        memory_order_relaxed);
     for (uint32_t i = 0; i < n; ++i) {
-        uint8_t rem = cjit_tls_counts[i];
-        if (rem == 0) continue;            /* nothing pending */
-        cjit_tls_counts[i] = 0;
-        atomic_fetch_add_explicit(&engine->ftable->entries[i].call_cnt,
-                                  rem, memory_order_relaxed);
+        uint8_t  rem     = cjit_tls_counts[i];
+        uint64_t elapsed = cjit_tls_elapsed[i];
+        if (rem == 0 && elapsed == 0) continue;   /* nothing pending */
+        func_table_entry_t *e = &engine->ftable->entries[i];
+        if (rem > 0) {
+            cjit_tls_counts[i] = 0;
+            atomic_fetch_add_explicit(&e->call_cnt, rem, memory_order_relaxed);
+        }
+        if (elapsed > 0) {
+            cjit_tls_elapsed[i] = 0;
+            atomic_fetch_add_explicit(&e->total_elapsed_ns, elapsed,
+                                      memory_order_relaxed);
+        }
     }
+}
+
+void cjit_record_timed_call(cjit_engine_t *engine,
+                              func_id_t      id,
+                              uint64_t       elapsed_ns)
+{
+    if (__builtin_expect(id >= CJIT_MAX_FUNCTIONS, 0)) return;
+    /*
+     * Accumulate elapsed nanoseconds in TLS (zero shared-memory traffic on the
+     * common path).  The count and elapsed buffers share the same flush trigger:
+     * when cjit_tls_counts reaches CJIT_TLS_FLUSH_THRESHOLD, both are flushed
+     * to the shared atomics with one call_cnt fetch_add and one (conditional)
+     * total_elapsed_ns fetch_add.  This adds at most one extra atomic operation
+     * per THRESHOLD calls compared to the non-timed path.
+     */
+    cjit_tls_elapsed[id] += elapsed_ns;
+    if (__builtin_expect(++cjit_tls_counts[id] >= CJIT_TLS_FLUSH_THRESHOLD, 0)) {
+        cjit_tls_counts[id] = 0;
+        uint64_t acc = cjit_tls_elapsed[id];
+        cjit_tls_elapsed[id] = 0;
+        func_table_entry_t *e = func_table_get(engine->ftable, id);
+        if (__builtin_expect(e != NULL, 1)) {
+            atomic_fetch_add_explicit(&e->call_cnt, CJIT_TLS_FLUSH_THRESHOLD,
+                                      memory_order_relaxed);
+            if (acc > 0)
+                atomic_fetch_add_explicit(&e->total_elapsed_ns, acc,
+                                          memory_order_relaxed);
+        }
+    }
+}
+
+uint64_t cjit_get_elapsed_ns(const cjit_engine_t *engine, func_id_t id)
+{
+    if (!engine) return 0;
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (!e) return 0;
+    return atomic_load_explicit(&e->total_elapsed_ns, memory_order_relaxed);
 }
 
 void cjit_request_recompile(cjit_engine_t *engine,
