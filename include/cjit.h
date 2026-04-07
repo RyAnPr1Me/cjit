@@ -110,7 +110,7 @@ extern "C" {
  * for every engine on each thread before switching to a different engine,
  * to avoid cross-engine counter contamination.
  *
- * Must be a power of two ≥ 2.  Default: 32.
+ * Must be a power of two in [2, 255].  Default: 32.
  */
 #define CJIT_TLS_FLUSH_THRESHOLD  32u
 

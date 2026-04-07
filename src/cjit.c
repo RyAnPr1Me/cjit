@@ -11,8 +11,8 @@
  * │     fn = atomic_load(&table[id].func_ptr);  ← single acquire-load      │
  * │     fn(args…);                              ← indirect call             │
  * │     tls_counts[id]++;                       ← thread-local byte incr   │
- * │     if (tls_counts[id] == 0)                ← flush every 256 calls    │
- * │         atomic_fetch_add(&call_cnt, 256);   ← amortised atomic flush   │
+ * │     if (tls_counts[id] >= THRESHOLD)        ← flush every N calls      │
+ * │         atomic_fetch_add(&call_cnt, N);     ← amortised atomic flush   │
  * │                                                                         │
  * │   Per-thread TLS batch counting                                         │
  * │   ──────────────────────────────                                        │
@@ -155,14 +155,9 @@
  * Each calling thread maintains a private uint8_t counter for every
  * registered function.  On every call, only this thread-local byte is
  * incremented (no shared-memory write, no atomic, no cache-line ownership
- * transfer).  When the counter wraps around to zero (after 256 increments),
- * the accumulated count is flushed to the global atomic call_cnt with a
- * single relaxed fetch_add.
- *
- * This gives a > 97 % reduction in shared-memory writes compared with a
- * direct per-call atomic_fetch_add, while introducing at most
- *   N_threads × 255 calls of observation lag in the global counter.
- * The EMA-based monitor absorbs this small lag without loss of accuracy.
+ * transfer).  When the counter reaches CJIT_TLS_FLUSH_THRESHOLD, the
+ * accumulated count is flushed to the global atomic call_cnt with a
+ * single relaxed fetch_add and the local counter is reset to zero.
  *
  * uint8_t × CJIT_MAX_FUNCTIONS = 1 024 bytes of TLS per calling thread.
  * TLS variables are zero-initialised by the C runtime.
@@ -1082,16 +1077,18 @@ void cjit_record_call(cjit_engine_t *engine, func_id_t id)
     if (__builtin_expect(id >= CJIT_MAX_FUNCTIONS, 0)) return;
     /*
      * Increment the thread-local batch counter (a plain byte write —
-     * zero shared-memory traffic).  When it wraps around to 0 after 256
-     * increments, flush the full batch to the global atomic call_cnt.
+     * zero shared-memory traffic).  When it reaches CJIT_TLS_FLUSH_THRESHOLD,
+     * flush the accumulated batch to the global atomic call_cnt and reset.
      *
      * func_table_get() on the flush path is bounded by the same id-valid
      * check above, so the array access is always in bounds.
      */
-    if (__builtin_expect(++cjit_tls_counts[id] == 0u, 0)) {
+    if (__builtin_expect(++cjit_tls_counts[id] >= CJIT_TLS_FLUSH_THRESHOLD, 0)) {
+        cjit_tls_counts[id] = 0;
         func_table_entry_t *e = func_table_get(engine->ftable, id);
         if (__builtin_expect(!!e, 1))
-            atomic_fetch_add_explicit(&e->call_cnt, 256, memory_order_relaxed);
+            atomic_fetch_add_explicit(&e->call_cnt, CJIT_TLS_FLUSH_THRESHOLD,
+                                      memory_order_relaxed);
     }
 }
 
@@ -1104,7 +1101,8 @@ void cjit_record_call(cjit_engine_t *engine, func_id_t id)
  * (on cache line 0, now independent of call_cnt on cache line 1).
  *
  * Atomic ordering:
- *   call_cnt flush : relaxed (approximation; once per 256 calls per thread)
+ *   call_cnt flush : relaxed (approximation; once per CJIT_TLS_FLUSH_THRESHOLD
+ *                   calls per thread)
  *   func_ptr load  : acquire (function body visible before indirect call)
  */
 jit_func_t cjit_get_func_counted(cjit_engine_t *engine, func_id_t id)
@@ -1115,8 +1113,11 @@ jit_func_t cjit_get_func_counted(cjit_engine_t *engine, func_id_t id)
      * id < ftable->count ≤ CJIT_MAX_FUNCTIONS is guaranteed by func_table_get
      * returning non-NULL, so cjit_tls_counts[id] is always in bounds here.
      */
-    if (__builtin_expect(++cjit_tls_counts[id] == 0u, 0))
-        atomic_fetch_add_explicit(&e->call_cnt, 256, memory_order_relaxed);
+    if (__builtin_expect(++cjit_tls_counts[id] >= CJIT_TLS_FLUSH_THRESHOLD, 0)) {
+        cjit_tls_counts[id] = 0;
+        atomic_fetch_add_explicit(&e->call_cnt, CJIT_TLS_FLUSH_THRESHOLD,
+                                  memory_order_relaxed);
+    }
     return atomic_load_explicit(&e->func_ptr, memory_order_acquire);
 }
 
@@ -1125,9 +1126,11 @@ void cjit_flush_local_counts(cjit_engine_t *engine)
     /*
      * Flush any partial batch accumulated since the last automatic flush.
      *
-     * For each registered function, cjit_tls_counts[i] holds calls modulo 256.
-     * Full batches of 256 have already been added to call_cnt atomically by
-     * the uint8_t overflow path.  Only the sub-256 remainder is pending here.
+     * For each registered function, cjit_tls_counts[i] holds the number of
+     * calls accumulated since the last flush (in [0, CJIT_TLS_FLUSH_THRESHOLD)).
+     * Full batches of CJIT_TLS_FLUSH_THRESHOLD have already been added to
+     * call_cnt by the threshold-compare path.  Only the sub-threshold remainder
+     * is pending here.
      *
      * We scan only registered functions (count ≤ CJIT_MAX_FUNCTIONS), so the
      * TLS array access is always in bounds.
