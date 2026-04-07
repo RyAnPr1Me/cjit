@@ -35,21 +35,36 @@ static const char CODEGEN_PREAMBLE[] =
     "#ifndef CJIT_PREAMBLE_H\n"
     "#define CJIT_PREAMBLE_H\n"
     "#ifdef __GNUC__\n"
-    "#  define LIKELY(x)   __builtin_expect(!!(x), 1)\n"
-    "#  define UNLIKELY(x) __builtin_expect(!!(x), 0)\n"
-    "#  define HOT         __attribute__((hot))\n"
-    "#  define COLD        __attribute__((cold))\n"
-    "#  define NOINLINE    __attribute__((noinline))\n"
-    "#  define ALWAYS_INLINE __attribute__((always_inline)) inline\n"
-    "#  define ALIGNED(n)  __attribute__((aligned(n)))\n"
+    "#  define LIKELY(x)                  __builtin_expect(!!(x), 1)\n"
+    "#  define UNLIKELY(x)                __builtin_expect(!!(x), 0)\n"
+    "#  define HOT                        __attribute__((hot))\n"
+    "#  define COLD                       __attribute__((cold))\n"
+    "#  define NOINLINE                   __attribute__((noinline))\n"
+    "#  define ALWAYS_INLINE              __attribute__((always_inline)) inline\n"
+    "#  define ALIGNED(n)                 __attribute__((aligned(n)))\n"
+    /* Pure: reads global state but has no side effects; same args → same result. */
+    "#  define PURE                       __attribute__((pure))\n"
+    /* Const: like PURE but must not read global state – result depends only on args. */
+    "#  define CONST_FUNC                 __attribute__((const))\n"
+    /* Restrict: pointer aliasing hint – tells the compiler this pointer is unique. */
+    "#  define RESTRICT                   __restrict__\n"
+    /* Prefetch: software prefetch hint (rw: 0=read,1=write; locality: 0-3). */
+    "#  define PREFETCH(addr, rw, loc)    __builtin_prefetch((addr), (rw), (loc))\n"
+    /* Assume aligned: lets the compiler omit alignment-fixup code for SIMD. */
+    "#  define ASSUME_ALIGNED(ptr, n)     __builtin_assume_aligned((ptr), (n))\n"
     "#else\n"
-    "#  define LIKELY(x)   (x)\n"
-    "#  define UNLIKELY(x) (x)\n"
+    "#  define LIKELY(x)                  (x)\n"
+    "#  define UNLIKELY(x)                (x)\n"
     "#  define HOT\n"
     "#  define COLD\n"
     "#  define NOINLINE\n"
-    "#  define ALWAYS_INLINE inline\n"
+    "#  define ALWAYS_INLINE              inline\n"
     "#  define ALIGNED(n)\n"
+    "#  define PURE\n"
+    "#  define CONST_FUNC\n"
+    "#  define RESTRICT\n"
+    "#  define PREFETCH(addr, rw, loc)    ((void)(addr))\n"
+    "#  define ASSUME_ALIGNED(ptr, n)     (ptr)\n"
     "#endif\n"
     "#include <stdint.h>\n"
     "#include <string.h>\n"
@@ -91,9 +106,30 @@ static void build_opt_flags(char *buf, size_t bufsz,
     if (level >= OPT_O2)
         n += snprintf(buf + n, bufsz - n, " -fomit-frame-pointer");
 
+    /*
+     * Disable ELF symbol interposition for shared-library symbols.
+     * With -fPIC the compiler is otherwise forced to assume that any
+     * call or global access might be redirected by LD_PRELOAD, which
+     * prevents inlining of non-static functions and devirtualization.
+     * Since each cjit .so is opened with RTLD_LOCAL and contains only
+     * a single translation unit, interposition cannot happen and this
+     * restriction is safe to lift.  The flag is available in GCC ≥ 8
+     * and Clang ≥ 6.
+     */
+    if (level >= OPT_O2)
+        n += snprintf(buf + n, bufsz - n, " -fno-semantic-interposition");
+
     /* march=native only at the most aggressive tier to avoid ABI issues */
     if (opts->enable_native_arch && level >= OPT_O3)
         n += snprintf(buf + n, bufsz - n, " -march=native");
+
+    /*
+     * Fast-math: allows reassociation and approximations that are not
+     * IEEE-754 strictly conformant.  Enabled only when the caller opts in
+     * and only at the most aggressive tier.
+     */
+    if (opts->enable_fast_math && level >= OPT_O3)
+        n += snprintf(buf + n, bufsz - n, " -ffast-math");
 
     /* Always hide non-exported symbols to avoid clash across multiple .so.
      * We do NOT use -fvisibility=hidden here: each .so is dlopened with

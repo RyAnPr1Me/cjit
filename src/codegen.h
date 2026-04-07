@@ -38,20 +38,28 @@
  * ──────────────────────────
  *   OPT_NONE : -O0
  *   OPT_O1   : -O1
- *   OPT_O2   : -O2 -finline-functions
+ *   OPT_O2   : -O2 -finline-functions -fno-semantic-interposition
  *   OPT_O3   : -O3 -finline-functions -funroll-loops -ftree-vectorize
- *              -fomit-frame-pointer -march=native  (if enable_native_arch)
+ *              -fomit-frame-pointer -fno-semantic-interposition
+ *              -march=native        (if enable_native_arch)
+ *              -ffast-math          (if enable_fast_math)
  *
  * Additionally the following hint macros are injected into every translation
  * unit at the top of the source:
  *
- *   #define LIKELY(x)   __builtin_expect(!!(x), 1)
- *   #define UNLIKELY(x) __builtin_expect(!!(x), 0)
- *   #define HOT         __attribute__((hot))
- *   #define NOINLINE    __attribute__((noinline))
+ *   #define LIKELY(x)                __builtin_expect(!!(x), 1)
+ *   #define UNLIKELY(x)              __builtin_expect(!!(x), 0)
+ *   #define HOT                      __attribute__((hot))
+ *   #define NOINLINE                 __attribute__((noinline))
+ *   #define PURE                     __attribute__((pure))
+ *   #define CONST_FUNC               __attribute__((const))
+ *   #define RESTRICT                 __restrict__
+ *   #define PREFETCH(addr,rw,loc)    __builtin_prefetch(addr,rw,loc)
+ *   #define ASSUME_ALIGNED(ptr,n)    __builtin_assume_aligned(ptr,n)
  *
- * This lets user IR code use branch-prediction and inlining hints portably
- * without adding a compile-time dependency on cjit.h.
+ * This lets user IR code use branch-prediction, aliasing, purity, and
+ * inlining hints portably without adding a compile-time dependency on
+ * cjit.h.
  */
 
 #pragma once
@@ -79,6 +87,7 @@ typedef struct {
     bool enable_vectorization; /**< -ftree-vectorize                            */
     bool enable_loop_unroll;   /**< -funroll-loops                              */
     bool enable_native_arch;   /**< -march=native (only at OPT_O3)             */
+    bool enable_fast_math;     /**< -ffast-math   (only at OPT_O3)             */
     bool verbose;              /**< Print compiler command to stderr            */
 } codegen_opts_t;
 
