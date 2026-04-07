@@ -1,55 +1,54 @@
 /**
- * ir_cache.h – Multi-generation LRU cache for JIT function IR strings.
+ * ir_cache.h – Multi-generation LRU cache for JIT function IR strings,
+ *              with system-memory-pressure awareness.
  *
- * Motivation
- * ──────────
- * A JIT engine may register hundreds or thousands of functions.  Keeping every
- * function's IR (C source) in memory at all times causes memory churn,
- * pollutes the allocator, and wastes L3 cache on code that is rarely (or
- * never) compiled.  Only a small subset of functions is "hot" at any moment.
- *
- * Solution: multi-generation LRU with disk spill
- * ───────────────────────────────────────────────
- * IR strings are partitioned into three generations based on how recently
- * they were requested for compilation:
+ * Overview
+ * ────────
+ * IR strings (C source for JIT compilation) are partitioned across three
+ * generations based on recency of access:
  *
  *   HOT  (gen 0) – in memory; at most `hot_capacity` entries.
- *                  These are the most recently compiled functions.
- *
  *   WARM (gen 1) – in memory; at most `warm_capacity` entries.
- *                  Recently compiled but not re-requested since.
+ *   COLD (gen 2) – on disk only; IR freed from heap.
  *
- *   COLD (gen 2) – on disk only; IR string freed from heap.
- *                  Written to `ir_disk_dir/<func_id>_<name>.ir` at
- *                  registration time, so the file is always present.
+ * A permanent copy of every IR string is written to disk at registration time
+ * so that COLD entries can be reloaded on demand without data loss.
  *
- * Generation transitions
- * ──────────────────────
+ * Generation transitions on access (ir_cache_get_ir):
+ *   HOT  → stay HOT, move to MRU position.
+ *   WARM → promote to HOT MRU; cascade LRU-HOT→WARM if needed.
+ *   COLD → load from disk; promote to WARM MRU; cascade LRU-WARM→COLD.
  *
- *  register()     → place in HOT (evict HOT→WARM→COLD if at capacity)
- *  get_ir()       → if HOT : move to MRU position inside HOT list
- *                   if WARM: promote to HOT MRU (may cascade HOT→WARM eviction)
- *                   if COLD: load from disk, promote to WARM MRU
- *                            (may cascade WARM→COLD eviction)
+ * Memory-pressure monitoring
+ * ──────────────────────────
+ * A dedicated background thread reads /proc/meminfo every
+ * `mem_check_interval_ms` milliseconds and computes a pressure level:
  *
- *  HOT eviction   → demote LRU-HOT to WARM MRU (IR stays in memory)
- *  WARM eviction  → demote LRU-WARM to COLD   (IR freed; disk file kept)
+ *   NORMAL   – MemAvailable ≥ mem_low_pct   % of MemTotal
+ *   MEDIUM   – MemAvailable  < mem_low_pct   % (but ≥ mem_high_pct)
+ *   HIGH     – MemAvailable  < mem_high_pct  % (but ≥ mem_critical_pct)
+ *   CRITICAL – MemAvailable  < mem_critical_pct %
  *
- * Memory invariant
- * ────────────────
- *   live heap bytes for IR ≤ (hot_capacity + warm_capacity) × avg_ir_size
+ * When pressure rises the effective capacities are automatically reduced:
+ *   NORMAL   → 100 % of configured hot_capacity / warm_capacity
+ *   MEDIUM   →  75 %
+ *   HIGH     →  50 %
+ *   CRITICAL →  25 % (minimum 1)
  *
- * All other functions' IR lives only on disk (a few KB per function).
+ * Entries that exceed the new effective capacity are evicted proactively in
+ * the background:  HOT→WARM (IR stays in memory) then WARM→COLD (IR freed,
+ * disk copy remains).  Subsequent insertions also respect the effective cap.
+ *
+ * When pressure falls the capacities widen again; the cache refills naturally
+ * as functions are next accessed for compilation.
  *
  * Thread safety
  * ─────────────
- * A single per-cache mutex serialises all LRU list mutations.  The mutex is
- * never held on the runtime hot path (cjit_get_func / cjit_record_call).
- * It is held only when a compiler thread calls ir_cache_get_ir(), which
- * already involves filesystem I/O for cold functions.
- *
- * The per-generation statistics counters are atomic and can be read without
- * holding the lock.
+ * All LRU list mutations are serialised under a single per-cache mutex.
+ * Disk I/O and malloc/free are performed outside the lock.
+ * The pressure level and mem-info counters are atomic; they are readable
+ * from any thread at any time without acquiring the lock.
+ * The hot-path (cjit_get_func / cjit_record_call) never touches this cache.
  */
 
 #pragma once
@@ -58,124 +57,141 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <pthread.h>
-#include "../include/cjit.h"  /* func_id_t */
-
-/* ═══════════════════════════ generation tags ══════════════════════════════ */
-
-#define IR_GEN_HOT  0   /**< In memory, most recently used.          */
-#define IR_GEN_WARM 1   /**< In memory, less recently used.          */
-#define IR_GEN_COLD 2   /**< On disk only; IR freed from heap.       */
-
-typedef uint8_t ir_gen_t;
+#include "../include/cjit.h"   /* func_id_t, mem_pressure_t */
 
 /* ═══════════════════════════ per-function node ════════════════════════════ */
 
 /**
- * One node per registered function.  Nodes live in a flat array indexed by
- * func_id_t; pointers inside the array are stable for the engine lifetime.
+ * One LRU node per registered function.
  *
- * A node is in exactly one of three states at any time:
- *   HOT  → linked in the hot  LRU list; ir_source != NULL
- *   WARM → linked in the warm LRU list; ir_source != NULL
- *   COLD → not in any list;             ir_source == NULL; disk file exists
+ * Stored in a flat array indexed by func_id_t; pointers are stable for the
+ * engine lifetime.  A node is in exactly one state at any time:
+ *   HOT  – linked in hot  list; ir_source != NULL
+ *   WARM – linked in warm list; ir_source != NULL
+ *   COLD – not in any list;     ir_source == NULL; disk file exists
  */
 typedef struct ir_node {
     func_id_t        func_id;
-    char             name[128];       /**< Function name (for disk filename). */
-    char            *ir_source;       /**< Heap copy of IR; NULL when COLD.   */
-    char             disk_path[300];  /**< Absolute path to on-disk IR file.  */
+    char             name[128];       /**< Sanitised function name.           */
+    char            *ir_source;       /**< Heap copy; NULL when COLD.         */
+    char             disk_path[512];  /**< Absolute path to on-disk .ir file. */
 
-    uint64_t         access_cnt;      /**< Times ir_cache_get_ir() was called.*/
-    uint64_t         last_access_ms;  /**< Monotonic timestamp of last access.*/
-    ir_gen_t         gen;             /**< Current generation (HOT/WARM/COLD).*/
+    uint64_t         access_cnt;      /**< Times get_ir() was called.         */
+    uint64_t         last_access_ms;  /**< Monotonic timestamp (ms).          */
+    uint8_t          gen;             /**< IR_GEN_HOT / WARM / COLD           */
     bool             registered;      /**< True after ir_cache_register().    */
 
-    /* Intrusive doubly-linked list links (within a generation's LRU list).
-     * prev → more recently used; next → less recently used.
-     * NULL at both ends when COLD or not yet registered.                    */
-    struct ir_node  *prev;
-    struct ir_node  *next;
+    struct ir_node  *prev;            /**< Toward MRU end of list.            */
+    struct ir_node  *next;            /**< Toward LRU end of list.            */
 } ir_node_t;
 
 /* ═══════════════════════════ cache structure ══════════════════════════════ */
 
 /**
- * The multi-generation LRU IR cache.
+ * Multi-generation LRU IR cache with memory-pressure awareness.
  *
- * One instance is embedded in cjit_engine_t.
+ * One instance is embedded inside cjit_engine_t.
  */
 typedef struct {
-    ir_node_t   *nodes;             /**< Flat array [0..max_funcs).           */
+    ir_node_t   *nodes;              /**< Flat array [0..max_funcs).          */
     uint32_t     max_funcs;
 
-    /* HOT generation doubly-linked LRU list (head = MRU, tail = LRU). */
-    ir_node_t   *hot_head;
-    ir_node_t   *hot_tail;
+    /* HOT generation LRU (head = MRU, tail = LRU). */
+    ir_node_t   *hot_head, *hot_tail;
     uint32_t     hot_count;
-    uint32_t     hot_capacity;      /**< Max entries allowed in HOT gen.     */
+    uint32_t     hot_capacity;       /**< Nominal max (pressure may reduce).  */
 
-    /* WARM generation doubly-linked LRU list. */
-    ir_node_t   *warm_head;
-    ir_node_t   *warm_tail;
+    /* WARM generation LRU. */
+    ir_node_t   *warm_head, *warm_tail;
     uint32_t     warm_count;
-    uint32_t     warm_capacity;     /**< Max entries allowed in WARM gen.    */
+    uint32_t     warm_capacity;      /**< Nominal max.                        */
 
-    uint32_t     cold_count;        /**< Functions on disk only.             */
-    uint32_t     total_registered;  /**< Total functions registered.         */
+    uint32_t     cold_count;         /**< Entries residing on disk only.      */
+    uint32_t     total_registered;
 
-    pthread_mutex_t lock;           /**< Serialises all list mutations.      */
+    pthread_mutex_t lock;            /**< Serialises all list mutations.      */
 
-    char         ir_dir[256];       /**< Base directory for .ir disk files.  */
+    char         ir_dir[256];        /**< Base directory for .ir disk files.  */
 
-    /* Per-operation statistics (lock-free reads without holding lock). */
-    atomic_uint_fast64_t stat_disk_writes;   /**< IR files written to disk.  */
-    atomic_uint_fast64_t stat_disk_reads;    /**< IR files read from disk.   */
-    atomic_uint_fast64_t stat_evictions;     /**< HOT→WARM or WARM→COLD.     */
-    atomic_uint_fast64_t stat_promotions;    /**< COLD→WARM or WARM→HOT.     */
-    atomic_uint_fast64_t stat_cache_hits;    /**< get_ir() served from mem.  */
-    atomic_uint_fast64_t stat_cache_misses;  /**< get_ir() loaded from disk. */
+    /* ── Memory pressure monitoring ─────────────────────────────────────── */
+
+    /** Current system-memory pressure level (atomically updated). */
+    atomic_int   pressure;           /**< mem_pressure_t cast to int.         */
+
+    /** Most-recent MemAvailable reading from /proc/meminfo (kB). */
+    atomic_uint_fast64_t mem_available_kb;
+
+    /** Most-recent MemTotal reading from /proc/meminfo (kB). */
+    atomic_uint_fast64_t mem_total_kb;
+
+    /** How often the pressure thread wakes (ms). */
+    uint32_t     mem_check_interval_ms;
+
+    /** available% below this → MEDIUM pressure. */
+    uint32_t     mem_low_pct;
+
+    /** available% below this → HIGH pressure. */
+    uint32_t     mem_high_pct;
+
+    /** available% below this → CRITICAL pressure. */
+    uint32_t     mem_critical_pct;
+
+    /** Set to true to stop the pressure-monitor thread. */
+    atomic_bool  stop_pressure_flag;
+
+    /** Background pressure-monitor thread handle. */
+    pthread_t    pressure_thread;
+
+    /* ── Statistics (lock-free reads at any time) ────────────────────────── */
+    atomic_uint_fast64_t stat_disk_writes;
+    atomic_uint_fast64_t stat_disk_reads;
+    atomic_uint_fast64_t stat_evictions;        /**< HOT→WARM or WARM→COLD.  */
+    atomic_uint_fast64_t stat_promotions;       /**< COLD→WARM or WARM→HOT.  */
+    atomic_uint_fast64_t stat_cache_hits;       /**< get_ir() from memory.   */
+    atomic_uint_fast64_t stat_cache_misses;     /**< get_ir() loaded disk.   */
+    atomic_uint_fast64_t stat_pressure_evictions; /**< Evictions due to mem. */
 } ir_lru_cache_t;
+
+/* ═══════════════════════════ configuration ════════════════════════════════ */
+
+/**
+ * Parameters for ir_cache_create().  All fields are optional; zero/NULL
+ * values are replaced with defaults.
+ */
+typedef struct {
+    uint32_t    max_funcs;            /**< Must equal engine max_functions.   */
+    uint32_t    hot_cap;              /**< Nominal HOT capacity  (def: 64).   */
+    uint32_t    warm_cap;             /**< Nominal WARM capacity (def: 128).  */
+    const char *ir_dir;              /**< IR dir; NULL → /tmp/cjit_ir_<pid>.  */
+    uint32_t    mem_check_interval_ms;/**< Pressure-check period (def: 500). */
+    uint32_t    mem_low_pct;          /**< % avail → MEDIUM  (def: 20).      */
+    uint32_t    mem_high_pct;         /**< % avail → HIGH    (def: 10).      */
+    uint32_t    mem_critical_pct;     /**< % avail → CRITICAL (def:  5).     */
+} ir_cache_config_t;
 
 /* ═══════════════════════════ public API ═══════════════════════════════════ */
 
 /**
- * Allocate and initialise the cache.
+ * Allocate and initialise the cache.  Starts the pressure-monitor thread
+ * immediately so that a meaningful pressure reading is available before the
+ * first compilation.
  *
- * @param max_funcs    Upper bound on registered functions (= engine capacity).
- * @param hot_cap      Max functions whose IR is kept in HOT generation.
- * @param warm_cap     Max functions whose IR is kept in WARM generation.
- * @param ir_dir       Directory for on-disk IR files (created if absent).
- *                     Pass NULL to use the default "/tmp/cjit_ir_<pid>".
  * @return Pointer to new cache, or NULL on allocation failure.
  */
-ir_lru_cache_t *ir_cache_create(uint32_t    max_funcs,
-                                 uint32_t    hot_cap,
-                                 uint32_t    warm_cap,
-                                 const char *ir_dir);
+ir_lru_cache_t *ir_cache_create(const ir_cache_config_t *cfg);
 
 /**
- * Destroy the cache and release all resources.
- *
- * Frees all heap IR strings.  Does NOT delete the on-disk IR files (they
- * may be useful for post-mortem inspection).  Does NOT dlclose any handles.
+ * Destroy the cache: stop the pressure thread, free all heap IR strings.
+ * Does NOT delete the on-disk .ir files.
  */
 void ir_cache_destroy(ir_lru_cache_t *cache);
 
 /**
- * Register a function's IR with the cache.
+ * Register a function's IR.  Makes a heap copy, writes it to disk as a
+ * permanent backup, and inserts into the HOT generation (evicting LRU
+ * entries as needed to maintain capacity invariants).
  *
- * Makes a heap copy of @p ir_source, writes it to disk as a permanent
- * backup, and inserts the node into the HOT generation (cascading any
- * required evictions to maintain capacity invariants).
- *
- * Must be called from a single registration thread before cjit_start().
- *
- * @param cache      The cache.
- * @param func_id    Stable function ID (0-based index into engine table).
- * @param func_name  Symbol name (used to build the on-disk filename).
- * @param ir_source  C source string to store.
- * @return true on success; false if func_id is out of range or disk write
- *         failed.
+ * Must be called from a single thread before cjit_start().
  */
 bool ir_cache_register(ir_lru_cache_t *cache,
                         func_id_t       func_id,
@@ -183,32 +199,27 @@ bool ir_cache_register(ir_lru_cache_t *cache,
                         const char     *ir_source);
 
 /**
- * Return a heap-allocated copy of the IR for @p func_id.
+ * Return a heap-allocated copy of the IR for func_id (caller must free()).
  *
- * The caller MUST free() the returned string after use.
- *
- * Side effects (performed under the cache lock):
- *   • HOT  entry → moved to MRU position in HOT list.
- *   • WARM entry → promoted to HOT MRU; LRU-HOT demoted to WARM if needed.
- *   • COLD entry → IR loaded from disk; promoted to WARM MRU;
- *                  LRU-WARM demoted to COLD if needed.
- *
- * @return Heap-allocated IR string, or NULL on error (unregistered func_id,
- *         disk read failure, allocation failure).
+ * Promotes the entry toward HOT; loads from disk if COLD.
+ * Returns NULL on error.
  */
 char *ir_cache_get_ir(ir_lru_cache_t *cache, func_id_t func_id);
 
 /**
- * Return the current generation of a function's IR entry.
- *
- * Returns IR_GEN_COLD for any unregistered func_id.
- * Does NOT acquire the lock; the result may be stale by one transition.
+ * Return the current generation of a function's IR (lock-free, may be stale
+ * by one transition).
  */
-ir_gen_t ir_cache_get_generation(const ir_lru_cache_t *cache, func_id_t func_id);
+uint8_t ir_cache_get_generation(const ir_lru_cache_t *cache, func_id_t func_id);
 
 /**
- * Snapshot of IR cache statistics.
+ * Return the current memory-pressure level (lock-free atomic read).
  */
+mem_pressure_t ir_cache_get_pressure(const ir_lru_cache_t *cache);
+
+/* ═══════════════════════════ statistics ═══════════════════════════════════ */
+
+/** Snapshot of IR-cache + memory-pressure statistics. */
 typedef struct {
     uint32_t hot_count;
     uint32_t warm_count;
@@ -220,9 +231,13 @@ typedef struct {
     uint64_t promotions;
     uint64_t cache_hits;
     uint64_t cache_misses;
+    uint64_t pressure_evictions;
+    mem_pressure_t pressure;          /**< Current pressure level.            */
+    uint64_t mem_available_mb;        /**< Last observed MemAvailable (MB).   */
+    uint64_t mem_total_mb;            /**< Last observed MemTotal (MB).       */
 } ir_cache_stats_t;
 
-/** Read a lock-free snapshot of cache statistics. */
+/** Read a lock-free snapshot of all cache statistics. */
 ir_cache_stats_t ir_cache_get_stats(const ir_lru_cache_t *cache);
 
 /** Print a formatted statistics block to stderr. */

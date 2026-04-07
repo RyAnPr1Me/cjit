@@ -95,8 +95,10 @@ static void build_opt_flags(char *buf, size_t bufsz,
     if (opts->enable_native_arch && level >= OPT_O3)
         n += snprintf(buf + n, bufsz - n, " -march=native");
 
-    /* Always hide non-exported symbols to avoid clash across multiple .so */
-    n += snprintf(buf + n, bufsz - n, " -fvisibility=hidden");
+    /* Always hide non-exported symbols to avoid clash across multiple .so.
+     * We do NOT use -fvisibility=hidden here: each .so is dlopened with
+     * RTLD_LOCAL and contains exactly one function; there is no collision
+     * risk, and hiding symbols would make dlsym() fail to find the entry. */
 
     /* Suppress warnings – we may be compiling user snippets */
     n += snprintf(buf + n, bufsz - n, " -w");

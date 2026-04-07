@@ -1,54 +1,36 @@
 /**
- * demo.c – End-to-end demonstration of the CJIT non-blocking JIT engine.
+ * demo.c – End-to-end demonstration of the CJIT non-blocking JIT engine,
+ *           multi-generation LRU IR cache, and memory-pressure awareness.
  *
  * What this demo shows
  * ────────────────────
  *  1. ENGINE SETUP
- *     • Create a JIT engine with verbose mode enabled.
- *     • Register three functions with C-source IR.
+ *     • Create a JIT engine with a tiny HOT/WARM cache (5/10 slots) so that
+ *       LRU eviction and disk spill are visible even with few functions.
  *
- *  2. AOT FALLBACK
- *     • Before cjit_start() is called, the engine still works: calls are
- *       dispatched through the AOT-compiled fallback function pointers.
+ *  2. LRU CACHE UNDER PRESSURE
+ *     • Register 20 functions.  With hot_ir_cache_size=5 and
+ *       warm_ir_cache_size=10, the remaining 5 functions are immediately
+ *       spilled to disk (COLD generation) at registration time.
  *
- *  3. HOT-FUNCTION DETECTION AND RECOMPILATION
- *     • Start the engine (compiler + monitor threads).
- *     • Run a tight dispatch loop that calls each function many times.
- *     • The monitor thread detects when call counts cross the hot thresholds
- *       and enqueues compilation tasks at OPT_O2 then OPT_O3.
- *     • Compiler threads compile each function and atomically swap the
- *       function pointer in the table.
- *     • The dispatch loop observes the upgrade transparently – no pause,
- *       no lock, no barrier beyond the single atomic load already present.
+ *  3. COLD LOAD ON COMPILATION
+ *     • When a COLD function is compiled for the first time, the compiler
+ *       thread calls ir_cache_get_ir(), which loads its IR from disk and
+ *       promotes it to WARM.  A [ir_cache/pressure] log line shows any
+ *       live memory-pressure level.
  *
- *  4. MANUAL RECOMPILE REQUEST
- *     • cjit_request_recompile() is called explicitly to trigger a
- *       pre-warm compilation before the function is naturally hot.
+ *  4. HOT-FUNCTION DETECTION AND RECOMPILATION
+ *     • Start the engine (compiler + monitor + GC + pressure threads).
+ *     • Run a tight dispatch loop; the monitor promotes hot functions to
+ *       OPT_O2 then OPT_O3 via atomic pointer swaps.
  *
- *  5. INCREMENTAL RECOMPILATION
- *     • add_numbers starts at OPT_NONE (AOT fallback), gets promoted to
- *       OPT_O2, then OPT_O3 as the call count grows.
+ *  5. CORRECTNESS CHECK
+ *     • Verify all 3 "real" functions produce correct results after JIT.
  *
- *  6. ATOMIC DISPATCH MACRO
- *     • CJIT_DISPATCH shows the minimal-overhead call pattern.
- *
- *  7. DEFERRED GC
- *     • After recompilation the old shared-object handle is retired with a
- *       100 ms grace period.  No runtime thread is blocked.
- *
- *  8. STATISTICS
- *     • cjit_print_stats() summarises all JIT activity.
- *
- * Build
- * ─────
- *   cmake -B build && cmake --build build
- *   ./build/demo
- *
- * Or directly:
- *   cc -std=c11 -O2 -I../include \
- *      ../src/work_queue.c ../src/deferred_gc.c \
- *      ../src/func_table.c ../src/codegen.c ../src/cjit.c \
- *      demo.c -lpthread -ldl -o demo && ./demo
+ *  6. STATISTICS
+ *     • Print the full stats table showing IR HOT/WARM/COLD counts, disk
+ *       reads/writes, LRU evictions, pressure-driven evictions, and the
+ *       current memory pressure level read from /proc/meminfo.
  */
 
 #ifndef _GNU_SOURCE
@@ -64,141 +46,90 @@
 #include "../include/cjit.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * AOT-compiled fallback functions
- *
- * These are normal C functions compiled into the demo binary.  They are
- * used as the initial function pointer before JIT compilation finishes.
+ * AOT fallbacks
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/**
- * AOT fallback: add two integers.
- *
- * The JIT-compiled version will be identical in result but generated at
- * runtime with higher optimisation flags and can include additional
- * specialisations.
- */
-static int add_numbers_aot(int a, int b)
-{
-    return a + b;
-}
-
-/**
- * AOT fallback: sum elements of an array.
- */
+static int  add_numbers_aot(int a, int b)            { return a + b; }
 static long sum_array_aot(const int *arr, int n)
 {
     long s = 0;
     for (int i = 0; i < n; ++i) s += arr[i];
     return s;
 }
-
-/**
- * AOT fallback: naive Fibonacci (intentionally slow to show JIT benefit).
- */
 static long fib_aot(int n)
 {
     if (n <= 1) return n;
     return fib_aot(n - 1) + fib_aot(n - 2);
 }
+/* Generic "cold" fallback for padding functions */
+static int cold_fn_aot(int x) { return x * 2; }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * IR (C-source) for each function
- *
- * The JIT engine compiles these strings at runtime.  They use the LIKELY /
- * UNLIKELY / HOT macros injected by the codegen preamble.
- *
- * Key IR features demonstrated:
- *   • Branch-prediction hints via LIKELY / UNLIKELY
- *   • HOT attribute to guide the compiler
- *   • Loop with auto-vectorization hint
- *   • Constant propagation opportunity (the compiler will fold the 2*x term)
- *   • Recursive Fibonacci with memoization for incremental improvement
+ * IR strings for the 3 primary functions
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static const char ADD_NUMBERS_IR[] =
-    "/*\n"
-    " * add_numbers – JIT version.\n"
-    " * Branch-prediction hint: most calls will not overflow.\n"
-    " * The compiler can inline this and constant-fold at the call site.\n"
-    " */\n"
     "HOT int add_numbers(int a, int b) {\n"
-    "    /* Constant folding: if a==0 the compiler eliminates this branch. */\n"
     "    if (UNLIKELY(a == 0)) return b;\n"
     "    if (UNLIKELY(b == 0)) return a;\n"
     "    return a + b;\n"
     "}\n";
 
 static const char SUM_ARRAY_IR[] =
-    "/*\n"
-    " * sum_array – JIT version.\n"
-    " * The ALIGNED attribute on the pointer lets the auto-vectorizer use\n"
-    " * 256-bit AVX2 loads at OPT_O3 with -march=native.\n"
-    " * LIKELY tells the branch predictor the array is non-empty.\n"
-    " */\n"
     "HOT long sum_array(const int * restrict arr, int n) {\n"
     "    long s = 0;\n"
     "    if (UNLIKELY(n <= 0)) return 0;\n"
-    "    /* Auto-vectorization loop: stride-1 access pattern is ideal. */\n"
-    "    for (int i = 0; i < n; ++i) {\n"
-    "        s += arr[i];\n"
-    "    }\n"
+    "    for (int i = 0; i < n; ++i) s += arr[i];\n"
     "    return s;\n"
     "}\n";
 
 static const char FIB_IR[] =
-    "/*\n"
-    " * fib – JIT version with iterative implementation.\n"
-    " * Unlike the AOT recursive version, this is O(n) and benefits from\n"
-    " * incremental recompilation: at OPT_O3 the compiler may fully unroll\n"
-    " * small-n cases with -funroll-loops.\n"
-    " */\n"
     "HOT long fib(int n) {\n"
     "    if (UNLIKELY(n <= 1)) return n;\n"
     "    long a = 0, b = 1;\n"
     "    for (int i = 2; i <= n; ++i) {\n"
-    "        long tmp = a + b;\n"
-    "        a = b;\n"
-    "        b = tmp;\n"
+    "        long tmp = a + b; a = b; b = tmp;\n"
     "    }\n"
     "    return b;\n"
     "}\n";
 
+/* Template IR for the 17 padding ("cold") functions. */
+static char cold_ir_buf[17][256];
+
+static void build_cold_ir(void)
+{
+    for (int i = 0; i < 17; ++i) {
+        snprintf(cold_ir_buf[i], sizeof(cold_ir_buf[i]),
+                 "HOT int cold_fn_%02d(int x) {\n"
+                 "    return x * %d;\n"
+                 "}\n", i, i + 2);
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
- * Typed dispatch helpers
- *
- * cjit_get_func() returns jit_func_t (void(*)(void)), a uniform type used
- * by the atomic table.  Callers cast to the concrete prototype they expect.
- *
- * CJIT_DISPATCH does this cast + record_call in one macro expansion.
+ * Call helpers
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-typedef int  (*add_fn_t )(int, int);
-typedef long (*sum_fn_t )(const int *, int);
-typedef long (*fib_fn_t )(int);
+typedef int  (*add_fn_t)(int, int);
+typedef long (*sum_fn_t)(const int *, int);
+typedef long (*fib_fn_t)(int);
 
-/* Shorthand inline wrappers so the main loop is readable. */
-static inline int call_add(cjit_engine_t *e, func_id_t id, int a, int b)
+static inline int  call_add(cjit_engine_t *e, func_id_t id, int a, int b)
 {
     cjit_record_call(e, id);
     return ((add_fn_t)cjit_get_func(e, id))(a, b);
 }
-
-static inline long call_sum(cjit_engine_t *e, func_id_t id,
-                             const int *arr, int n)
+static inline long call_sum(cjit_engine_t *e, func_id_t id, const int *arr, int n)
 {
     cjit_record_call(e, id);
     return ((sum_fn_t)cjit_get_func(e, id))(arr, n);
 }
-
 static inline long call_fib(cjit_engine_t *e, func_id_t id, int n)
 {
     cjit_record_call(e, id);
     return ((fib_fn_t)cjit_get_func(e, id))(n);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Utility: monotonic time in ms
- * ═══════════════════════════════════════════════════════════════════════════ */
 static uint64_t now_ms(void)
 {
     struct timespec ts;
@@ -211,160 +142,171 @@ static uint64_t now_ms(void)
  * ═══════════════════════════════════════════════════════════════════════════ */
 int main(void)
 {
-    printf("════════════════════════════════════════════════════\n");
-    printf("   CJIT – Non-blocking JIT Compiler Demo\n");
-    printf("════════════════════════════════════════════════════\n\n");
+    build_cold_ir();
 
-    /* ── 1. Configure and create the engine ─────────────────────────── */
-    cjit_config_t cfg       = cjit_default_config();
-    cfg.verbose             = true;      /* Print compilation events      */
-    cfg.monitor_interval_ms = 100;       /* Check hot functions every 100 ms */
-    cfg.hot_threshold_t1    = 200;       /* T1 after 200 calls            */
-    cfg.hot_threshold_t2    = 1000;      /* T2 after 1000 calls           */
-    cfg.grace_period_ms     = 200;       /* Keep old code 200 ms          */
+    printf("═══════════════════════════════════════════════════════\n");
+    printf("  CJIT Demo: Multi-Gen LRU + Memory-Pressure Awareness\n");
+    printf("═══════════════════════════════════════════════════════\n\n");
+
+    /* ── 1. Configure the engine ──────────────────────────────────────── */
+    cjit_config_t cfg          = cjit_default_config();
+    cfg.verbose                = true;
+    cfg.monitor_interval_ms    = 100;
+    cfg.hot_threshold_t1       = 200;
+    cfg.hot_threshold_t2       = 800;
+    cfg.grace_period_ms        = 200;
+
+    /*
+     * Deliberately small LRU capacities so we can observe evictions with
+     * only 20 registered functions:
+     *   HOT  = 5 slots  → functions 6-20 start in WARM or COLD
+     *   WARM = 10 slots → functions 16-20 are immediately COLD (disk-only)
+     *
+     * In a real deployment these would be O(thousands).
+     */
+    cfg.hot_ir_cache_size      = 5;
+    cfg.warm_ir_cache_size     = 10;
+
+    /* Memory-pressure thresholds (real /proc/meminfo values on Linux).
+     * Low thresholds so we can observe the pressure level even in CI. */
+    cfg.mem_pressure_check_ms     = 200;
+    cfg.mem_pressure_low_pct      = 50;  /* MEDIUM when < 50% available */
+    cfg.mem_pressure_high_pct     = 20;  /* HIGH   when < 20% available */
+    cfg.mem_pressure_critical_pct = 10;  /* CRITICAL when < 10% available */
 
     cjit_engine_t *engine = cjit_create(&cfg);
-    if (!engine) {
-        fprintf(stderr, "cjit_create failed\n");
-        return 1;
-    }
-    printf("[demo] Engine created.\n\n");
+    if (!engine) { fprintf(stderr, "cjit_create failed\n"); return 1; }
+    printf("[demo] Engine created.\n"
+           "[demo]   HOT capacity  = %u\n"
+           "[demo]   WARM capacity = %u\n\n",
+           cfg.hot_ir_cache_size, cfg.warm_ir_cache_size);
 
-    /* ── 2. Register functions with their IR ────────────────────────── */
+    /* ── 2. Register 3 real + 17 cold padding functions ──────────────── */
     func_id_t id_add = cjit_register_function(
-        engine, "add_numbers", ADD_NUMBERS_IR,
-        (jit_func_t)add_numbers_aot);
-
+        engine, "add_numbers", ADD_NUMBERS_IR, (jit_func_t)add_numbers_aot);
     func_id_t id_sum = cjit_register_function(
-        engine, "sum_array", SUM_ARRAY_IR,
-        (jit_func_t)sum_array_aot);
-
+        engine, "sum_array",   SUM_ARRAY_IR,   (jit_func_t)sum_array_aot);
     func_id_t id_fib = cjit_register_function(
-        engine, "fib", FIB_IR,
-        (jit_func_t)fib_aot);
+        engine, "fib",         FIB_IR,         (jit_func_t)fib_aot);
 
-    printf("[demo] Registered functions: add_numbers(%u), "
-           "sum_array(%u), fib(%u)\n\n",
-           id_add, id_sum, id_fib);
+    char cold_name[32];
+    for (int i = 0; i < 17; ++i) {
+        snprintf(cold_name, sizeof(cold_name), "cold_fn_%02d", i);
+        cjit_register_function(engine, cold_name,
+                               cold_ir_buf[i], (jit_func_t)cold_fn_aot);
+    }
 
-    /* ── 3. Verify AOT fallback works before any JIT compilation ────── */
-    printf("[demo] === AOT fallback phase (before cjit_start) ===\n");
+    printf("[demo] Registered 20 functions.\n");
+
+    /* Snapshot the IR cache state after registration. */
+    {
+        cjit_stats_t s = cjit_get_stats(engine);
+        printf("[demo] IR cache after registration:\n"
+               "[demo]   HOT=%u  WARM=%u  COLD=%u (on-disk)\n\n",
+               s.ir_hot_count, s.ir_warm_count, s.ir_cold_count);
+
+        if (s.ir_cold_count == 0) {
+            printf("[demo] NOTE: all functions fit in memory; increase the\n"
+                   "[demo]       number of registrations to observe eviction.\n\n");
+        }
+    }
+
+    /* ── 3. AOT correctness before JIT ───────────────────────────────── */
+    printf("[demo] === AOT fallback phase ===\n");
     int  r1 = call_add(engine, id_add, 3, 4);
     long r2 = call_fib(engine, id_fib, 10);
-    printf("[demo] add_numbers(3,4)  = %d  (expected 7)\n",  r1);
-    printf("[demo] fib(10)           = %ld (expected 55)\n", r2);
+    printf("[demo]   add_numbers(3,4)=%d (expect 7)   fib(10)=%ld (expect 55)\n",
+           r1, r2);
     if (r1 != 7 || r2 != 55) {
-        fprintf(stderr, "[demo] FATAL: AOT fallback returned wrong result!\n");
-        cjit_destroy(engine);
-        return 1;
+        fprintf(stderr, "[demo] FATAL: AOT fallback wrong!\n");
+        cjit_destroy(engine); return 1;
     }
     printf("[demo] AOT fallback: OK\n\n");
 
-    /* ── 4. Pre-warm: request immediate compilation of fib at O1 ─────── */
-    printf("[demo] Pre-warming 'fib' at OPT_O1 before hot loop...\n");
-
-    /* ── 5. Start engine (compiler + monitor + GC threads) ──────────── */
+    /* ── 4. Start engine ──────────────────────────────────────────────── */
     cjit_start(engine);
-    printf("[demo] Engine started (%d compiler threads, 1 monitor thread).\n\n",
-           cfg.compiler_threads);
+    printf("[demo] Engine started (%d compiler threads + 1 monitor + "
+           "1 pressure thread).\n\n", cfg.compiler_threads);
 
-    /* Issue the pre-warm request AFTER start so compiler threads are live. */
+    /* Pre-warm fib at O1. */
     cjit_request_recompile(engine, id_fib, OPT_O1);
 
-    /* ── 6. Hot dispatch loop ────────────────────────────────────────── */
+    /* ── 5. Hot dispatch loop ─────────────────────────────────────────── */
     printf("[demo] === Hot dispatch loop ===\n");
-    printf("[demo] Calling functions in a tight loop; watch the JIT upgrade...\n\n");
 
-    /* Prepare a test array for sum_array. */
-    enum { ARR_LEN = 1024 };
+    enum { ARR_LEN = 512 };
     int arr[ARR_LEN];
     for (int i = 0; i < ARR_LEN; ++i) arr[i] = i;
-    long expected_sum = (long)ARR_LEN * (ARR_LEN - 1) / 2;
+    const long expected_sum = (long)ARR_LEN * (ARR_LEN - 1) / 2;
 
-    uint64_t t0 = now_ms();
-    long     last_print_ms = 0;
-    int      last_fib_arg  = 0;
-    volatile long sink = 0; /* prevent optimiser from eliding the calls */
+    uint64_t t0           = now_ms();
+    long     last_print   = 0;
+    volatile long sink    = 0;
 
     for (int iter = 0; iter < 3000; ++iter) {
-
-        /* add_numbers: simple integer addition */
         sink += call_add(engine, id_add, iter, iter + 1);
-
-        /* sum_array: memory-bandwidth bound, vectorizable */
         sink += call_sum(engine, id_sum, arr, ARR_LEN);
+        sink += call_fib(engine, id_fib, 20 + (iter % 8));
 
-        /* fib: CPU-bound, benefits from iterative JIT version */
-        int fib_n = 20 + (iter % 10);
-        sink += call_fib(engine, id_fib, fib_n);
-        last_fib_arg = fib_n;
-
-        /* Print progress and current opt level every ~500 ms */
         long elapsed = (long)(now_ms() - t0);
-        if (elapsed - last_print_ms >= 500) {
-            last_print_ms = elapsed;
-            printf("[demo] iter=%4d  elapsed=%4ld ms  "
-                   "add@O%d  sum@O%d  fib@O%d  "
-                   "call_cnt(add)=%llu\n",
+        if (elapsed - last_print >= 500) {
+            last_print = elapsed;
+            cjit_stats_t s = cjit_get_stats(engine);
+            static const char *const pnames[] =
+                { "NORMAL", "MEDIUM", "HIGH", "CRITICAL" };
+            printf("[demo] iter=%4d  %4ld ms  "
+                   "add@O%d sum@O%d fib@O%d  "
+                   "IR(H=%u W=%u C=%u)  mem=%s(%lluMB/%lluMB)\n",
                    iter, elapsed,
                    (int)cjit_get_current_opt_level(engine, id_add),
                    (int)cjit_get_current_opt_level(engine, id_sum),
                    (int)cjit_get_current_opt_level(engine, id_fib),
-                   (unsigned long long)cjit_get_call_count(engine, id_add));
+                   s.ir_hot_count, s.ir_warm_count, s.ir_cold_count,
+                   pnames[s.mem_pressure],
+                   (unsigned long long)s.mem_available_mb,
+                   (unsigned long long)s.mem_total_mb);
         }
 
-        /* Short sleep every 100 iterations so threads can do work. */
         if (iter % 100 == 99) {
-            struct timespec ms5 = { .tv_sec = 0, .tv_nsec = 5000000L };
+            struct timespec ms5 = { .tv_nsec = 5000000L };
             nanosleep(&ms5, NULL);
         }
     }
 
-    uint64_t t1 = now_ms();
-    printf("\n[demo] Hot loop completed in %llu ms (sink=%ld to prevent DCE).\n\n",
-           (unsigned long long)(t1 - t0), sink);
+    printf("\n[demo] Hot loop done in %llu ms (sink=%ld).\n\n",
+           (unsigned long long)(now_ms() - t0), sink);
 
-    /* ── 7. Correctness check after JIT compilation ──────────────────── */
-    printf("[demo] === Correctness checks after JIT compilation ===\n");
+    /* ── 6. Wait for in-flight compilations to settle ────────────────── */
+    struct timespec wait = { .tv_nsec = 600000000L };
+    nanosleep(&wait, NULL);
 
-    /* Give compiler threads a moment to finish any in-flight compilations. */
-    struct timespec wait500 = { .tv_sec = 0, .tv_nsec = 500000000L };
-    nanosleep(&wait500, NULL);
-
+    /* ── 7. Correctness after JIT ────────────────────────────────────── */
+    printf("[demo] === Post-JIT correctness ===\n");
     int  jit_add = call_add(engine, id_add, 100, 200);
     long jit_sum = call_sum(engine, id_sum, arr, ARR_LEN);
-    long jit_fib = call_fib(engine, id_fib, last_fib_arg);
-    long aot_fib = fib_aot(last_fib_arg);
+    long jit_fib = call_fib(engine, id_fib, 25);
+    long aot_fib = fib_aot(25);
 
-    printf("[demo] add_numbers(100,200)         = %d   (expected 300)\n",
-           jit_add);
-    printf("[demo] sum_array(arr, %d)         = %ld (expected %ld)\n",
+    printf("[demo]   add_numbers(100,200)   = %d  (expect 300)\n",   jit_add);
+    printf("[demo]   sum_array(%d)         = %ld (expect %ld)\n",
            ARR_LEN, jit_sum, expected_sum);
-    printf("[demo] fib(%d)                      = %ld  (expected %ld)\n",
-           last_fib_arg, jit_fib, aot_fib);
+    printf("[demo]   fib(25)               = %ld (expect %ld)\n",    jit_fib, aot_fib);
 
-    int ok = (jit_add == 300) &&
-             (jit_sum == expected_sum) &&
-             (jit_fib == aot_fib);
+    int ok = (jit_add == 300) && (jit_sum == expected_sum) && (jit_fib == aot_fib);
     printf("[demo] Correctness: %s\n\n", ok ? "PASS ✓" : "FAIL ✗");
 
-    /* ── 8. Final optimisation levels ───────────────────────────────── */
-    printf("[demo] Final optimisation levels:\n");
-    printf("[demo]   add_numbers : O%d\n",
-           (int)cjit_get_current_opt_level(engine, id_add));
-    printf("[demo]   sum_array   : O%d\n",
-           (int)cjit_get_current_opt_level(engine, id_sum));
-    printf("[demo]   fib         : O%d\n\n",
+    /* ── 8. Final opt levels ──────────────────────────────────────────── */
+    printf("[demo] Final opt levels: add@O%d  sum@O%d  fib@O%d\n\n",
+           (int)cjit_get_current_opt_level(engine, id_add),
+           (int)cjit_get_current_opt_level(engine, id_sum),
            (int)cjit_get_current_opt_level(engine, id_fib));
 
-    /* ── 9. Statistics ──────────────────────────────────────────────── */
+    /* ── 9. Full statistics ───────────────────────────────────────────── */
     cjit_print_stats(engine);
 
     /* ── 10. Shutdown ────────────────────────────────────────────────── */
-    printf("\n[demo] Stopping engine (joining threads, flushing GC)...\n");
+    printf("\n[demo] Shutting down...\n");
     cjit_destroy(engine);
-    printf("[demo] Engine destroyed cleanly.\n");
     printf("[demo] Done.\n");
-
     return ok ? 0 : 1;
 }

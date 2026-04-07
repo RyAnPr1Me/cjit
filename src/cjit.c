@@ -98,6 +98,7 @@
 #include "deferred_gc.h"
 #include "func_table.h"
 #include "codegen.h"
+#include "ir_cache.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -116,6 +117,9 @@ struct cjit_engine {
 
     /* Function table: the heart of the engine. */
     func_table_t   *ftable;
+
+    /* IR LRU cache with memory-pressure awareness. */
+    ir_lru_cache_t *ir_cache;
 
     /* Single compile work-queue shared by all compiler threads. */
     mpmc_queue_t    work_queue;
@@ -242,9 +246,32 @@ static void *compiler_thread_fn(void *arg)
                     atomic_load_explicit(&entry->call_cnt, memory_order_relaxed));
         }
 
+        /*
+         * Fetch IR from the LRU cache.
+         * ir_cache_get_ir() promotes the entry toward HOT, loading from disk
+         * if the function was cold.  Returns a malloc'd copy we must free.
+         * Falls back to entry->ir_source if the cache returns NULL (e.g. the
+         * cache was not initialised or the function was registered without it).
+         */
+        const char *ir_to_use = NULL;
+        char       *ir_cache_copy = NULL;
+        if (engine->ir_cache) {
+            ir_cache_copy = ir_cache_get_ir(engine->ir_cache, task.func_id);
+            ir_to_use     = ir_cache_copy;
+        }
+        if (!ir_to_use)
+            ir_to_use = entry->ir_source;  /* fallback: original pointer */
+        if (!ir_to_use) {
+            fprintf(stderr, "[cjit/compiler] no IR for '%s'\n", entry->name);
+            pthread_mutex_unlock(&entry->compile_lock);
+            free(ir_cache_copy);
+            continue;
+        }
+
         codegen_result_t cres;
-        bool ok = codegen_compile(entry->name, entry->ir_source,
+        bool ok = codegen_compile(entry->name, ir_to_use,
                                    task.target_level, &copts, &cres);
+        free(ir_cache_copy);  /* safe to free; codegen already read it */
 
         if (!ok) {
             atomic_fetch_add_explicit(&engine->stat_failed, 1,
@@ -402,13 +429,22 @@ cjit_config_t cjit_default_config(void)
     cfg.hot_threshold_t1     = CJIT_HOT_THRESHOLD_T1;
     cfg.hot_threshold_t2     = CJIT_HOT_THRESHOLD_T2;
     cfg.grace_period_ms      = CJIT_GRACE_PERIOD_MS;
-    cfg.monitor_interval_ms  = 50;   /* Check for hot functions every 50 ms */
+    cfg.monitor_interval_ms  = 50;
     cfg.enable_inlining      = true;
     cfg.enable_vectorization = true;
     cfg.enable_loop_unroll   = true;
     cfg.enable_const_fold    = true;
     cfg.enable_native_arch   = true;
     cfg.verbose              = false;
+    /* IR LRU cache */
+    cfg.hot_ir_cache_size         = 64;
+    cfg.warm_ir_cache_size        = 128;
+    /* ir_disk_dir: empty → auto (/tmp/cjit_ir_<pid>) */
+    /* Memory pressure */
+    cfg.mem_pressure_check_ms     = 500;
+    cfg.mem_pressure_low_pct      = 20;
+    cfg.mem_pressure_high_pct     = 10;
+    cfg.mem_pressure_critical_pct = 5;
     return cfg;
 }
 
@@ -427,6 +463,24 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
 
     e->ftable = func_table_create(e->cfg.max_functions);
     if (!e->ftable) { free(e); return NULL; }
+
+    /* Create the IR LRU cache with memory-pressure awareness. */
+    ir_cache_config_t icc = {
+        .max_funcs             = e->cfg.max_functions,
+        .hot_cap               = e->cfg.hot_ir_cache_size,
+        .warm_cap              = e->cfg.warm_ir_cache_size,
+        .ir_dir                = e->cfg.ir_disk_dir[0] ? e->cfg.ir_disk_dir : NULL,
+        .mem_check_interval_ms = e->cfg.mem_pressure_check_ms,
+        .mem_low_pct           = e->cfg.mem_pressure_low_pct,
+        .mem_high_pct          = e->cfg.mem_pressure_high_pct,
+        .mem_critical_pct      = e->cfg.mem_pressure_critical_pct,
+    };
+    e->ir_cache = ir_cache_create(&icc);
+    if (!e->ir_cache) {
+        func_table_destroy(e->ftable);
+        free(e);
+        return NULL;
+    }
 
     mpmc_init(&e->work_queue);
     dgc_init(&e->dgc, e->cfg.grace_period_ms);
@@ -499,6 +553,7 @@ void cjit_destroy(cjit_engine_t *engine)
     }
 
     func_table_destroy(engine->ftable);
+    ir_cache_destroy(engine->ir_cache);
     free(engine);
 }
 
@@ -508,7 +563,16 @@ func_id_t cjit_register_function(cjit_engine_t *engine,
                                   jit_func_t     aot_fallback)
 {
     if (!engine || !name || !ir_source) return CJIT_INVALID_FUNC_ID;
-    return func_table_register(engine->ftable, name, ir_source, aot_fallback);
+
+    func_id_t id = func_table_register(engine->ftable, name, ir_source,
+                                        aot_fallback);
+    if (id == CJIT_INVALID_FUNC_ID) return id;
+
+    /* Register with the IR LRU cache (makes a copy, writes to disk). */
+    if (engine->ir_cache)
+        ir_cache_register(engine->ir_cache, id, name, ir_source);
+
+    return id;
 }
 
 /*
@@ -586,31 +650,76 @@ cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
     s.freed_handles        = atomic_load_explicit(&engine->dgc.total_freed,
                                                    memory_order_relaxed);
     s.queue_depth          = mpmc_size(&engine->work_queue);
+
+    if (engine->ir_cache) {
+        ir_cache_stats_t cs = ir_cache_get_stats(engine->ir_cache);
+        s.ir_hot_count          = cs.hot_count;
+        s.ir_warm_count         = cs.warm_count;
+        s.ir_cold_count         = cs.cold_count;
+        s.ir_disk_writes        = cs.disk_writes;
+        s.ir_disk_reads         = cs.disk_reads;
+        s.ir_evictions          = cs.evictions;
+        s.ir_promotions         = cs.promotions;
+        s.ir_cache_hits         = cs.cache_hits;
+        s.ir_cache_misses       = cs.cache_misses;
+        s.ir_pressure_evictions = cs.pressure_evictions;
+        s.mem_pressure          = cs.pressure;
+        s.mem_available_mb      = cs.mem_available_mb;
+        s.mem_total_mb          = cs.mem_total_mb;
+    }
     return s;
 }
 
 void cjit_print_stats(const cjit_engine_t *engine)
 {
     cjit_stats_t s = cjit_get_stats(engine);
+    static const char *const pnames[] =
+        { "NORMAL", "MEDIUM", "HIGH", "CRITICAL" };
     fprintf(stderr,
-            "╔══════════════════════════════════════╗\n"
-            "║          CJIT Engine Statistics       ║\n"
-            "╠══════════════════════════════════════╣\n"
-            "║  Registered functions  : %6u        ║\n"
-            "║  Total compilations    : %6llu        ║\n"
-            "║  Failed compilations   : %6llu        ║\n"
-            "║  Atomic pointer swaps  : %6llu        ║\n"
-            "║  Handles retired (GC)  : %6llu        ║\n"
-            "║  Handles freed   (GC)  : %6llu        ║\n"
-            "║  Work-queue depth now  : %6u        ║\n"
-            "╚══════════════════════════════════════╝\n",
+            "╔══════════════════════════════════════════╗\n"
+            "║           CJIT Engine Statistics          ║\n"
+            "╠══════════════════════════════════════════╣\n"
+            "║  Registered functions  : %6u            ║\n"
+            "║  Total compilations    : %6llu            ║\n"
+            "║  Failed compilations   : %6llu            ║\n"
+            "║  Atomic pointer swaps  : %6llu            ║\n"
+            "║  Handles retired (GC)  : %6llu            ║\n"
+            "║  Handles freed   (GC)  : %6llu            ║\n"
+            "║  Work-queue depth now  : %6u            ║\n"
+            "╠══════════════════════════════════════════╣\n"
+            "║  Memory pressure       : %-8s          ║\n"
+            "║  Mem available         : %6llu MB         ║\n"
+            "║  Mem total             : %6llu MB         ║\n"
+            "╠══════════════════════════════════════════╣\n"
+            "║  IR HOT  (in memory)   : %6u            ║\n"
+            "║  IR WARM (in memory)   : %6u            ║\n"
+            "║  IR COLD (on disk)     : %6u            ║\n"
+            "║  IR cache hits         : %6llu            ║\n"
+            "║  IR cache misses       : %6llu            ║\n"
+            "║  IR disk writes        : %6llu            ║\n"
+            "║  IR disk reads         : %6llu            ║\n"
+            "║  IR LRU evictions      : %6llu            ║\n"
+            "║  IR pressure evictions : %6llu            ║\n"
+            "║  IR promotions         : %6llu            ║\n"
+            "╚══════════════════════════════════════════╝\n",
             s.registered_functions,
             (unsigned long long)s.total_compilations,
             (unsigned long long)s.failed_compilations,
             (unsigned long long)s.total_swaps,
             (unsigned long long)s.retired_handles,
             (unsigned long long)s.freed_handles,
-            s.queue_depth);
+            s.queue_depth,
+            pnames[s.mem_pressure],
+            (unsigned long long)s.mem_available_mb,
+            (unsigned long long)s.mem_total_mb,
+            s.ir_hot_count, s.ir_warm_count, s.ir_cold_count,
+            (unsigned long long)s.ir_cache_hits,
+            (unsigned long long)s.ir_cache_misses,
+            (unsigned long long)s.ir_disk_writes,
+            (unsigned long long)s.ir_disk_reads,
+            (unsigned long long)s.ir_evictions,
+            (unsigned long long)s.ir_pressure_evictions,
+            (unsigned long long)s.ir_promotions);
 }
 
 uint64_t cjit_get_call_count(const cjit_engine_t *engine, func_id_t id)

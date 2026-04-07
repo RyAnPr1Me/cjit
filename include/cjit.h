@@ -87,6 +87,23 @@ typedef uint32_t func_id_t;
 #define CJIT_INVALID_FUNC_ID ((func_id_t)UINT32_MAX)
 
 /**
+ * System memory pressure level, computed from /proc/meminfo by the IR cache's
+ * background pressure-monitor thread.
+ *
+ * Affects the effective HOT/WARM capacity of the IR LRU cache:
+ *   NORMAL   → 100% of configured capacity
+ *   MEDIUM   →  75%
+ *   HIGH     →  50%
+ *   CRITICAL →  25% (never below 1)
+ */
+typedef enum {
+    MEM_PRESSURE_NORMAL   = 0,  /**< Plenty of memory available.              */
+    MEM_PRESSURE_MEDIUM   = 1,  /**< Some pressure; cache capacity reduced.   */
+    MEM_PRESSURE_HIGH     = 2,  /**< High pressure; aggressive eviction.      */
+    MEM_PRESSURE_CRITICAL = 3,  /**< Very low memory; nearly all IR on disk.  */
+} mem_pressure_t;
+
+/**
  * Optimisation tier requested for recompilation.
  *
  * Maps directly to compiler -O flags; higher tiers also enable additional
@@ -118,12 +135,24 @@ typedef struct {
     bool     enable_const_fold;   /**< Constant folding (enabled at -O1+).       */
     bool     enable_native_arch;  /**< Pass -march=native at OPT_O3.             */
     bool     verbose;             /**< Print compilation events to stderr.        */
+
+    /* ── IR LRU cache settings ──────────────────────────────────────────── */
+    uint32_t hot_ir_cache_size;   /**< Max HOT-gen IR entries in memory (def 64). */
+    uint32_t warm_ir_cache_size;  /**< Max WARM-gen IR entries in memory (def 128).*/
+    char     ir_disk_dir[256];    /**< On-disk IR directory (empty = auto-create). */
+
+    /* ── Memory-pressure monitoring ─────────────────────────────────────── */
+    uint32_t mem_pressure_check_ms;     /**< /proc/meminfo poll interval (ms).  */
+    uint32_t mem_pressure_low_pct;      /**< % avail → MEDIUM  (def 20).        */
+    uint32_t mem_pressure_high_pct;     /**< % avail → HIGH    (def 10).        */
+    uint32_t mem_pressure_critical_pct; /**< % avail → CRITICAL (def  5).       */
 } cjit_config_t;
 
 /* ══════════════════════════════ runtime stats ═════════════════════════════ */
 
 /** Snapshot of JIT-engine statistics. */
 typedef struct {
+    /* ── JIT engine core ──────────────────────────────────────────────── */
     uint32_t registered_functions;  /**< Total functions registered.            */
     uint64_t total_compilations;    /**< Total successful compilations.         */
     uint64_t failed_compilations;   /**< Total failed compilations.             */
@@ -131,6 +160,23 @@ typedef struct {
     uint64_t retired_handles;       /**< Total handles enqueued for deferred GC.*/
     uint64_t freed_handles;         /**< Total handles already freed.           */
     uint32_t queue_depth;           /**< Current depth of the compile queue.    */
+
+    /* ── IR LRU cache ────────────────────────────────────────────────── */
+    uint32_t ir_hot_count;          /**< Entries in HOT  generation (memory).  */
+    uint32_t ir_warm_count;         /**< Entries in WARM generation (memory).  */
+    uint32_t ir_cold_count;         /**< Entries in COLD generation (disk).    */
+    uint64_t ir_disk_writes;        /**< IR files written to disk.             */
+    uint64_t ir_disk_reads;         /**< IR files loaded from disk.            */
+    uint64_t ir_evictions;          /**< Total LRU evictions (HOT/WARM→lower). */
+    uint64_t ir_promotions;         /**< Total promotions (COLD/WARM→higher).  */
+    uint64_t ir_cache_hits;         /**< get_ir() satisfied from memory.       */
+    uint64_t ir_cache_misses;       /**< get_ir() required disk load.          */
+    uint64_t ir_pressure_evictions; /**< Evictions triggered by memory pressure*/
+
+    /* ── Memory pressure ─────────────────────────────────────────────── */
+    mem_pressure_t mem_pressure;    /**< Current pressure level.               */
+    uint64_t mem_available_mb;      /**< Last observed MemAvailable (MB).      */
+    uint64_t mem_total_mb;          /**< Last observed MemTotal (MB).          */
 } cjit_stats_t;
 
 /* ══════════════════════════════ public API ════════════════════════════════ */
