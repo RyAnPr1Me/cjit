@@ -51,6 +51,11 @@
 extern "C" {
 #endif
 
+/* ══════════════════════════════ version ═══════════════════════════════════ */
+
+/** Human-readable version string. */
+#define CJIT_VERSION "0.5.0"
+
 /* ═══════════════════════════ tuneable constants ═══════════════════════════ */
 
 /** Maximum number of concurrently registered functions. */
