@@ -167,6 +167,39 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
     if (level >= OPT_O1) {
         argv[n++] = "-fomit-frame-pointer";
         argv[n++] = "-fno-semantic-interposition";
+
+        /*
+         * -mtune=native: schedule instructions for the CPU that is actually
+         * running this JIT engine.  Unlike -march=native, this does NOT change
+         * the instruction set (the binary is still baseline x86-64, ARM64,
+         * etc.), so it is always safe to emit.  It improves throughput for all
+         * JIT-compiled code by choosing pipeline-optimal instruction ordering,
+         * register allocation hints, and branch alignment for the host µarch.
+         */
+        argv[n++] = "-mtune=native";
+
+#ifdef __linux__
+        /*
+         * -fno-plt: replace PLT indirection stubs with direct GOT-relative
+         * calls for any external functions called from within JIT code (e.g.
+         * malloc, memcpy, libc helpers).
+         *
+         * Without this flag: call → PLT stub → GOT load → function  (2 hops)
+         * With this flag:    call *GOT_entry@GOTPCREL(%rip)           (1 hop)
+         *
+         * The saving is one indirect-branch instruction and one potential
+         * branch-target-buffer miss per unique external call site.  For
+         * JIT functions that call many libc routines this is a measurable
+         * win at zero correctness risk, because:
+         *   (a) We already dlopen() with RTLD_NOW so all GOT entries are
+         *       fully resolved before any JIT code executes.
+         *   (b) We use RTLD_LOCAL so there is no inter-.so PLT sharing.
+         *
+         * Linux/ELF only.  Mach-O (macOS) uses a different ABI and does
+         * not recognise this flag.
+         */
+        argv[n++] = "-fno-plt";
+#endif
     }
 
     if (opts->enable_inlining && level >= OPT_O2)

@@ -38,9 +38,15 @@
  * ──────────────────────────
  *   OPT_NONE : -O0
  *   OPT_O1   : -O1 -fomit-frame-pointer -fno-semantic-interposition
+ *              -mtune=native
+ *              -fno-plt            (Linux/ELF only)
  *   OPT_O2   : -O2 -fomit-frame-pointer -fno-semantic-interposition
+ *              -mtune=native
+ *              -fno-plt            (Linux/ELF only)
  *              -finline-functions -funroll-loops -ftree-vectorize
  *   OPT_O3   : -O3 -fomit-frame-pointer -fno-semantic-interposition
+ *              -mtune=native
+ *              -fno-plt            (Linux/ELF only)
  *              -finline-functions -funroll-loops -ftree-vectorize
  *              -march=native        (if enable_native_arch)
  *              -ffast-math          (if enable_fast_math)

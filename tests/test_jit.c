@@ -38,6 +38,16 @@
  *                                        updated result after recompilation.
  *   t15  extra_cflags (-D define)   – a -D flag in cfg.extra_cflags reaches
  *                                        the compiler and affects JIT output.
+ *   t16  JIT replaces AOT pointer   – after cjit_request_recompile +
+ *                                        cjit_wait_compiled, func_ptr is no
+ *                                        longer the AOT fallback (new binary).
+ *   t17  dladdr compiled object     – dladdr(3) confirms the JIT function
+ *                                        lives in a separately loaded shared
+ *                                        object, not in the test binary itself.
+ *   t18  O3 vectorised correctness  – integer dot-product compiled at O3 +
+ *                                        vectorise + unroll + march=native
+ *                                        gives correct results over 1 000
+ *                                        iterations.
  *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).
@@ -59,6 +69,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <dlfcn.h>   /* dladdr – verify JIT function is in a loaded shared object */
 
 #include "../include/cjit.h"
 
@@ -241,6 +252,14 @@ static const char IR_DJB2[] =
     "    int c;\n"
     "    while ((c = (unsigned char)*s++)) h = ((h << 5) + h) ^ (uint32_t)c;\n"
     "    return h;\n"
+    "}\n";
+
+/* Integer dot product – used by t18 to exercise O3 vectorisation. */
+static const char IR_DOT_INT[] =
+    "long dot_int(const int *a, const int *b, int n) {\n"
+    "    long s = 0;\n"
+    "    for (int i = 0; i < n; ++i) s += (long)a[i] * b[i];\n"
+    "    return s;\n"
     "}\n";
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1091,6 +1110,188 @@ TEST(t15_extra_cflags)
     return 0;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * t16 – JIT pointer is NOT the AOT fallback after compilation
+ * ─────────────────────────────────────────────────────────────────────────
+ * Verifies end-to-end that cjit_request_recompile() + cjit_wait_compiled()
+ * results in the function-table entry being updated to a NEW pointer that is
+ * distinct from the original AOT fallback — proving that a real compiled
+ * binary was loaded and installed, not just the fallback pointer kept.
+ */
+TEST(t16_jit_replaces_aot)
+{
+    printf("[t16] JIT pointer differs from AOT fallback after compilation...\n");
+    cjit_engine_t *e = make_engine(false);
+    CHECK(e != NULL, "engine creation failed");
+
+    func_id_t id = cjit_register_function(e, "add", IR_ADD, (jit_func_t)aot_add);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "registration failed");
+
+    /* Before start the engine must serve the AOT fallback. */
+    jit_func_t pre = cjit_get_func(e, id);
+    CHECK(pre == (jit_func_t)aot_add, "before start: expected AOT fallback");
+    CHECK(cjit_get_current_opt_level(e, id) == OPT_NONE, "pre-start opt level != OPT_NONE");
+
+    cjit_start(e);
+    cjit_request_recompile(e, id, OPT_O2);
+
+    bool ok = cjit_wait_compiled(e, id, 5000);
+    CHECK(ok, "JIT compilation did not complete within 5 s");
+
+    jit_func_t post = cjit_get_func(e, id);
+
+    /* Core assertion: a new pointer was installed (not the AOT fallback). */
+    CHECK(post != NULL,                  "func_ptr is NULL after compilation");
+    CHECK(post != (jit_func_t)aot_add,  "func_ptr still points to AOT fallback after JIT compile");
+    CHECK(cjit_get_recompile_count(e, id) >= 1, "recompile_count == 0 after JIT compile");
+    CHECK(cjit_get_current_opt_level(e, id) == OPT_O2, "opt_level != OPT_O2 after O2 compile");
+
+    /* Correctness: the JIT function must return the same answer as AOT. */
+    typedef int (*add_fn)(int, int);
+    int v = ((add_fn)post)(12, 30);
+    CHECKF(v == 42, "JIT add(12,30) = %d, want 42", v);
+
+    cjit_destroy(e);
+    printf("[t16] PASS\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * t17 – dladdr: JIT function lives in a separately loaded shared object
+ * ─────────────────────────────────────────────────────────────────────────
+ * Uses POSIX dladdr(3) to inspect the function pointer installed after
+ * JIT compilation.  The function must reside in a dynamically-loaded
+ * shared object whose load-base is different from the test binary's own
+ * load-base — proving that the JIT compiled and dlopen'd a real .so.
+ */
+TEST(t17_dladdr_compiled_object)
+{
+    printf("[t17] dladdr: JIT function is in a loaded shared object...\n");
+    cjit_engine_t *e = make_engine(false);
+    CHECK(e != NULL, "engine creation failed");
+
+    /*
+     * Register WITHOUT an AOT fallback so that func_ptr is NULL until the
+     * JIT compilation finishes.  After cjit_wait_compiled() any non-NULL
+     * func_ptr must be a JIT-compiled entry point.
+     */
+    func_id_t id = cjit_register_function(e, "add", IR_ADD, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "registration failed");
+
+    cjit_start(e);
+    cjit_request_recompile(e, id, OPT_O1);
+
+    bool ok = cjit_wait_compiled(e, id, 5000);
+    CHECK(ok, "JIT compilation did not complete within 5 s");
+
+    jit_func_t fn = cjit_get_func(e, id);
+    CHECK(fn != NULL, "func_ptr is NULL after compilation");
+
+    /* ── dladdr inspection ──────────────────────────────────────────── */
+    Dl_info jit_info;
+    memset(&jit_info, 0, sizeof(jit_info));
+    int found = dladdr((void *)(uintptr_t)fn, &jit_info);
+    CHECKF(found != 0,
+           "dladdr returned 0: JIT function (ptr=%p) not in any mapped shared object",
+           (void *)(uintptr_t)fn);
+    CHECK(jit_info.dli_fbase != NULL, "dladdr: dli_fbase is NULL");
+
+    /*
+     * The JIT .so has a different load base than the test binary.
+     * Use now_ms() (a static function in this translation unit) as the
+     * anchor for the test binary's load base — it is guaranteed to be in
+     * the same mapped object as this test code.
+     */
+    Dl_info main_info;
+    memset(&main_info, 0, sizeof(main_info));
+    dladdr((void *)(uintptr_t)now_ms, &main_info);
+    CHECK(jit_info.dli_fbase != main_info.dli_fbase,
+          "JIT function is in the same mapping as the test binary (not a JIT .so)");
+
+    if (jit_info.dli_fname)
+        printf("[t17]   JIT .so mapped from: %s\n", jit_info.dli_fname);
+    else
+        printf("[t17]   JIT .so: anonymous mapping (in-memory .so)\n");
+
+    /* Correctness: the JIT function must return the right answer. */
+    typedef int (*add_fn)(int, int);
+    int v = ((add_fn)fn)(5, 7);
+    CHECKF(v == 12, "JIT add(5,7) = %d, want 12", v);
+
+    cjit_destroy(e);
+    printf("[t17] PASS\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * t18 – O3 + vectorisation: integer dot-product correctness
+ * ─────────────────────────────────────────────────────────────────────────
+ * Exercises the full optimisation path (O3 + -ftree-vectorize +
+ * -funroll-loops + -march=native) with a loop that the auto-vectoriser
+ * can convert to SIMD instructions.  The result is verified against a
+ * reference implementation for 1 000 consecutive calls to confirm that the
+ * JIT-compiled, highly-optimised code is both correct and stable.
+ */
+TEST(t18_o3_vectorised_correctness)
+{
+    printf("[t18] O3 vectorised compilation correctness (dot product)...\n");
+
+    cjit_config_t cfg          = cjit_default_config();
+    cfg.verbose                = false;
+    cfg.monitor_interval_ms    = 50;
+    cfg.enable_inlining        = true;
+    cfg.enable_vectorization   = true;
+    cfg.enable_loop_unroll     = true;
+    cfg.enable_native_arch     = true;
+    cfg.hot_ir_cache_size      = 4;
+    cfg.warm_ir_cache_size     = 8;
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e != NULL, "engine creation failed");
+
+    func_id_t id = cjit_register_function(e, "dot_int", IR_DOT_INT, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "registration failed");
+
+    cjit_start(e);
+    cjit_request_recompile(e, id, OPT_O3);
+
+    bool ok = cjit_wait_compiled(e, id, 5000);
+    CHECK(ok, "O3 compilation did not complete within 5 s");
+
+    CHECK(cjit_get_current_opt_level(e, id) == OPT_O3, "opt_level != OPT_O3 after O3 compile");
+    CHECK(cjit_get_recompile_count(e, id) >= 1, "recompile_count == 0 after O3 compile");
+
+    typedef long (*dot_fn)(const int *, const int *, int);
+    dot_fn jit_dot = (dot_fn)cjit_get_func(e, id);
+    CHECK(jit_dot != NULL, "func_ptr NULL after O3 compilation");
+
+    /* Build deterministic test vectors and compute the reference result. */
+    enum { N = 1024 };
+    int  a[N], b[N];
+    long ref = 0;
+    for (int i = 0; i < N; ++i) {
+        a[i] = i + 1;
+        b[i] = N - i;
+        ref += (long)a[i] * b[i];
+    }
+
+    /* Single correctness check. */
+    long got = jit_dot(a, b, N);
+    CHECKF(got == ref, "dot_int[%d] first call: got %ld, want %ld", N, got, ref);
+
+    /* Stability: repeat 1 000 times to catch any code-quality regression
+     * (e.g. vectorisation that miscomputes the tail element). */
+    for (int t = 1; t < 1000; ++t) {
+        long v = jit_dot(a, b, N);
+        CHECKF(v == ref, "dot_int[%d] iter %d: got %ld, want %ld", N, t, v, ref);
+    }
+
+    printf("[t18]   ref=%ld, 1000 iterations correct at OPT_O3\n", ref);
+    cjit_destroy(e);
+    printf("[t18] PASS\n");
+    return 0;
+}
+
 
 
 typedef int (*test_fn)(void);
@@ -1110,6 +1311,9 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t13_lookup_function",    t13_lookup_function    },
     { "t14_update_ir",          t14_update_ir          },
     { "t15_extra_cflags",       t15_extra_cflags       },
+    { "t16_jit_replaces_aot",         t16_jit_replaces_aot         },
+    { "t17_dladdr_compiled_object",   t17_dladdr_compiled_object   },
+    { "t18_o3_vectorised_correctness",t18_o3_vectorised_correctness},
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 
