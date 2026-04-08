@@ -185,6 +185,33 @@ typedef struct {
      * 0 = no timeout (default, backward-compatible).
      */
     uint32_t compile_timeout_ms;
+
+    /**
+     * EMA call rate at the time this compilation was enqueued (calls/second).
+     *
+     * When non-zero, injected into the translation unit as
+     *   -DCJIT_CALL_RATE=<n>
+     * User IR can use this at compile time:
+     *   #if defined(CJIT_CALL_RATE) && CJIT_CALL_RATE > 5000
+     *     // enable hot-path SIMD / loop-unrolling manually
+     *   #endif
+     *
+     * 0 = unknown (no define injected).
+     */
+    uint64_t call_rate;
+
+    /**
+     * Average observed nanoseconds per call at the time of compilation.
+     *
+     * Computed as total_elapsed_ns / call_cnt when timing data is available
+     * (requires CJIT_DISPATCH_TIMED or cjit_record_timed_call() on hot path).
+     *
+     * When non-zero, injected as -DCJIT_AVG_ELAPSED_NS=<n>.
+     * Useful for latency-sensitive code paths that want to know their own cost.
+     *
+     * 0 = unknown (no define injected).
+     */
+    uint64_t avg_elapsed_ns;
 } codegen_opts_t;
 
 /* ─────────────────────────── API ───────────────────────────────────────────── */

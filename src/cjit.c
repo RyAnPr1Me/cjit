@@ -590,11 +590,27 @@ static void *compiler_thread_fn(void *raw_arg)
          * coherence).  The arg_profile pointer is only valid until the end of
          * this codegen_compile() call (entry remains live throughout since we
          * hold compile_lock).
+         *
+         * Also pass the runtime call-rate and average elapsed-time-per-call
+         * observed at the time this task was enqueued.  These are injected by
+         * codegen_compile() as preprocessor defines (CJIT_CALL_RATE,
+         * CJIT_AVG_ELAPSED_NS) so user IR can make compile-time decisions
+         * based on the function's actual runtime profile.
          */
         copts.arg_profile = &entry->arg_profile;
+        copts.call_rate   = task.call_rate;
+        {
+            uint64_t cnt_snap = atomic_load_explicit(&entry->call_cnt,
+                                                      memory_order_relaxed);
+            uint64_t ns_snap  = atomic_load_explicit(&entry->total_elapsed_ns,
+                                                      memory_order_relaxed);
+            copts.avg_elapsed_ns = (cnt_snap > 0) ? (ns_snap / cnt_snap) : 0;
+        }
         bool ok = codegen_compile(entry->name, ir_to_use,
                                    task.target_level, &copts, &cres);
-        copts.arg_profile = NULL; /* clear for next task */
+        copts.arg_profile    = NULL; /* clear for next task */
+        copts.call_rate      = 0;
+        copts.avg_elapsed_ns = 0;
         free(ir_cache_copy);
 
         /* Record how long this compilation took (relaxed store, read by monitor
@@ -2316,8 +2332,11 @@ bool cjit_compile_sync(cjit_engine_t *engine, func_id_t id, opt_level_t level)
                               memory_order_relaxed);
     pthread_mutex_lock(&entry->compile_lock);
 
-    /* Attach the current arg profile for potential specialisation. */
-    copts.arg_profile = &entry->arg_profile;
+    /* Attach the current arg profile and zero runtime-profile hints
+     * (call_rate and avg_elapsed_ns are unavailable in the sync path). */
+    copts.arg_profile    = &entry->arg_profile;
+    copts.call_rate      = 0;
+    copts.avg_elapsed_ns = 0;
 
     uint64_t t0 = engine_now_ms();
     codegen_result_t cres;

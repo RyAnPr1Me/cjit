@@ -201,15 +201,15 @@ static const char CODEGEN_PREAMBLE[] =
 /**
  * Maximum number of arguments passed to the compiler subprocess.
  *
- * cc(1) + -shared + -fPIC + opt-level + up to 14 optional flags
- * (including -funswitch-loops, -fpeel-loops) +
- * JIT-specific flags (-fno-stack-protector, -fno-asynchronous-unwind-tables,
- * -fno-ident) + -w + -o + so_path + -x + c + src_path + NULL = at most 26
- * entries.  When argument specialisation is active, two more entries are
- * added (-D <func=_cjit_i_func>).  Extra user flags (extra_cflags) may add
- * up to ~50 more tokens.  96 gives comfortable headroom.
+ * cc(1) + -shared + -fPIC + opt-level + up to 14 optional flags +
+ * JIT-specific flags + -w + -o + so_path + -x + c + src_path + NULL = ~26.
+ * When argument specialisation is active: two more (-D <func=_cjit_i_func>).
+ * Extra user flags (extra_cflags) may add up to ~50 more tokens.
+ * Runtime-profile defines (CJIT_OPT_TIER, CJIT_CALL_RATE, CJIT_AVG_ELAPSED_NS,
+ * CJIT_ARG0..ARG7) add up to 11 more.
+ * 128 gives comfortable headroom.
  */
-#define MAX_CC_ARGS 96
+#define MAX_CC_ARGS 128
 
 /**
  * Build the compiler argv array for posix_spawnp().
@@ -1138,7 +1138,91 @@ bool codegen_compile(const char          *func_name,
     }
     cc_argv[n_argv] = NULL;  /* always ensure NULL-terminator for posix_spawnp */
 
-    /* Determine which compiler binary to invoke. */
+    /*
+     * Append runtime-profile preprocessor defines.
+     *
+     * These communicate the JIT engine's profiling observations directly to
+     * the C compiler so user IR can make compile-time decisions based on
+     * runtime behaviour:
+     *
+     *   CJIT_OPT_TIER        – optimisation tier (0=O0, 1=O1, 2=O2, 3=O3).
+     *                          Always injected.
+     *   CJIT_CALL_RATE        – EMA call rate at compilation time (calls/sec).
+     *                          Injected when opts->call_rate > 0.
+     *   CJIT_AVG_ELAPSED_NS  – Average observed nanoseconds per call.
+     *                          Injected when opts->avg_elapsed_ns > 0.
+     *   CJIT_ARG<i>          – Dominant value for argument slot i.
+     *                          Injected for each slot whose Boyer-Moore
+     *                          majority vote meets the confidence threshold.
+     *                          Mirrors the constant value used in the
+     *                          arg-specialisation wrapper (when generated)
+     *                          and additionally exposed as a named macro
+     *                          for __builtin_expect or #if use by user code.
+     *
+     * Usage example in user IR:
+     *   int process(int stride, int *buf, int n) {
+     *   #if defined(CJIT_OPT_TIER) && CJIT_OPT_TIER >= 2
+     *     // O2+: trust the compiler has vectorised the inner loop
+     *   #endif
+     *   #if defined(CJIT_ARG0)
+     *     // stride almost always CJIT_ARG0 at runtime — use as __builtin_expect hint
+     *     int s = __builtin_expect(stride, CJIT_ARG0);
+     *   #else
+     *     int s = stride;
+     *   #endif
+     *     ...
+     *   }
+     *
+     * These defines do NOT affect the artifact cache key: they are performance
+     * hints whose staleness (bounded by the previous compilation cycle) does
+     * not affect correctness.  The arg-specialisation wrapper (when generated)
+     * encodes the dominant value as a literal constant in the wrapper source,
+     * which IS part of the cache key, so cache correctness is maintained.
+     */
+#define CJIT_PRF_DEFS_MAX 11  /* OPT_TIER + CALL_RATE + AVG_NS + up to 8 ARGs */
+    char prf_strs[CJIT_PRF_DEFS_MAX][64];
+    int  n_prf = 0;
+
+    /* CJIT_OPT_TIER: always injected */
+    if (n_argv < MAX_CC_ARGS - 1) {
+        snprintf(prf_strs[n_prf], sizeof(prf_strs[n_prf]),
+                 "-DCJIT_OPT_TIER=%d", (int)level);
+        cc_argv[n_argv++] = prf_strs[n_prf++];
+    }
+
+    /* CJIT_CALL_RATE: if known */
+    if (opts && opts->call_rate > 0 &&
+        n_prf < CJIT_PRF_DEFS_MAX && n_argv < MAX_CC_ARGS - 1) {
+        snprintf(prf_strs[n_prf], sizeof(prf_strs[n_prf]),
+                 "-DCJIT_CALL_RATE=%llu",
+                 (unsigned long long)opts->call_rate);
+        cc_argv[n_argv++] = prf_strs[n_prf++];
+    }
+
+    /* CJIT_AVG_ELAPSED_NS: if known */
+    if (opts && opts->avg_elapsed_ns > 0 &&
+        n_prf < CJIT_PRF_DEFS_MAX && n_argv < MAX_CC_ARGS - 1) {
+        snprintf(prf_strs[n_prf], sizeof(prf_strs[n_prf]),
+                 "-DCJIT_AVG_ELAPSED_NS=%llu",
+                 (unsigned long long)opts->avg_elapsed_ns);
+        cc_argv[n_argv++] = prf_strs[n_prf++];
+    }
+
+    /* CJIT_ARG<i>: dominant value for each confident argument slot */
+    if (opts && opts->arg_profile) {
+        int n_slots = (int)opts->arg_profile->n_profiled;
+        for (int _ai = 0; _ai < n_slots && _ai < SPEC_MAX_PARAMS; ++_ai) {
+            const cjit_arg_slot_t *_sl = &opts->arg_profile->slots[_ai];
+            if (!cjit_arg_slot_confident(_sl)) continue;
+            if (n_prf >= CJIT_PRF_DEFS_MAX || n_argv >= MAX_CC_ARGS - 1) break;
+            snprintf(prf_strs[n_prf], sizeof(prf_strs[n_prf]),
+                     "-DCJIT_ARG%d=%lld",
+                     _ai, (long long)(int64_t)_sl->dominant_val);
+            cc_argv[n_argv++] = prf_strs[n_prf++];
+        }
+    }
+#undef CJIT_PRF_DEFS_MAX
+    cc_argv[n_argv] = NULL;
     const char *cc_bin = (opts && opts->cc_binary && opts->cc_binary[0])
                              ? opts->cc_binary : "cc";
 
