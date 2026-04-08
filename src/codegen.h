@@ -44,10 +44,15 @@
  *              -mtune=native
  *              -fno-plt            (Linux/ELF only)
  *              -finline-functions -funroll-loops -ftree-vectorize
+ *              -funswitch-loops    (hoist invariant conditionals out of loops)
+ *              -fpeel-loops        (peel first/last iterations; unroll small
+ *                                  known-trip-count loops to straight-line)
  *   OPT_O3   : -O3 -fomit-frame-pointer -fno-semantic-interposition
  *              -mtune=native
  *              -fno-plt            (Linux/ELF only)
  *              -finline-functions -funroll-loops -ftree-vectorize
+ *              -funswitch-loops
+ *              -fpeel-loops
  *              -march=native        (if enable_native_arch)
  *              -ffast-math          (if enable_fast_math)
  *
@@ -55,6 +60,8 @@
  *   -fno-stack-protector        removes stack-canary overhead
  *   -fno-asynchronous-unwind-tables  omits .eh_frame (smaller .so,
  *                                    faster dlopen, better I-cache)
+ *   -fno-ident                  omits .comment section (smaller .so,
+ *                                    faster dlopen)
  *
  * Source file delivery
  * ────────────────────
@@ -70,16 +77,25 @@
  *   #define LIKELY(x)                __builtin_expect(!!(x), 1)
  *   #define UNLIKELY(x)              __builtin_expect(!!(x), 0)
  *   #define HOT                      __attribute__((hot))
+ *   #define COLD                     __attribute__((cold))
  *   #define NOINLINE                 __attribute__((noinline))
+ *   #define ALWAYS_INLINE            __attribute__((always_inline)) inline
  *   #define PURE                     __attribute__((pure))
  *   #define CONST_FUNC               __attribute__((const))
  *   #define RESTRICT                 __restrict__
  *   #define PREFETCH(addr,rw,loc)    __builtin_prefetch(addr,rw,loc)
  *   #define ASSUME_ALIGNED(ptr,n)    __builtin_assume_aligned(ptr,n)
+ *   #define FLATTEN                  __attribute__((flatten))
+ *   #define NORETURN                 __attribute__((noreturn))
+ *   #define CJIT_EXPORT              __attribute__((visibility("default")))
+ *   #define MALLOC_FUNC              __attribute__((malloc))
  *
- * This lets user IR code use branch-prediction, aliasing, purity, and
- * inlining hints portably without adding a compile-time dependency on
- * cjit.h.
+ * Also included automatically: <stdint.h>, <string.h>, <stdlib.h>,
+ * <limits.h>, <stdbool.h>.
+ *
+ * These macros and headers let user IR code use branch-prediction, aliasing,
+ * purity, inlining, and visibility hints portably without adding a compile-
+ * time dependency on cjit.h.
  */
 
 #pragma once

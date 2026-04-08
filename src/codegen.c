@@ -90,6 +90,38 @@ static const char CODEGEN_PREAMBLE[] =
     "#  define PREFETCH(addr, rw, loc)    __builtin_prefetch((addr), (rw), (loc))\n"
     /* Assume aligned: lets the compiler omit alignment-fixup code for SIMD. */
     "#  define ASSUME_ALIGNED(ptr, n)     __builtin_assume_aligned((ptr), (n))\n"
+    /*
+     * FLATTEN: forces the compiler to inline every function called from within
+     * the annotated function, recursively.  More powerful than ALWAYS_INLINE
+     * (which applies only to the immediate callee): a FLATTEN function becomes
+     * a single block of straight-line code with no internal call overhead at
+     * all.  Particularly useful for hot inner loops that call small helpers —
+     * apply it to the outer loop function to guarantee the helpers disappear.
+     */
+    "#  define FLATTEN                    __attribute__((flatten))\n"
+    /*
+     * NORETURN: annotates a function guaranteed never to return (e.g. one that
+     * calls exit() unconditionally or loops forever).  Allows the compiler to
+     * elide the return sequence at call sites and remove dead code after the
+     * call, reducing both binary size and branch overhead.
+     */
+    "#  define NORETURN                   __attribute__((noreturn))\n"
+    /*
+     * CJIT_EXPORT: explicitly marks a symbol as having default (exported)
+     * visibility so it remains accessible via dlsym() even when the
+     * translation unit is compiled with -fvisibility=hidden.  Apply to the
+     * entry-point function of any JIT IR that also contains internal helpers
+     * you want to keep private (i.e. hidden from the dynamic symbol table).
+     */
+    "#  define CJIT_EXPORT                __attribute__((visibility(\"default\")))\n"
+    /*
+     * MALLOC_FUNC: asserts that the annotated function returns a freshly-
+     * allocated pointer that is not aliased by any other live pointer in the
+     * program.  Enables the alias analyser to eliminate many conservative
+     * load/store assumptions when the caller uses the returned pointer,
+     * allowing aggressive reordering and vectorisation of subsequent code.
+     */
+    "#  define MALLOC_FUNC                __attribute__((malloc))\n"
     "#else\n"
     "#  define LIKELY(x)                  (x)\n"
     "#  define UNLIKELY(x)                (x)\n"
@@ -103,10 +135,24 @@ static const char CODEGEN_PREAMBLE[] =
     "#  define RESTRICT\n"
     "#  define PREFETCH(addr, rw, loc)    ((void)(addr))\n"
     "#  define ASSUME_ALIGNED(ptr, n)     (ptr)\n"
+    "#  define FLATTEN\n"
+    "#  define NORETURN\n"
+    "#  define CJIT_EXPORT\n"
+    "#  define MALLOC_FUNC\n"
     "#endif\n"
     "#include <stdint.h>\n"
     "#include <string.h>\n"
     "#include <stdlib.h>\n"
+    /*
+     * <limits.h>: provides INT_MAX, INT_MIN, LONG_MAX, etc.  Commonly
+     * required for overflow guards and sentinel values in JIT functions.
+     */
+    "#include <limits.h>\n"
+    /*
+     * <stdbool.h>: provides bool, true, false in C99/C11.  In C23 these are
+     * built-in keywords and the header is a no-op; including it is always safe.
+     */
+    "#include <stdbool.h>\n"
     "#endif /* CJIT_PREAMBLE_H */\n";
 
 /* ─────────────────────────── optimisation flags ───────────────────────────── */
@@ -114,14 +160,15 @@ static const char CODEGEN_PREAMBLE[] =
 /**
  * Maximum number of arguments passed to the compiler subprocess.
  *
- * cc(1) + -shared + -fPIC + opt-level + up to 10 optional flags +
- * JIT-specific flags (-fno-stack-protector, -fno-asynchronous-unwind-tables) +
- * -w + -o + so_path + -x + c + src_path + NULL = at most 22 entries.
- * When argument specialisation is active, two more entries are added
- * (-D <func=_cjit_i_func>).  Extra user flags (extra_cflags) may add up to
- * ~50 more tokens.  80 gives comfortable headroom.
+ * cc(1) + -shared + -fPIC + opt-level + up to 14 optional flags
+ * (including -funswitch-loops, -fpeel-loops) +
+ * JIT-specific flags (-fno-stack-protector, -fno-asynchronous-unwind-tables,
+ * -fno-ident) + -w + -o + so_path + -x + c + src_path + NULL = at most 26
+ * entries.  When argument specialisation is active, two more entries are
+ * added (-D <func=_cjit_i_func>).  Extra user flags (extra_cflags) may add
+ * up to ~50 more tokens.  96 gives comfortable headroom.
  */
-#define MAX_CC_ARGS 80
+#define MAX_CC_ARGS 96
 
 /**
  * Build the compiler argv array for posix_spawnp().
@@ -211,6 +258,36 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
     if (opts->enable_vectorization && level >= OPT_O2)
         argv[n++] = "-ftree-vectorize";
 
+    if (level >= OPT_O2) {
+        /*
+         * -funswitch-loops: hoist loop-invariant conditionals out of the loop
+         * body.  When a loop contains `if (mode == 0) { … } else { … }` and
+         * `mode` does not change across iterations, the compiler emits two
+         * separate loops (one per branch) rather than re-testing the condition
+         * on every iteration.  The result is fewer branch mispredictions, a
+         * tighter inner loop, and better vectorisation opportunities.
+         *
+         * GCC enables this only at -O3 by default; we apply it at O2 as well
+         * since JIT workloads very commonly contain dispatch-style inner loops
+         * with invariant flag or mode parameters.
+         */
+        argv[n++] = "-funswitch-loops";
+
+        /*
+         * -fpeel-loops: peel the first (and last) iterations from loops where
+         * the compiler has high confidence they execute very few times — either
+         * from profile feedback or when the trip count is statically known and
+         * small (e.g. a 3-iteration initialisation loop becomes straight-line
+         * code).  Peeling the first iteration also often achieves better
+         * alignment for the main loop body, reducing the cycle cost of the
+         * hot path.
+         *
+         * GCC enables this only at -O3 by default; we apply it at O2 for the
+         * same reasons as -funswitch-loops.
+         */
+        argv[n++] = "-fpeel-loops";
+    }
+
     if (opts->enable_native_arch && level >= OPT_O3)
         argv[n++] = "-march=native";
 
@@ -234,6 +311,15 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
      */
     argv[n++] = "-fno-stack-protector";
     argv[n++] = "-fno-asynchronous-unwind-tables";
+
+    /*
+     * -fno-ident: suppress the `.comment` ELF section that GCC and Clang
+     * normally emit into every compiled object.  This section contains the
+     * compiler version string (e.g. "GCC: (GNU) 13.2.0") and is never read
+     * at runtime.  Removing it makes each JIT .so a few hundred bytes smaller
+     * and reduces the amount of data that dlopen() must map and process.
+     */
+    argv[n++] = "-fno-ident";
 
     argv[n++] = "-w";   /* suppress warnings from user snippets */
     argv[n++] = "-o";

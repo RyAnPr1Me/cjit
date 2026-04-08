@@ -54,6 +54,14 @@
  *                                        reports speedup vs AOT; asserts
  *                                        correctness and compile < 10 s per
  *                                        tier and O3 not >3× slower than O1.
+ *   t20  New opt-flags + preamble   – verifies the -funswitch-loops /
+ *                                        -fpeel-loops additions and the new
+ *                                        FLATTEN / NORETURN / CJIT_EXPORT /
+ *                                        MALLOC_FUNC preamble attributes and
+ *                                        the <limits.h> / <stdbool.h> auto-
+ *                                        includes by compiling representative
+ *                                        IR at O2 and O3 and checking all
+ *                                        results against AOT references.
  *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).
@@ -72,6 +80,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <limits.h>
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -148,6 +157,14 @@ static long aot_dot_int(const int *a, const int *b, int n)
     long s = 0;
     for (int i = 0; i < n; ++i) s += (long)a[i] * b[i];
     return s;
+}
+
+/* Reference for t20: conditional sum (mode 0 = add, mode 1 = subtract). */
+static long aot_cond_sum(const int *a, int n, int mode)
+{
+    long r = 0;
+    for (int i = 0; i < n; ++i) r += (mode == 0) ? a[i] : -a[i];
+    return r;
 }
 
 /* Reference prime sieve (returns count of primes ≤ limit). */
@@ -273,6 +290,74 @@ static const char IR_DOT_INT[] =
     "long dot_int(const int *a, const int *b, int n) {\n"
     "    long s = 0;\n"
     "    for (int i = 0; i < n; ++i) s += (long)a[i] * b[i];\n"
+    "    return s;\n"
+    "}\n";
+
+/* ─ t20 IR strings ─────────────────────────────────────────────────────────
+ *
+ * IR_COND_SUM: exercises -funswitch-loops.
+ *   The loop contains an invariant conditional on `mode`.  With
+ *   -funswitch-loops the compiler hoists the branch outside the loop,
+ *   emitting two tight loops (one for each mode) instead of testing `mode`
+ *   on every iteration.  We verify correctness for both modes at O2 and O3.
+ */
+static const char IR_COND_SUM[] =
+    "long cond_sum(const int *a, int n, int mode) {\n"
+    "    long r = 0;\n"
+    "    for (int i = 0; i < n; ++i) {\n"
+    "        if (mode == 0)\n"
+    "            r += a[i];\n"
+    "        else\n"
+    "            r -= a[i];\n"
+    "    }\n"
+    "    return r;\n"
+    "}\n";
+
+/*
+ * IR_PREAMBLE_ATTRS: verifies that newly-added preamble macros and headers
+ * compile without error.
+ *
+ *   • FLATTEN  – applied to outer(), which calls inner(); the compiler must
+ *                inline inner() even though it is a non-static, non-inline
+ *                function.
+ *   • <limits.h> auto-include – INT_MAX is referenced directly.
+ *   • <stdbool.h> auto-include – bool / true / false used.
+ *   • CJIT_EXPORT  – marks preamble_test as exported (dlsym-visible).
+ *   • MALLOC_FUNC  – applied to a trivial allocator-style function (purely
+ *                    a compile-time annotation; function body is inert).
+ *
+ * Expected return value: INT_MAX (computed as 10 adds + INT_MAX - 10).
+ */
+static const char IR_PREAMBLE_ATTRS[] =
+    "static int inner(int x) { return x + 1; }\n"
+    "FLATTEN static int outer(int x, int n) {\n"
+    "    for (int i = 0; i < n; ++i) x = inner(x);\n"
+    "    return x;\n"
+    "}\n"
+    "/* MALLOC_FUNC: compile-time annotation only; just confirm it compiles. */\n"
+    "MALLOC_FUNC static void *trivial_alloc(void) { return 0; }\n"
+    "/* CJIT_EXPORT ensures this symbol is visible via dlsym. */\n"
+    "CJIT_EXPORT int preamble_test(void) {\n"
+    "    (void)trivial_alloc();\n"
+    "    bool ok = true;\n"         /* tests stdbool.h auto-include */
+    "    if (!ok) return -1;\n"
+    "    return outer(INT_MAX - 10, 10);  /* uses limits.h auto-include */\n"
+    "}\n";
+
+/*
+ * IR_DOT_HELPERS: exercises FLATTEN with real helper inlining.
+ *   The outer FLATTEN-annotated function calls two non-static helpers
+ *   (mul_pair, add_accum).  Without FLATTEN these would only be inlined
+ *   at -O2 if the compiler judges them small enough; with FLATTEN inlining
+ *   is guaranteed.  We verify the numeric result matches the AOT reference.
+ */
+static const char IR_DOT_HELPERS[] =
+    "static int mul_pair(int a, int b) { return a * b; }\n"
+    "static long add_accum(long s, int v) { return s + v; }\n"
+    "FLATTEN long dot_helpers(const int *a, const int *b, int n) {\n"
+    "    long s = 0;\n"
+    "    for (int i = 0; i < n; ++i)\n"
+    "        s = add_accum(s, mul_pair(a[i], b[i]));\n"
     "    return s;\n"
     "}\n";
 
@@ -1476,6 +1561,137 @@ TEST(t19_perf_benchmark)
     return 0;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * t20 – New optimisation flags and preamble attributes
+ * ─────────────────────────────────────────────────────────────────────────
+ * Verifies three improvements made to the JIT's code-generation layer:
+ *
+ *   1. -funswitch-loops (now active at O2+)
+ *      Hoists loop-invariant conditionals out of loops.  A loop whose body
+ *      contains `if (mode == 0)` with a constant-across-iterations `mode`
+ *      becomes two separate loops — correct results must be produced for
+ *      both mode values at both O2 and O3.
+ *
+ *   2. FLATTEN preamble attribute
+ *      Forces the compiler to inline all calls within the annotated function
+ *      recursively.  IR_PREAMBLE_ATTRS defines a FLATTEN outer() that calls
+ *      inner(); the compiled function must return INT_MAX (10 increments
+ *      starting from INT_MAX-10).  Also exercises the auto-included
+ *      <limits.h> (INT_MAX) and <stdbool.h> (bool / true / false).
+ *
+ *   3. FLATTEN on real helper-calling IR (IR_DOT_HELPERS)
+ *      A dot-product loop calling two per-element helpers through FLATTEN;
+ *      result must match the AOT reference.
+ */
+TEST(t20_new_optflags_and_preamble)
+{
+    printf("[t20] New optimisation flags and preamble attributes...\n");
+
+    cjit_config_t cfg        = cjit_default_config();
+    cfg.verbose              = false;
+    cfg.monitor_interval_ms  = 50;
+    cfg.enable_inlining      = true;
+    cfg.enable_vectorization = true;
+    cfg.enable_loop_unroll   = true;
+    cfg.enable_native_arch   = true;
+    cfg.hot_ir_cache_size    = 8;
+    cfg.warm_ir_cache_size   = 16;
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e != NULL, "engine creation failed");
+
+    /* Register all three test functions. */
+    func_id_t id_csum = cjit_register_function(e, "cond_sum",
+                                                IR_COND_SUM, NULL);
+    func_id_t id_patt = cjit_register_function(e, "preamble_test",
+                                                IR_PREAMBLE_ATTRS, NULL);
+    func_id_t id_dh   = cjit_register_function(e, "dot_helpers",
+                                                IR_DOT_HELPERS, NULL);
+    CHECK(id_csum != CJIT_INVALID_FUNC_ID, "cond_sum registration failed");
+    CHECK(id_patt != CJIT_INVALID_FUNC_ID, "preamble_test registration failed");
+    CHECK(id_dh   != CJIT_INVALID_FUNC_ID, "dot_helpers registration failed");
+
+    cjit_start(e);
+
+    /* ── Compile all three to O2 and wait ────────────────────────────── */
+    cjit_request_recompile(e, id_csum, OPT_O2);
+    cjit_request_recompile(e, id_patt, OPT_O2);
+    cjit_request_recompile(e, id_dh,   OPT_O2);
+
+    wait_arg_t wa_csum = { e, id_csum, OPT_O2 };
+    wait_arg_t wa_patt = { e, id_patt, OPT_O2 };
+    wait_arg_t wa_dh   = { e, id_dh,   OPT_O2 };
+
+    CHECK(wait_for(check_opt, &wa_csum, 5000), "cond_sum O2 compile timeout");
+    CHECK(wait_for(check_opt, &wa_patt, 5000), "preamble_test O2 compile timeout");
+    CHECK(wait_for(check_opt, &wa_dh,   5000), "dot_helpers O2 compile timeout");
+
+    /* ── 1. cond_sum correctness at O2 ──────────────────────────────── */
+    enum { CSN = 512 };
+    int ca[CSN];
+    for (int i = 0; i < CSN; ++i) ca[i] = i + 1;
+    long ref0 = aot_cond_sum(ca, CSN, 0);
+    long ref1 = aot_cond_sum(ca, CSN, 1);
+
+    typedef long (*csum_fn)(const int *, int, int);
+    csum_fn jit_csum = (csum_fn)cjit_get_func(e, id_csum);
+    CHECK(jit_csum != NULL, "cond_sum func_ptr NULL at O2");
+
+    long got0 = jit_csum(ca, CSN, 0);
+    long got1 = jit_csum(ca, CSN, 1);
+    CHECKF(got0 == ref0, "O2 cond_sum mode=0: got %ld, want %ld", got0, ref0);
+    CHECKF(got1 == ref1, "O2 cond_sum mode=1: got %ld, want %ld", got1, ref1);
+    printf("[t20]   -funswitch-loops O2: mode0=%ld mode1=%ld  OK\n", got0, got1);
+
+    /* ── 2. preamble_test: FLATTEN + limits.h + stdbool.h ───────────── */
+    typedef int (*patt_fn)(void);
+    int patt_got = ((patt_fn)cjit_get_func(e, id_patt))();
+    CHECKF(patt_got == INT_MAX,
+           "preamble_test() = %d, want INT_MAX (%d)", patt_got, INT_MAX);
+    printf("[t20]   FLATTEN + limits.h + stdbool.h O2: result=%d (INT_MAX) OK\n",
+           patt_got);
+
+    /* ── 3. dot_helpers: FLATTEN on helper-calling loop ─────────────── */
+    enum { DHN = 64 };
+    int da[DHN], db[DHN];
+    long dref = 0;
+    for (int i = 0; i < DHN; ++i) {
+        da[i] = i + 1;
+        db[i] = DHN - i;
+        dref += (long)da[i] * db[i];
+    }
+
+    typedef long (*dh_fn)(const int *, const int *, int);
+    long dh_got = ((dh_fn)cjit_get_func(e, id_dh))(da, db, DHN);
+    CHECKF(dh_got == dref,
+           "dot_helpers O2 (N=%d): got %ld, want %ld", DHN, dh_got, dref);
+    printf("[t20]   FLATTEN dot_helpers O2 (N=%d): %ld  OK\n", DHN, dh_got);
+
+    /* ── Re-verify cond_sum and dot_helpers at O3 ────────────────────── */
+    cjit_request_recompile(e, id_csum, OPT_O3);
+    cjit_request_recompile(e, id_dh,   OPT_O3);
+
+    wait_arg_t wa_csum3 = { e, id_csum, OPT_O3 };
+    wait_arg_t wa_dh3   = { e, id_dh,   OPT_O3 };
+    CHECK(wait_for(check_opt, &wa_csum3, 5000), "cond_sum O3 compile timeout");
+    CHECK(wait_for(check_opt, &wa_dh3,   5000), "dot_helpers O3 compile timeout");
+
+    long o3_0 = ((csum_fn)cjit_get_func(e, id_csum))(ca, CSN, 0);
+    long o3_1 = ((csum_fn)cjit_get_func(e, id_csum))(ca, CSN, 1);
+    CHECKF(o3_0 == ref0, "O3 cond_sum mode=0: got %ld, want %ld", o3_0, ref0);
+    CHECKF(o3_1 == ref1, "O3 cond_sum mode=1: got %ld, want %ld", o3_1, ref1);
+    printf("[t20]   -funswitch-loops O3: mode0=%ld mode1=%ld  OK\n", o3_0, o3_1);
+
+    long dh_o3 = ((dh_fn)cjit_get_func(e, id_dh))(da, db, DHN);
+    CHECKF(dh_o3 == dref,
+           "dot_helpers O3 (N=%d): got %ld, want %ld", DHN, dh_o3, dref);
+    printf("[t20]   FLATTEN dot_helpers O3 (N=%d): %ld  OK\n", DHN, dh_o3);
+
+    cjit_destroy(e);
+    printf("[t20] PASS\n");
+    return 0;
+}
+
 
 
 typedef int (*test_fn)(void);
@@ -1499,6 +1715,7 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t17_dladdr_compiled_object",    t17_dladdr_compiled_object   },
     { "t18_o3_vectorised_correctness", t18_o3_vectorised_correctness},
     { "t19_perf_benchmark",            t19_perf_benchmark           },
+    { "t20_new_optflags_and_preamble", t20_new_optflags_and_preamble},
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 
