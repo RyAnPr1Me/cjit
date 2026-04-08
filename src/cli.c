@@ -146,8 +146,8 @@ int main(int argc, char *argv[])
      * extra_cflags accumulates space-separated flags collected from -I, -D,
      * -l, and -L options.  cc_binary holds the optional --cc override.
      */
-    char extra_cflags[512] = "";
-    char cc_binary[64]     = "";
+    char extra_cflags[CJIT_MAX_EXTRA_CFLAGS] = "";
+    char cc_binary[CJIT_MAX_CC_BINARY]        = "";
 
     /* Append a single flag token to extra_cflags (with leading space). */
     /* Returns false and prints an error on overflow. */
@@ -155,9 +155,9 @@ int main(int argc, char *argv[])
     size_t _cur = strlen(extra_cflags); \
     size_t _add = strlen(flag); \
     size_t _sep = (_cur > 0) ? 1u : 0u; /* space separator */ \
-    if (_cur + _sep + _add + 1 > sizeof(extra_cflags)) { \
-        fprintf(stderr, "cjit: too many compiler flags (limit %zu chars)\n", \
-                sizeof(extra_cflags) - 1); \
+    if (_cur + _sep + _add + 1 > CJIT_MAX_EXTRA_CFLAGS) { \
+        fprintf(stderr, "cjit: too many compiler flags (limit %d chars)\n", \
+                CJIT_MAX_EXTRA_CFLAGS - 1); \
         return 1; \
     } \
     if (_sep) extra_cflags[_cur++] = ' '; \
@@ -212,28 +212,28 @@ int main(int argc, char *argv[])
             /* -I<path> or -I <path> */
             const char *path = (a[2] != '\0') ? &a[2] : (++i < argc ? argv[i] : NULL);
             if (!path) { fprintf(stderr, "cjit: -I requires a path\n"); return 1; }
-            char flag[512];
+            char flag[CJIT_MAX_EXTRA_CFLAGS];
             snprintf(flag, sizeof(flag), "-I%s", path);
             APPEND_CFLAG(flag);
         } else if (strncmp(a, "-D", 2) == 0) {
             /* -D<macro> or -D <macro> */
             const char *def = (a[2] != '\0') ? &a[2] : (++i < argc ? argv[i] : NULL);
             if (!def) { fprintf(stderr, "cjit: -D requires a macro\n"); return 1; }
-            char flag[512];
+            char flag[CJIT_MAX_EXTRA_CFLAGS];
             snprintf(flag, sizeof(flag), "-D%s", def);
             APPEND_CFLAG(flag);
         } else if (strncmp(a, "-l", 2) == 0) {
             /* -l<lib> or -l <lib> */
             const char *lib = (a[2] != '\0') ? &a[2] : (++i < argc ? argv[i] : NULL);
             if (!lib) { fprintf(stderr, "cjit: -l requires a library name\n"); return 1; }
-            char flag[512];
+            char flag[CJIT_MAX_EXTRA_CFLAGS];
             snprintf(flag, sizeof(flag), "-l%s", lib);
             APPEND_CFLAG(flag);
         } else if (strncmp(a, "-L", 2) == 0) {
             /* -L<dir> or -L <dir> */
             const char *dir = (a[2] != '\0') ? &a[2] : (++i < argc ? argv[i] : NULL);
             if (!dir) { fprintf(stderr, "cjit: -L requires a directory\n"); return 1; }
-            char flag[512];
+            char flag[CJIT_MAX_EXTRA_CFLAGS];
             snprintf(flag, sizeof(flag), "-L%s", dir);
             APPEND_CFLAG(flag);
         } else if (a[0] == '-') {

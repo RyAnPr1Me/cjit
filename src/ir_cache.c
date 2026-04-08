@@ -726,7 +726,7 @@ bool ir_cache_update_ir(ir_lru_cache_t *cache,
                          const char     *func_name,
                          const char     *new_ir)
 {
-    (void)func_name;   /* func_name is embedded in the node at registration */
+    (void)func_name;   /* Reserved for future logging; name is in node->name */
     if (!cache || !new_ir || func_id >= cache->max_funcs) return false;
 
     ir_node_t *node = &cache->nodes[func_id];

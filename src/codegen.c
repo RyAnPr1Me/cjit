@@ -759,7 +759,7 @@ bool codegen_compile(const char          *func_name,
     /* Append extra_cflags tokens (e.g. -I/path, -DFOO, -lm).
      * strtok needs a mutable buffer; we copy into a local array on the stack.
      * Tokens point into this buffer so they are valid until after waitpid. */
-    char extra_flags_buf[512];
+    char extra_flags_buf[CJIT_MAX_EXTRA_CFLAGS];
     extra_flags_buf[0] = '\0';
     if (opts && opts->extra_cflags && opts->extra_cflags[0]) {
         strncpy(extra_flags_buf, opts->extra_cflags, sizeof(extra_flags_buf) - 1);

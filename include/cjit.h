@@ -75,6 +75,18 @@ extern "C" {
 #define CJIT_GRACE_PERIOD_MS    100
 
 /**
+ * Maximum length (including NUL) of the extra_cflags string in cjit_config_t.
+ * Used to size both the config field and CLI accumulation buffers so that all
+ * places that reference this limit stay in sync.
+ */
+#define CJIT_MAX_EXTRA_CFLAGS   512
+
+/**
+ * Maximum length (including NUL) of the cc_binary string in cjit_config_t.
+ */
+#define CJIT_MAX_CC_BINARY      64
+
+/**
  * Per-calling-thread TLS call-counter flush threshold.
  *
  * Each calling thread maintains a private per-function byte counter in
@@ -565,17 +577,19 @@ typedef struct {
      * Useful for -I include paths, -D preprocessor defines, -l libraries, etc.
      * Example: "-I/usr/local/include -DNDEBUG -lm"
      *
-     * Maximum length: 511 characters + NUL.
+     * Maximum length: CJIT_MAX_EXTRA_CFLAGS - 1 characters.
      */
-    char extra_cflags[512];
+    char extra_cflags[CJIT_MAX_EXTRA_CFLAGS];
 
     /**
      * Compiler binary override.
      *
      * Empty string (default) → "cc" found on PATH.
      * Set to e.g. "gcc", "clang", or an absolute path like "/usr/bin/gcc-14".
+     *
+     * Maximum length: CJIT_MAX_CC_BINARY - 1 characters.
      */
-    char cc_binary[64];
+    char cc_binary[CJIT_MAX_CC_BINARY];
 } cjit_config_t;
 
 /* ══════════════════════════════ runtime stats ═════════════════════════════ */
