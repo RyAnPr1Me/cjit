@@ -721,6 +721,61 @@ uint8_t ir_cache_get_generation(const ir_lru_cache_t *cache, func_id_t func_id)
     return cache->nodes[func_id].gen;
 }
 
+bool ir_cache_update_ir(ir_lru_cache_t *cache,
+                         func_id_t       func_id,
+                         const char     *func_name,
+                         const char     *new_ir)
+{
+    (void)func_name;   /* func_name is embedded in the node at registration */
+    if (!cache || !new_ir || func_id >= cache->max_funcs) return false;
+
+    ir_node_t *node = &cache->nodes[func_id];
+    if (!node->registered) return false;
+
+    /* Allocate the new heap copy outside the lock. */
+    char *new_copy = strdup(new_ir);
+    if (!new_copy) return false;
+
+    /* Write the updated IR to the on-disk backup (outside lock; I/O is slow). */
+    char disk_path[IRC_PATH_MAX];
+    node_disk_path(cache, node, disk_path, sizeof(disk_path));
+    if (irc_write_to_disk(disk_path, new_ir))
+        atomic_fetch_add_explicit(&cache->stat_disk_writes, 1, memory_order_relaxed);
+    else
+        fprintf(stderr, "[ir_cache] WARNING: cannot update IR on disk for func %u\n",
+                func_id);
+
+    pthread_mutex_lock(&cache->lock);
+
+    char *old_copy = node->ir_source;   /* may be NULL when COLD */
+
+    if (node->gen == IR_GEN_COLD) {
+        /*
+         * Promote the entry from COLD to WARM so the next compilation
+         * gets the new IR from memory rather than reading from disk.
+         */
+        make_room_in_warm(cache);
+        node->ir_source = new_copy;
+        node->gen = IR_GEN_WARM;
+        list_push_front(&cache->warm_head, &cache->warm_tail, node);
+        ++cache->warm_count;
+        --cache->cold_count;
+        atomic_fetch_add_explicit(&cache->stat_promotions, 1, memory_order_relaxed);
+        old_copy = NULL;   /* was NULL for COLD entries; nothing to free */
+    } else {
+        /* HOT or WARM: replace the in-memory IR string in-place. */
+        node->ir_source = new_copy;
+    }
+
+    node->access_cnt++;
+    node->last_access_ms = irc_now_ms();
+
+    pthread_mutex_unlock(&cache->lock);
+
+    free(old_copy);   /* free outside the lock; free(NULL) is safe */
+    return true;
+}
+
 mem_pressure_t ir_cache_get_pressure(const ir_lru_cache_t *cache)
 {
     if (!cache) return MEM_PRESSURE_NORMAL;

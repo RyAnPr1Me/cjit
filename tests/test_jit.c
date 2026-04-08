@@ -32,6 +32,13 @@
  *   t12  CRC32 tier progression        – CRC32 correctness verified at O1, O2,
  *                                        and O3 against the reference.
  *
+ *   t13  cjit_lookup_function       – lookup by name returns correct func_id;
+ *                                        unknown names return INVALID.
+ *   t14  cjit_update_ir (hot-reload) – hot-reload with new IR produces the
+ *                                        updated result after recompilation.
+ *   t15  extra_cflags (-D define)   – a -D flag in cfg.extra_cflags reaches
+ *                                        the compiler and affects JIT output.
+ *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).
  *
@@ -943,9 +950,148 @@ TEST(t12_crc32_tiers)
     return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Runner
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ─────────────────────────────────────────────────────────────────────────
+ * t13 – cjit_lookup_function
+ * ─────────────────────────────────────────────────────────────────────────
+ * Registers several functions and verifies that cjit_lookup_function()
+ * returns the correct func_id for each registered name and
+ * CJIT_INVALID_FUNC_ID for an unregistered name.
+ */
+TEST(t13_lookup_function)
+{
+    printf("[t13] cjit_lookup_function...\n");
+    cjit_engine_t *e = make_engine(false);
+    CHECK(e != NULL, "engine creation failed");
+
+    func_id_t id_add = cjit_register_function(e, "add", IR_ADD, (jit_func_t)aot_add);
+    func_id_t id_fib = cjit_register_function(e, "fib", IR_FIB, (jit_func_t)aot_fib);
+    func_id_t id_mul = cjit_register_function(e, "mul", IR_MUL, (jit_func_t)aot_mul);
+    CHECK(id_add != CJIT_INVALID_FUNC_ID, "add registration failed");
+    CHECK(id_fib != CJIT_INVALID_FUNC_ID, "fib registration failed");
+    CHECK(id_mul != CJIT_INVALID_FUNC_ID, "mul registration failed");
+
+    CHECK(cjit_lookup_function(e, "add") == id_add, "lookup 'add' returned wrong id");
+    CHECK(cjit_lookup_function(e, "fib") == id_fib, "lookup 'fib' returned wrong id");
+    CHECK(cjit_lookup_function(e, "mul") == id_mul, "lookup 'mul' returned wrong id");
+    CHECK(cjit_lookup_function(e, "nonexistent") == CJIT_INVALID_FUNC_ID,
+          "lookup of unregistered name should return INVALID");
+    CHECK(cjit_lookup_function(e, NULL) == CJIT_INVALID_FUNC_ID,
+          "lookup(NULL) should return INVALID");
+    CHECK(cjit_lookup_function(NULL, "add") == CJIT_INVALID_FUNC_ID,
+          "lookup(NULL engine) should return INVALID");
+
+    cjit_destroy(e);
+    printf("[t13] PASS\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * t14 – cjit_update_ir (hot-reload)
+ * ─────────────────────────────────────────────────────────────────────────
+ * Registers a function that returns a constant, waits for initial
+ * compilation, verifies the result, then hot-reloads it with new IR
+ * returning a different constant, waits for recompilation, and verifies
+ * the updated result.
+ */
+static const char IR_CONST1[] = "int get_val(void) { return 1001; }\n";
+static const char IR_CONST2[] = "int get_val(void) { return 2002; }\n";
+
+TEST(t14_update_ir)
+{
+    printf("[t14] cjit_update_ir (hot-reload)...\n");
+    cjit_engine_t *e = make_engine(false);
+    CHECK(e != NULL, "engine creation failed");
+
+    func_id_t id = cjit_register_function(e, "get_val", IR_CONST1, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "registration failed");
+
+    cjit_start(e);
+    cjit_request_recompile(e, id, OPT_O1);
+
+    /* Wait for first compilation. */
+    bool ok = cjit_wait_compiled(e, id, 5000);
+    CHECK(ok, "initial compilation timed out");
+
+    typedef int (*gv_fn)(void);
+    int v1 = ((gv_fn)cjit_get_func(e, id))();
+    CHECKF(v1 == 1001, "get_val() before update: got %d, want 1001", v1);
+
+    /* Hot-reload with new IR. */
+    CHECK(cjit_update_ir(e, id, IR_CONST2, OPT_O1), "cjit_update_ir failed");
+
+    /*
+     * After update the func_ptr was set by the first compile; it will be
+     * replaced by the new compile triggered by cjit_update_ir.  We wait
+     * until the recompile_count increases (= new binary installed).
+     */
+    uint32_t rc0 = cjit_get_recompile_count(e, id);
+    uint64_t deadline = now_ms() + 5000;
+    while (now_ms() < deadline &&
+           cjit_get_recompile_count(e, id) <= rc0)
+        sleep_ms(20);
+
+    CHECKF(cjit_get_recompile_count(e, id) > rc0,
+           "recompile_count did not increase after update (rc=%u)",
+           cjit_get_recompile_count(e, id));
+
+    int v2 = ((gv_fn)cjit_get_func(e, id))();
+    CHECKF(v2 == 2002, "get_val() after update: got %d, want 2002", v2);
+
+    cjit_destroy(e);
+    printf("[t14] PASS\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * t15 – extra_cflags / -D preprocessor define
+ * ─────────────────────────────────────────────────────────────────────────
+ * Passes a -D flag via cfg.extra_cflags so that a JIT function compiled
+ * against a macro-dependent constant produces the expected result.
+ */
+static const char IR_USE_DEFINE[] =
+    "int get_magic(void) {\n"
+    "#ifndef CJIT_MAGIC_VAL\n"
+    "    return 0;\n"
+    "#else\n"
+    "    return CJIT_MAGIC_VAL;\n"
+    "#endif\n"
+    "}\n";
+
+TEST(t15_extra_cflags)
+{
+    printf("[t15] extra_cflags (-D define)...\n");
+    cjit_config_t cfg        = cjit_default_config();
+    cfg.verbose              = false;
+    cfg.monitor_interval_ms  = 50;
+    cfg.hot_ir_cache_size    = 4;
+    cfg.warm_ir_cache_size   = 8;
+    /* Inject a preprocessor define via extra_cflags. */
+    strncpy(cfg.extra_cflags, "-DCJIT_MAGIC_VAL=7777",
+            sizeof(cfg.extra_cflags) - 1);
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e != NULL, "engine creation failed");
+
+    func_id_t id = cjit_register_function(e, "get_magic", IR_USE_DEFINE, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "registration failed");
+
+    cjit_start(e);
+    cjit_request_recompile(e, id, OPT_O1);
+
+    bool ok = cjit_wait_compiled(e, id, 5000);
+    CHECK(ok, "compilation with -D flag timed out");
+
+    typedef int (*gm_fn)(void);
+    int got = ((gm_fn)cjit_get_func(e, id))();
+    CHECKF(got == 7777,
+           "get_magic() with -DCJIT_MAGIC_VAL=7777: got %d, want 7777", got);
+
+    cjit_destroy(e);
+    printf("[t15] PASS\n");
+    return 0;
+}
+
+
 
 typedef int (*test_fn)(void);
 static const struct { const char *name; test_fn fn; } TESTS[] = {
@@ -961,6 +1107,9 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t10_concurrent_dispatch",t10_concurrent_dispatch},
     { "t11_sum_range",          t11_sum_range          },
     { "t12_crc32_tiers",        t12_crc32_tiers        },
+    { "t13_lookup_function",    t13_lookup_function    },
+    { "t14_update_ir",          t14_update_ir          },
+    { "t15_extra_cflags",       t15_extra_cflags       },
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 

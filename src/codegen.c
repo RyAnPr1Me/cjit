@@ -118,9 +118,10 @@ static const char CODEGEN_PREAMBLE[] =
  * JIT-specific flags (-fno-stack-protector, -fno-asynchronous-unwind-tables) +
  * -w + -o + so_path + -x + c + src_path + NULL = at most 22 entries.
  * When argument specialisation is active, two more entries are added
- * (-D <func=_cjit_i_func>).  40 gives comfortable headroom.
+ * (-D <func=_cjit_i_func>).  Extra user flags (extra_cflags) may add up to
+ * ~50 more tokens.  80 gives comfortable headroom.
  */
-#define MAX_CC_ARGS 40
+#define MAX_CC_ARGS 80
 
 /**
  * Build the compiler argv array for posix_spawnp().
@@ -136,7 +137,8 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
                                 const codegen_opts_t *opts)
 {
     int n = 0;
-    argv[n++] = "cc";
+    argv[n++] = (opts && opts->cc_binary && opts->cc_binary[0])
+                    ? opts->cc_binary : "cc";
     argv[n++] = "-shared";
     argv[n++] = "-fPIC";
 
@@ -752,16 +754,36 @@ bool codegen_compile(const char          *func_name,
     const char *cc_argv[MAX_CC_ARGS];
     char err_path[304];
     snprintf(err_path, sizeof(err_path), "%s.err", prefix);
-    build_compiler_argv(cc_argv, so_path, src_path, level, opts);
+    int n_argv = build_compiler_argv(cc_argv, so_path, src_path, level, opts);
 
-    if (opts->verbose) {
+    /* Append extra_cflags tokens (e.g. -I/path, -DFOO, -lm).
+     * strtok needs a mutable buffer; we copy into a local array on the stack.
+     * Tokens point into this buffer so they are valid until after waitpid. */
+    char extra_flags_buf[512];
+    extra_flags_buf[0] = '\0';
+    if (opts && opts->extra_cflags && opts->extra_cflags[0]) {
+        strncpy(extra_flags_buf, opts->extra_cflags, sizeof(extra_flags_buf) - 1);
+        extra_flags_buf[sizeof(extra_flags_buf) - 1] = '\0';
+        char *tok = strtok(extra_flags_buf, " \t");
+        while (tok && n_argv < MAX_CC_ARGS - 1) {
+            cc_argv[n_argv++] = tok;
+            tok = strtok(NULL, " \t");
+        }
+        cc_argv[n_argv] = NULL;
+    }
+
+    /* Determine which compiler binary to invoke. */
+    const char *cc_bin = (opts && opts->cc_binary && opts->cc_binary[0])
+                             ? opts->cc_binary : "cc";
+
+    if (opts && opts->verbose) {
         fprintf(stderr, "[cjit/codegen] compile:");
         for (int _i = 0; cc_argv[_i]; ++_i)
             fprintf(stderr, " %s", cc_argv[_i]);
         fprintf(stderr, " 2>%s\n", err_path);
     }
 
-    /* ── 4. Spawn the compiler (no shell intermediate) ────────────────── */
+    /* ── 5. Spawn the compiler (no shell intermediate) ────────────────── */
     /*
      * posix_spawnp avoids the /bin/sh intermediate step that system() requires
      * (fork → exec /bin/sh → exec cc → waitpid becomes fork → exec cc → waitpid).
@@ -776,14 +798,15 @@ bool codegen_compile(const char          *func_name,
                                      O_WRONLY | O_CREAT | O_TRUNC, 0600);
 
     pid_t cc_pid;
-    int spawn_err = posix_spawnp(&cc_pid, "cc", &fa, NULL,
+    int spawn_err = posix_spawnp(&cc_pid, cc_bin, &fa, NULL,
                                   (char *const *)cc_argv, environ);
     posix_spawn_file_actions_destroy(&fa);
 
     int rc;
     if (spawn_err != 0) {
         snprintf(result->errmsg, sizeof(result->errmsg),
-                 "codegen: posix_spawnp failed: %s", strerror(spawn_err));
+                 "codegen: posix_spawnp(%s) failed: %s", cc_bin,
+                 strerror(spawn_err));
         if (src_is_memfd) close(src_fd); else unlink(src_path);
         free(wrapper_src);
         return false;
@@ -800,16 +823,26 @@ bool codegen_compile(const char          *func_name,
     wrapper_src = NULL;
 
     if (rc != 0) {
-        /* Capture compiler error output from the per-invocation error file. */
+        /*
+         * Print the full compiler error output to stderr immediately so the
+         * user sees the complete diagnostics.  Additionally store up to
+         * sizeof(errmsg)-1 bytes in result->errmsg for the caller's log line.
+         */
         FILE *ef = fopen(err_path, "r");
         if (ef) {
+            /* Stream full output to stderr first. */
+            char line[256];
+            while (fgets(line, sizeof(line), ef))
+                fputs(line, stderr);
+            /* Rewind and store first chunk in errmsg for structured logging. */
+            rewind(ef);
             size_t nr = fread(result->errmsg,
                               1, sizeof(result->errmsg) - 1, ef);
             result->errmsg[nr] = '\0';
             fclose(ef);
         } else {
             snprintf(result->errmsg, sizeof(result->errmsg),
-                     "codegen: cc exited with code %d", rc);
+                     "codegen: %s exited with error %d", cc_bin, rc);
         }
         unlink(err_path);
         unlink(so_path);

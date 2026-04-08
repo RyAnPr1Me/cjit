@@ -91,7 +91,7 @@ typedef struct {
     jit_func_t  fn;        /**< Pointer to the compiled function (NULL on err). */
     void       *handle;    /**< dlopen handle; pass to dgc_retire() when done.  */
     bool        success;   /**< True iff compilation succeeded.                 */
-    char        errmsg[512]; /**< Human-readable error message on failure.      */
+    char        errmsg[4096]; /**< Human-readable error message on failure.     */
 } codegen_result_t;
 
 /**
@@ -117,6 +117,21 @@ typedef struct {
      * NULL (the default) disables argument specialisation entirely.
      */
     const cjit_arg_profile_t  *arg_profile;
+
+    /**
+     * Extra compiler flags passed verbatim after all CJIT-generated flags.
+     *
+     * Space-separated tokens; may contain -I, -D, -l, -L, etc.
+     * NULL or empty string → no extra flags.
+     */
+    const char *extra_cflags;
+
+    /**
+     * Compiler binary name or absolute path.
+     *
+     * NULL or empty string → "cc" found on PATH.
+     */
+    const char *cc_binary;
 } codegen_opts_t;
 
 /* ─────────────────────────── API ───────────────────────────────────────────── */
