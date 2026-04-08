@@ -109,9 +109,11 @@ static const char CODEGEN_PREAMBLE[] =
     /*
      * CJIT_EXPORT: explicitly marks a symbol as having default (exported)
      * visibility so it remains accessible via dlsym() even when the
-     * translation unit is compiled with -fvisibility=hidden.  Apply to the
-     * entry-point function of any JIT IR that also contains internal helpers
-     * you want to keep private (i.e. hidden from the dynamic symbol table).
+     * translation unit is compiled with -fvisibility=hidden.  Without that
+     * flag all symbols have default visibility anyway, so CJIT_EXPORT is a
+     * no-op in normal builds.  It becomes useful when user IR passes
+     * -fvisibility=hidden via cfg.extra_cflags to hide internal helpers and
+     * only export the specific entry-point function the engine looks up.
      */
     "#  define CJIT_EXPORT                __attribute__((visibility(\"default\")))\n"
     /*
@@ -243,7 +245,8 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
          *   (b) We use RTLD_LOCAL so there is no inter-.so PLT sharing.
          *
          * Linux/ELF only.  Mach-O (macOS) uses a different ABI and does
-         * not recognise this flag.
+         * not recognise this flag.  On non-Linux platforms the `#ifdef`
+         * simply skips it — no error, just the optimisation is omitted.
          */
         argv[n++] = "-fno-plt";
 #endif

@@ -1711,10 +1711,10 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t13_lookup_function",    t13_lookup_function    },
     { "t14_update_ir",          t14_update_ir          },
     { "t15_extra_cflags",       t15_extra_cflags       },
-    { "t16_jit_replaces_aot",          t16_jit_replaces_aot         },
-    { "t17_dladdr_compiled_object",    t17_dladdr_compiled_object   },
+    { "t16_jit_replaces_aot",       t16_jit_replaces_aot         },
+    { "t17_dladdr_compiled_object", t17_dladdr_compiled_object   },
     { "t18_o3_vectorised_correctness", t18_o3_vectorised_correctness},
-    { "t19_perf_benchmark",            t19_perf_benchmark           },
+    { "t19_perf_benchmark",         t19_perf_benchmark           },
     { "t20_new_optflags_and_preamble", t20_new_optflags_and_preamble},
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
