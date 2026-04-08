@@ -1823,6 +1823,175 @@ TEST(t21_artifact_cache)
     return 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t22 – Priority queue: manual recompile task goes through priority lane
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Verifies that cjit_request_recompile() (priority 3) routes through the
+ * priority lane and is correctly processed by the compiler thread.
+ * The test exercises the two-level queue indirectly:
+ *   1. Registers a function WITHOUT an AOT fallback (func_ptr starts NULL).
+ *   2. Calls cjit_request_recompile() with OPT_O2 → priority = 3 → prio queue.
+ *   3. Waits for compilation.
+ *   4. Verifies correctness, compilation count, and prio_queue_depth = 0 after.
+ *   5. Issues a second request (OPT_O3) and verifies the upgrade also completes.
+ */
+TEST(t22_priority_queue)
+{
+    printf("[t22] Priority queue: manual requests use fast lane...\n");
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads = 1;
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e != NULL, "engine creation failed");
+    cjit_start(e);
+
+    /* Register without AOT fallback so wait_compiled actually waits. */
+    func_id_t id = cjit_register_function(e, "add", IR_ADD, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "register failed");
+
+    /* First manual request → priority 3 → priority queue (lane 1). */
+    cjit_request_recompile(e, id, OPT_O2);
+    bool ok = cjit_wait_compiled(e, id, 5000);
+    CHECK(ok, "first manual compile timed out");
+
+    cjit_stats_t s = cjit_get_stats(e);
+    CHECKF(s.total_compilations == 1,
+           "expected 1 compilation after first request, got %llu",
+           (unsigned long long)s.total_compilations);
+    CHECKF(s.prio_queue_depth == 0,
+           "priority queue not empty after compile: depth=%u", s.prio_queue_depth);
+    CHECKF(cjit_get_current_opt_level(e, id) == OPT_O2,
+           "opt level should be O2 after first request, got %d",
+           (int)cjit_get_current_opt_level(e, id));
+
+    typedef int (*add_fn)(int, int);
+    add_fn fn = (add_fn)(uintptr_t)cjit_get_func_counted(e, id);
+    CHECK(fn != NULL, "function pointer NULL after O2");
+    CHECKF(fn(10, 20) == 30, "add(10,20) expected 30, got %d", fn(10, 20));
+    printf("[t22]   O2 compile: compilations=%llu prio_q_depth=%u  OK\n",
+           (unsigned long long)s.total_compilations, s.prio_queue_depth);
+
+    /* Second manual request → OPT_O3, also priority 3. */
+    cjit_request_recompile(e, id, OPT_O3);
+    /*
+     * cjit_wait_compiled() returns as soon as func_ptr != NULL — which it
+     * already is from the O2 compile.  Use wait_for(check_opt, …) instead,
+     * which polls until the opt-level has actually reached OPT_O3.
+     */
+    wait_arg_t wa3 = { e, id, OPT_O3 };
+    bool ok3 = wait_for(check_opt, &wa3, 5000);
+    CHECK(ok3, "second manual compile (O3) timed out");
+
+    s = cjit_get_stats(e);
+    CHECKF(s.total_compilations == 2,
+           "expected 2 total compilations after O3 upgrade, got %llu",
+           (unsigned long long)s.total_compilations);
+    CHECKF(cjit_get_current_opt_level(e, id) == OPT_O3,
+           "opt level should be O3 after second request, got %d",
+           (int)cjit_get_current_opt_level(e, id));
+
+    /* Reuse the add_fn typedef declared above. */
+    add_fn fn3 = (add_fn)(uintptr_t)cjit_get_func_counted(e, id);
+    CHECK(fn3 != NULL, "function pointer NULL after O3");
+    CHECKF(fn3(-5, 5) == 0, "add(-5,5) expected 0, got %d", fn3(-5, 5));
+    printf("[t22]   O3 upgrade:  compilations=%llu prio_q_depth=%u  OK\n",
+           (unsigned long long)s.total_compilations, s.prio_queue_depth);
+
+    cjit_destroy(e);
+    printf("[t22] PASS\n");
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t23 – Tier-skip: direct O0→O3 when call rate exceeds the skip threshold
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Configure a low hot_rate_t2 and tier_skip_multiplier = 0.5 (skip when
+ * rate ≥ hot_rate_t2 × 0.5 = hot_rate_t1 × 0.5, which is below t2 but
+ * above t1 — this exercises the skip path without needing a huge call rate).
+ *
+ * Strategy:
+ *   1. Configure: hot_rate_t1=100, hot_rate_t2=200, tier_skip_multiplier=0.5
+ *      → skip fires when rate ≥ 200 × 0.5 = 100 calls/sec.
+ *   2. Register a function with no AOT fallback.
+ *   3. Drive it at a rate well above the skip threshold.
+ *   4. Wait for compilation.
+ *   5. Verify the function ended up at OPT_O3 (skip fired) and
+ *      stats.tier_skips == 1.
+ *   6. Verify result correctness at O3.
+ */
+TEST(t23_tier_skip)
+{
+    printf("[t23] Tier-skip: O0→O3 direct promotion for explosively hot function...\n");
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads = 1;
+    cfg.hot_rate_t1           = 100;   /* 100 calls/sec = T1 */
+    cfg.hot_rate_t2           = 200;   /* 200 calls/sec = T2 */
+    cfg.tier_skip_multiplier  = 0.5f;  /* skip when rate ≥ 200 × 0.5 = 100 */
+    cfg.hot_confirm_cycles    = 1;     /* confirm after 1 cycle */
+    cfg.monitor_interval_ms   = 25;    /* fast monitor for test speed */
+    cfg.min_uptime_for_tier2_ms = 0;   /* no uptime gate */
+    cfg.compile_cooloff_ms    = 0;
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e != NULL, "engine creation failed");
+    cjit_start(e);
+
+    /* Register WITHOUT AOT fallback so wait_compiled blocks on JIT. */
+    func_id_t id = cjit_register_function(e, "add", IR_ADD, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "register failed");
+
+    /*
+     * Drive the function at a rate well above the skip threshold (100 cps).
+     * We call it in a tight loop for 300 ms.  At ≥100 calls in 300 ms that
+     * is ≥333 calls/sec, comfortably above the 100 cps skip threshold.
+     */
+    uint64_t deadline = (uint64_t)clock() * 1000ULL / (uint64_t)CLOCKS_PER_SEC
+                        + 300ULL;
+    volatile int sink = 0;
+    while ((uint64_t)clock() * 1000ULL / (uint64_t)CLOCKS_PER_SEC < deadline) {
+        /* Use the AOT fallback directly for counting (no JIT yet). */
+        sink += aot_add(1, 2);
+        /* Manually advance the call counter so the monitor sees the rate. */
+        cjit_get_func_counted(e, id); /* increments call_cnt via hot-path */
+    }
+    (void)sink;
+
+    /* Wait for the tier-skip promotion to compile at O3 (up to 5 s). */
+    bool ok = cjit_wait_compiled(e, id, 5000);
+    CHECK(ok, "tier-skip compilation timed out (no compilation in 5 s)");
+
+    cjit_stats_t s = cjit_get_stats(e);
+    opt_level_t lvl = cjit_get_current_opt_level(e, id);
+
+    CHECKF(lvl == OPT_O3,
+           "tier-skip: expected OPT_O3, got O%d", (int)lvl);
+    CHECKF(s.tier_skips >= 1,
+           "tier-skip stat should be ≥1, got %llu",
+           (unsigned long long)s.tier_skips);
+    /* Only one compilation should have happened (the O3 skip, no O2 step). */
+    CHECKF(s.total_compilations == 1,
+           "tier-skip: expected 1 compilation (no intermediate O2), got %llu",
+           (unsigned long long)s.total_compilations);
+
+    typedef int (*add_fn)(int, int);
+    add_fn fn = (add_fn)(uintptr_t)cjit_get_func_counted(e, id);
+    CHECK(fn != NULL, "function pointer NULL after tier-skip O3");
+    CHECKF(fn(7, 8) == 15, "add(7,8) expected 15, got %d", fn(7, 8));
+
+    printf("[t23]   lvl=O%d tier_skips=%llu compilations=%llu  OK\n",
+           (int)lvl,
+           (unsigned long long)s.tier_skips,
+           (unsigned long long)s.total_compilations);
+
+    cjit_destroy(e);
+    printf("[t23] PASS\n");
+    return 0;
+}
+
 
 typedef int (*test_fn)(void);
 static const struct { const char *name; test_fn fn; } TESTS[] = {
@@ -1847,6 +2016,8 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t19_perf_benchmark",         t19_perf_benchmark           },
     { "t20_new_optflags_and_preamble", t20_new_optflags_and_preamble},
     { "t21_artifact_cache",         t21_artifact_cache           },
+    { "t22_priority_queue",         t22_priority_queue           },
+    { "t23_tier_skip",              t23_tier_skip                },
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 

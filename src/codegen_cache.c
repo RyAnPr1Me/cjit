@@ -235,8 +235,9 @@ bool codegen_cache_store(codegen_cache_t *c, uint64_t key, const char *so_path)
          * rename within the cache dir (same device → atomic).
          */
         char tmp[CC_PATH_MAX + 32];
-        snprintf(tmp, sizeof(tmp), "%s/.tmp_%016llx_%d.so",
-                 c->dir, (unsigned long long)key, (int)getpid());
+        snprintf(tmp, sizeof(tmp), "%s/.tmp_%016llx_%d_%lu.so",
+                 c->dir, (unsigned long long)key, (int)getpid(),
+                 (unsigned long)pthread_self());
 
         if (!cc_copy_file(so_path, tmp)) {
             /* Copy failed; keep so_path intact for the caller to unlink. */

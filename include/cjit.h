@@ -535,6 +535,64 @@ typedef struct {
      */
     uint32_t extra_streak_per_recompile;
 
+    /* ── Tier-skip optimization ─────────────────────────────────────────── */
+
+    /**
+     * Call-rate multiplier that triggers a direct O0→O3 tier-skip.
+     *
+     * When a function that has never been compiled reaches a call rate of
+     * (hot_rate_t2 × tier_skip_multiplier), the monitor issues a direct
+     * OPT_O3 compilation request, skipping the intermediate OPT_O2 tier
+     * entirely.  This halves the number of compiler invocations for
+     * explosively hot functions (e.g., a newly-called tight inner loop
+     * that immediately dominates the workload).
+     *
+     * Semantics:
+     *   0.0  – disabled (default).  All functions must pass through O2 first.
+     *   1.0  – skip to O3 whenever rate ≥ hot_rate_t2  (even on first call-burst).
+     *   2.0  – skip to O3 whenever rate ≥ 2 × hot_rate_t2  (conservative).
+     *
+     * The same hot_confirm_cycles stability gate applies — the function must
+     * sustain the multiplied rate for hot_confirm_cycles consecutive scans
+     * before the skip promotion fires.
+     *
+     * Default: 0.0f (disabled, backward-compatible).
+     */
+    float tier_skip_multiplier;
+
+    /* ── Predictive EMA-slope promotion ─────────────────────────────────── */
+
+    /**
+     * Forward-look horizon (in monitor-scan cycles) for predictive promotion.
+     *
+     * When non-zero the monitor estimates the call rate
+     * (prediction_lookahead_cycles) scan-cycles into the future using a
+     * first-order linear extrapolation of the EMA slope:
+     *
+     *   predicted_rate = ema_rate + slope × prediction_lookahead_cycles
+     *
+     * where `slope` is the per-scan delta of the EMA (new_ema − old_ema).
+     * The predicted rate is compared against the tier threshold instead of
+     * the raw EMA; this fires the tier promotion earlier when the call rate
+     * is visibly trending upward.
+     *
+     * Typical benefit: during application startup, functions ramp up quickly.
+     * The EMA takes hot_confirm_cycles cycles to confirm steady hotness; with
+     * a lookahead the engine "bets" on the trend and promotes one to three
+     * scan cycles earlier.  This reduces the first-compile latency for
+     * fast-ramping functions from (hot_confirm_cycles × interval_ms) to
+     * roughly half of that when the rate is doubling each cycle.
+     *
+     * The feature interacts correctly with all other gates (cooloff, uptime,
+     * min_calls, recompile cap): if any other gate would block the promotion,
+     * the extrapolated rate does not override it.
+     *
+     * 0  – disabled (default, backward-compatible).
+     * 2  – look two scan cycles ahead (recommended starting point).
+     * 5  – aggressive; may cause premature promotions under transient spikes.
+     */
+    uint32_t prediction_lookahead_cycles;
+
     /* ── CPU-time-based tier promotion ─────────────────────────────────── */
 
     /**
@@ -628,6 +686,7 @@ typedef struct {
     uint64_t retired_handles;       /**< Total handles enqueued for deferred GC.*/
     uint64_t freed_handles;         /**< Total handles already freed.           */
     uint32_t queue_depth;           /**< Current depth of the compile queue.    */
+    uint32_t prio_queue_depth;      /**< Current depth of the priority queue.   */
 
     /**
      * Highest recompile_count seen across all registered functions.
@@ -636,6 +695,10 @@ typedef struct {
      * the scaled thresholds are having the desired effect.
      */
     uint32_t max_recompile_count;   /**< Highest per-function recompile count.  */
+
+    /* ── Tier-skip and predictive promotion ────────────────────────────── */
+    uint64_t tier_skips;            /**< Direct O0→O3 skips (tier_skip_multiplier). */
+    uint64_t predictive_promotions; /**< Promotions triggered by slope lookahead.   */
 
     /* ── Compiled-artifact cache ──────────────────────────────────────── */
     uint64_t artifact_cache_hits;   /**< Compilations skipped via cache hit.    */

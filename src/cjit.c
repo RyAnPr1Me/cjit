@@ -219,18 +219,23 @@ struct cjit_engine {
     codegen_cache_t *artifact_cache;
 
     /*
-     * Per-compiler-thread work queues.
+     * Per-compiler-thread work queues (2 per thread).
      *
-     * Heap-allocated array of cfg.compiler_threads MPMC queues.  Tasks are
-     * routed by (func_id % num_threads) so the same function always lands on
-     * the same queue.  This gives each function compile_lock affinity to one
-     * thread, eliminating cross-thread trylock contention in the common case.
+     * Layout: work_queues[2 × thread_idx + lane]
+     *   lane 0 = normal queue   (priority 1 — background monitoring promotions)
+     *   lane 1 = priority queue (priority ≥ 2 — T2 upgrades, manual requests)
      *
-     * Each queue has exactly ONE consumer (its owning thread).  A thread whose
-     * queue is empty steals from the next queue in round-robin order before
-     * sleeping on the shared condition variable.
+     * A compiler thread always drains its own priority queue first, then its
+     * normal queue.  Work-stealing first targets priority queues of idle peers
+     * (to get urgent tasks done as fast as possible), then normal queues.
+     *
+     * Using two separate queues instead of a sorted queue preserves the O(1)
+     * lock-free MPMC properties of the underlying Vyukov ring-buffer: there is
+     * no reordering or search, just two FIFO queues with a fixed priority rule.
+     *
+     * Total memory: 2 × cfg.compiler_threads × sizeof(mpmc_queue_t).
      */
-    mpmc_queue_t   *work_queues;   /* [0 .. cfg.compiler_threads) */
+    mpmc_queue_t   *work_queues;   /* [2 × cfg.compiler_threads]: [0]=normal [1]=prio */
 
     /*
      * Shared condition variable.
@@ -282,6 +287,8 @@ struct cjit_engine {
     atomic_uint_fast64_t stat_compilations;
     atomic_uint_fast64_t stat_failed;
     atomic_uint_fast64_t stat_swaps;
+    atomic_uint_fast64_t stat_tier_skips;        /**< O0→O3 tier-skip promotions. */
+    atomic_uint_fast64_t stat_predictive_promos; /**< Slope-lookahead early promotions. */
 
     /*
      * Condition variable signaled after every compilation attempt (success or
@@ -316,6 +323,10 @@ static uint64_t engine_now_ms(void)
  * acquired by the same thread, eliminating cross-thread trylock contention
  * in the common case.
  *
+ * Two-level priority:
+ *   priority >= 2 → priority queue (lane 1): T2 upgrades, manual requests.
+ *   priority  < 2 → normal queue   (lane 0): background monitoring promotions.
+ *
  * The condvar signal is sent inside a brief mutex section so no wake-up can
  * be lost (see engine struct comment for the full protocol).
  *
@@ -326,7 +337,8 @@ static bool engine_enqueue_task(cjit_engine_t *engine,
 {
     uint32_t n      = engine->cfg.compiler_threads;
     uint32_t target = task->func_id % n;
-    bool ok = mpmc_enqueue(&engine->work_queues[target], task);
+    uint32_t lane   = (task->priority >= 2) ? 1u : 0u;
+    bool ok = mpmc_enqueue(&engine->work_queues[2 * target + lane], task);
     if (ok) {
         pthread_mutex_lock(&engine->work_cond_mutex);
         pthread_cond_signal(&engine->work_cond);
@@ -376,14 +388,42 @@ static void *compiler_thread_fn(void *raw_arg)
 
     while (!atomic_load_explicit(&engine->stop_requested, memory_order_acquire)) {
 
-        /* Step 1: own queue – no peer contention. */
+        /*
+         * Two-level dequeue: always drain the priority queue first.
+         *
+         * Step 1a: own priority queue (lane 1) — T2 upgrades, manual requests.
+         * Step 1b: own normal queue   (lane 0) — background monitoring.
+         * Step 2a: steal priority queues from neighbours (urgent tasks get
+         *          processed as fast as possible, across threads if needed).
+         * Step 2b: steal normal queues from neighbours (load balancing).
+         * Step 3:  all queues empty — block on condvar.
+         */
         compile_task_t task;
-        bool got = mpmc_dequeue(&engine->work_queues[me], &task);
+        bool got;
 
-        /* Step 2: work-steal from neighbours round-robin. */
+        /* Step 1a: own priority queue. */
+        got = mpmc_dequeue(&engine->work_queues[2 * me + 1], &task);
+
+        /* Step 1b: own normal queue. */
+        if (!got)
+            got = mpmc_dequeue(&engine->work_queues[2 * me + 0], &task);
+
+        /* Step 2a: work-steal priority queues round-robin. */
         if (!got) {
             for (uint32_t i = 1; i < n; ++i) {
-                if (mpmc_dequeue(&engine->work_queues[(me + i) % n], &task)) {
+                uint32_t peer = (me + i) % n;
+                if (mpmc_dequeue(&engine->work_queues[2 * peer + 1], &task)) {
+                    got = true;
+                    break;
+                }
+            }
+        }
+
+        /* Step 2b: work-steal normal queues round-robin. */
+        if (!got) {
+            for (uint32_t i = 1; i < n; ++i) {
+                uint32_t peer = (me + i) % n;
+                if (mpmc_dequeue(&engine->work_queues[2 * peer + 0], &task)) {
                     got = true;
                     break;
                 }
@@ -398,7 +438,7 @@ static void *compiler_thread_fn(void *raw_arg)
              * that arrived after the steal loop above but before the lock.
              */
             bool any = false;
-            for (uint32_t i = 0; i < n && !any; ++i)
+            for (uint32_t i = 0; i < 2 * n && !any; ++i)
                 any = (mpmc_size(&engine->work_queues[i]) > 0);
             if (!any && !atomic_load_explicit(&engine->stop_requested,
                                               memory_order_relaxed))
@@ -462,9 +502,10 @@ static void *compiler_thread_fn(void *raw_arg)
                     &entry->in_queue, &exp, true,
                     memory_order_relaxed, memory_order_relaxed)) {
                 /* We reclaimed the slot; re-enqueue to the affinity queue.
-                 * Routing uses (func_id % n), identical to engine_enqueue_task,
-                 * so tasks for the same function always land on the same queue. */
-                if (!mpmc_enqueue(&engine->work_queues[task.func_id % n], &task)) {
+                 * Use the same priority-lane routing as engine_enqueue_task. */
+                uint32_t lane = (task.priority >= 2) ? 1u : 0u;
+                if (!mpmc_enqueue(&engine->work_queues[2 * (task.func_id % n) + lane],
+                                  &task)) {
                     /* Queue full: clear in_queue so future enqueues can proceed. */
                     atomic_store_explicit(&entry->in_queue, false,
                                           memory_order_relaxed);
@@ -631,6 +672,7 @@ static void *monitor_thread_fn(void *arg)
      *   [uint64_t × max_funcs] last_queued_ms
      *   [uint64_t × max_funcs] prev_elapsed       ← nanosecond baseline
      *   [float    × max_funcs] ema_rate
+     *   [float    × max_funcs] prev_ema_rate       ← for slope extrapolation
      *   [float    × max_funcs] ema_ns_per_sec      ← CPU-time EMA (ns/s)
      *   [uint32_t × max_funcs] hot_scan_streak
      *   [bool     × max_funcs] prefetch_done
@@ -642,24 +684,30 @@ static void *monitor_thread_fn(void *arg)
      * This ensures each successive recompile requires a proportionally
      * longer observation window, preventing promotions based on
      * insufficient or transient data.
+     *
+     * prev_ema_rate[i] holds the EMA value from the previous scan cycle.
+     * The per-cycle delta (ema_rate[i] - prev_ema_rate[i]) is the "slope"
+     * used for predictive promotion lookahead.
      */
     size_t monitor_block_sz =
-        (size_t)max_funcs * (4 * sizeof(uint64_t) + 2 * sizeof(float)
-                             + sizeof(uint32_t) + sizeof(bool));
+        (size_t)max_funcs * (4 * sizeof(uint64_t) + 3 * sizeof(float)
+                             + sizeof(uint32_t) + 2 * sizeof(bool));
     void *monitor_block = calloc(1, monitor_block_sz);
     if (!monitor_block) {
         fprintf(stderr, "[cjit/monitor] FATAL: cannot allocate monitor state (%zu B)\n", monitor_block_sz);
         return NULL;
     }
 
-    uint64_t *prev_cnt        = (uint64_t *)monitor_block;
-    uint64_t *cnt_at_compile  = prev_cnt        + max_funcs;
-    uint64_t *last_queued_ms  = cnt_at_compile  + max_funcs;
-    uint64_t *prev_elapsed    = last_queued_ms  + max_funcs;
-    float    *ema_rate        = (float   *)(void *)(prev_elapsed    + max_funcs);
-    float    *ema_ns_per_sec  = (float   *)(void *)(ema_rate        + max_funcs);
-    uint32_t *hot_scan_streak = (uint32_t *)(void *)(ema_ns_per_sec + max_funcs);
-    bool     *prefetch_done   = (bool    *)(void *)(hot_scan_streak + max_funcs);
+    uint64_t *prev_cnt          = (uint64_t *)monitor_block;
+    uint64_t *cnt_at_compile    = prev_cnt          + max_funcs;
+    uint64_t *last_queued_ms    = cnt_at_compile    + max_funcs;
+    uint64_t *prev_elapsed      = last_queued_ms    + max_funcs;
+    float    *ema_rate          = (float   *)(void *)(prev_elapsed      + max_funcs);
+    float    *prev_ema_rate     = (float   *)(void *)(ema_rate          + max_funcs);
+    float    *ema_ns_per_sec    = (float   *)(void *)(prev_ema_rate     + max_funcs);
+    uint32_t *hot_scan_streak   = (uint32_t *)(void *)(ema_ns_per_sec   + max_funcs);
+    bool     *prefetch_done     = (bool    *)(void *)(hot_scan_streak   + max_funcs);
+    bool     *tier_skip_pending = (bool    *)(void *)(prefetch_done     + max_funcs);
 
     struct timespec interval;
     interval.tv_sec  = itvl_ms / 1000;
@@ -698,7 +746,25 @@ static void *monitor_thread_fn(void *arg)
             if (delta > (uint64_t)1000000000000ULL)
                 delta = (uint64_t)1000000000000ULL;
             uint64_t inst_rate = delta * 1000ULL / itvl_safe;  /* calls/sec */
-            ema_rate[i] = ema_rate[i] + alpha * ((float)inst_rate - ema_rate[i]);
+
+            /*
+             * Update EMA and track the per-scan slope for predictive promotion.
+             *
+             * slope = new_ema − old_ema  (calls/sec gained per scan cycle)
+             *
+             * A positive slope means the call rate is currently rising.  The
+             * predictive promotion feature extrapolates:
+             *
+             *   predicted_rate = ema_rate + slope × lookahead_cycles
+             *
+             * and uses predicted_rate for threshold comparisons instead of the
+             * raw EMA.  This fires promotions earlier when the rate is trending
+             * upward, reducing first-compile latency during fast-ramp workloads.
+             */
+            float old_ema   = ema_rate[i];
+            ema_rate[i]     = old_ema + alpha * ((float)inst_rate - old_ema);
+            float ema_slope = ema_rate[i] - prev_ema_rate[i];
+            prev_ema_rate[i] = ema_rate[i];
 
             /*
              * Update the CPU-time EMA (nanoseconds/second).
@@ -725,7 +791,11 @@ static void *monitor_thread_fn(void *arg)
                                                    memory_order_relaxed);
 
             /* Already at maximum tier. */
-            if (cur_level >= OPT_O3) continue;
+            if (cur_level >= OPT_O3) {
+                /* Clear pending flag once the skip target has been reached. */
+                tier_skip_pending[i] = false;
+                continue;
+            }
 
             /* ── Warm-up prefetch (one-shot, non-blocking) ─────────────── */
             if (!prefetch_done[i] && engine->ir_cache &&
@@ -734,6 +804,90 @@ static void *monitor_thread_fn(void *arg)
                     == IRC_GEN_COLD) {
                 if (ir_cache_prefetch(engine->ir_cache, (func_id_t)i))
                     prefetch_done[i] = true;
+            }
+
+            /* ── Tier-skip optimization ─────────────────────────────────── */
+            /*
+             * When tier_skip_multiplier > 0 and the function has not yet
+             * been compiled, check whether the call rate already exceeds
+             * (hot_rate_t2 × multiplier).  If so, issue an OPT_O3 task
+             * directly (skip the intermediate OPT_O2 tier), saving one
+             * complete compiler invocation.
+             *
+             * The same hot_confirm_cycles gate applies, so the function must
+             * sustain the elevated rate for the full streak before the skip
+             * fires — transient spikes do not trigger this path.
+             *
+             * When this path fires the normal T1/T2 gate below is skipped.
+             */
+            if (engine->cfg.tier_skip_multiplier > 0.0f &&
+                cur_level < OPT_O2 &&
+                !tier_skip_pending[i]) {
+                float skip_thresh =
+                    (float)engine->cfg.hot_rate_t2 * engine->cfg.tier_skip_multiplier;
+                if (ema_rate[i] >= skip_thresh) {
+                    /* Reload streak and recompile cap. */
+                    uint32_t rc_skip = atomic_load_explicit(&entry->recompile_count,
+                                                             memory_order_relaxed);
+                    if (rc_skip < engine->cfg.max_recompiles_per_func) {
+                        uint32_t req_streak = engine->cfg.hot_confirm_cycles
+                            + rc_skip * engine->cfg.extra_streak_per_recompile;
+                        hot_scan_streak[i]++;
+                        if (hot_scan_streak[i] >= req_streak) {
+                            uint64_t now2 = engine_now_ms();
+                            uint32_t last_dur =
+                                atomic_load_explicit(&entry->last_compile_duration_ms,
+                                                     memory_order_relaxed);
+                            uint64_t eff_cooloff =
+                                engine->cfg.compile_cooloff_ms > 2 * last_dur
+                                    ? engine->cfg.compile_cooloff_ms
+                                    : 2 * (uint64_t)last_dur;
+                            if ((now2 - last_queued_ms[i]) >= eff_cooloff) {
+                                uint32_t ver =
+                                    atomic_load_explicit(&entry->version,
+                                                          memory_order_relaxed);
+                                bool already =
+                                    atomic_load_explicit(&entry->in_queue,
+                                                          memory_order_relaxed);
+                                if (!already) {
+                                    bool exp2 = false;
+                                    if (atomic_compare_exchange_strong_explicit(
+                                            &entry->in_queue, &exp2, true,
+                                            memory_order_relaxed,
+                                            memory_order_relaxed)) {
+                                        compile_task_t task = {
+                                            .func_id      = (func_id_t)i,
+                                            .target_level = OPT_O3,
+                                            .priority     = 2,
+                                            .version_req  = ver,
+                                            .call_rate    = (uint64_t)ema_rate[i],
+                                        };
+                                        if (engine_enqueue_task(engine, &task)) {
+                                            last_queued_ms[i]   = now2;
+                                            cnt_at_compile[i]   = cur_cnt;
+                                            hot_scan_streak[i]  = 0;
+                                            tier_skip_pending[i] = true;
+                                            atomic_fetch_add_explicit(
+                                                &engine->stat_tier_skips, 1,
+                                                memory_order_relaxed);
+                                            if (engine->cfg.verbose)
+                                                fprintf(stderr,
+                                                    "[cjit/monitor] tier-skip '%s' → O3"
+                                                    " (rate=%.0f skip_thresh=%.0f)\n",
+                                                    entry->name,
+                                                    (double)ema_rate[i],
+                                                    (double)skip_thresh);
+                                            continue;
+                                        }
+                                        atomic_store_explicit(&entry->in_queue, false,
+                                                              memory_order_relaxed);
+                                    }
+                                }
+                            }
+                        }
+                        continue; /* handled by tier-skip path; skip normal gate */
+                    }
+                }
             }
 
             /* ── Tier promotion gate ────────────────────────────────────── */
@@ -822,8 +976,35 @@ static void *monitor_thread_fn(void *arg)
             bool ns_hot   = (scaled_ns_thresh > 0 &&
                              (uint64_t)ema_ns_per_sec[i] >= scaled_ns_thresh);
 
+            /*
+             * Predictive promotion: if the call-rate EMA has been rising
+             * (positive slope) and prediction_lookahead_cycles > 0, extrapolate
+             * the rate forward to see if it will cross the threshold within the
+             * lookahead window.  A positive prediction triggers a "predictive
+             * hot" condition that counts toward the streak even if the raw EMA
+             * has not yet reached the threshold.
+             *
+             * We clamp the slope contribution to the threshold value to prevent
+             * a single extreme spike from masking as a sustained trend.
+             *
+             * The counter stat_predictive_promos is incremented only when the
+             * predictive signal is the deciding factor (i.e., rate_hot was false
+             * but predicted_hot would be true) AND the streak gate is met.
+             */
+            bool predicted_hot = false;
+            if (!rate_hot && engine->cfg.prediction_lookahead_cycles > 0
+                          && ema_slope > 0.0f) {
+                float max_slope_contrib = (float)scaled_rate_thresh;
+                float slope_contrib = ema_slope
+                    * (float)engine->cfg.prediction_lookahead_cycles;
+                if (slope_contrib > max_slope_contrib)
+                    slope_contrib = max_slope_contrib;
+                predicted_hot = ((ema_rate[i] + slope_contrib) >=
+                                 (float)scaled_rate_thresh);
+            }
+
             /* Neither signal crosses its threshold → cold scan, reset streak. */
-            if (!rate_hot && !ns_hot) {
+            if (!rate_hot && !ns_hot && !predicted_hot) {
                 hot_scan_streak[i] = 0;
                 continue;
             }
@@ -927,15 +1108,21 @@ static void *monitor_thread_fn(void *arg)
                 last_queued_ms[i]   = now;
                 hot_scan_streak[i]  = 0;  /* fresh evidence required for next tier */
                 prefetch_done[i]    = false;
+                /* Bookkeeping: was this a predictive promotion? */
+                if (predicted_hot && !rate_hot && !ns_hot) {
+                    atomic_fetch_add_explicit(&engine->stat_predictive_promos, 1,
+                                              memory_order_relaxed);
+                }
                 if (engine->cfg.verbose)
                     fprintf(stderr,
                             "[cjit/monitor] enqueued '%s' for O%d "
-                            "(ema=%.0fcps ema_ns=%.0fns/s streak=%u/%u rc=%u cooloff=%ums)\n",
+                            "(ema=%.0fcps ema_ns=%.0fns/s streak=%u/%u rc=%u cooloff=%ums%s)\n",
                             entry->name, (int)target,
                             (double)ema_rate[i],
                             (double)ema_ns_per_sec[i],
                             hot_scan_streak[i], req_streak,
-                            rc, effective_cooloff);
+                            rc, effective_cooloff,
+                            (predicted_hot && !rate_hot) ? " [predictive]" : "");
             }
         }
     }
@@ -991,6 +1178,10 @@ cjit_config_t cjit_default_config(void)
     cfg.recompile_rate_scale_pct    = CJIT_DEFAULT_RECOMPILE_RATE_SCALE_PCT;
     cfg.min_uptime_for_tier2_ms     = CJIT_DEFAULT_MIN_UPTIME_T2_MS;
     cfg.extra_streak_per_recompile  = CJIT_DEFAULT_EXTRA_STREAK_PER_RECOMPILE;
+
+    /* Tier-skip and predictive promotion (disabled by default; opt-in). */
+    cfg.tier_skip_multiplier          = 0.0f;
+    cfg.prediction_lookahead_cycles   = 0;
 
     /* CPU-time-based tier promotion (disabled by default; opt-in). */
     cfg.cpu_hot_ns_per_sec_t1 = CJIT_DEFAULT_CPU_HOT_NS_T1;
@@ -1058,15 +1249,16 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
          */
     }
 
-    /* Per-thread work queues. */
-    e->work_queues = calloc(e->cfg.compiler_threads, sizeof(mpmc_queue_t));
+    /* Per-thread work queues: 2 per thread (normal lane + priority lane). */
+    e->work_queues = calloc(2 * (size_t)e->cfg.compiler_threads, sizeof(mpmc_queue_t));
     if (!e->work_queues) {
+        codegen_cache_destroy(e->artifact_cache);
         ir_cache_destroy(e->ir_cache);
         func_table_destroy(e->ftable);
         free(e);
         return NULL;
     }
-    for (uint32_t i = 0; i < e->cfg.compiler_threads; ++i)
+    for (uint32_t i = 0; i < 2 * e->cfg.compiler_threads; ++i)
         mpmc_init(&e->work_queues[i]);
 
     /* Condition variable for instant compiler wake-up. */
@@ -1094,11 +1286,13 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
 
     dgc_init(&e->dgc, e->cfg.grace_period_ms);
 
-    atomic_init(&e->running,           false);
-    atomic_init(&e->stop_requested,    false);
-    atomic_init(&e->stat_compilations,  0);
-    atomic_init(&e->stat_failed,        0);
-    atomic_init(&e->stat_swaps,         0);
+    atomic_init(&e->running,               false);
+    atomic_init(&e->stop_requested,        false);
+    atomic_init(&e->stat_compilations,      0);
+    atomic_init(&e->stat_failed,            0);
+    atomic_init(&e->stat_swaps,             0);
+    atomic_init(&e->stat_tier_skips,        0);
+    atomic_init(&e->stat_predictive_promos, 0);
 
     return e;
 }
@@ -1396,13 +1590,16 @@ cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
     s.freed_handles        = atomic_load_explicit(&engine->dgc.total_freed,
                                                    memory_order_relaxed);
 
-    /* Sum queue depths and find highest recompile count across all functions. */
-    uint32_t qd  = 0;
+    /* Sum queue depths across both lanes for all threads. */
+    uint32_t qd       = 0;
+    uint32_t qd_prio_depth = 0;
     uint32_t max_rc = 0;
     uint64_t total_elapsed = 0;
     uint32_t nf  = s.registered_functions;
-    for (uint32_t i = 0; i < engine->cfg.compiler_threads; ++i)
-        qd += mpmc_size(&engine->work_queues[i]);
+    for (uint32_t i = 0; i < engine->cfg.compiler_threads; ++i) {
+        qd           += mpmc_size(&engine->work_queues[2 * i + 0]);
+        qd_prio_depth += mpmc_size(&engine->work_queues[2 * i + 1]);
+    }
     for (uint32_t i = 0; i < nf; ++i) {
         uint32_t rc = atomic_load_explicit(
             &engine->ftable->entries[i].recompile_count, memory_order_relaxed);
@@ -1410,9 +1607,14 @@ cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
         total_elapsed += atomic_load_explicit(
             &engine->ftable->entries[i].total_elapsed_ns, memory_order_relaxed);
     }
-    s.queue_depth         = qd;
-    s.max_recompile_count = max_rc;
-    s.total_elapsed_ns    = total_elapsed;
+    s.queue_depth           = qd;
+    s.prio_queue_depth      = qd_prio_depth;
+    s.max_recompile_count   = max_rc;
+    s.total_elapsed_ns      = total_elapsed;
+    s.tier_skips            = atomic_load_explicit(&engine->stat_tier_skips,
+                                                    memory_order_relaxed);
+    s.predictive_promotions = atomic_load_explicit(&engine->stat_predictive_promos,
+                                                    memory_order_relaxed);
 
     if (engine->artifact_cache) {
         s.artifact_cache_hits   = codegen_cache_hits(engine->artifact_cache);
@@ -1453,8 +1655,12 @@ void cjit_print_stats(const cjit_engine_t *engine)
             "║  Atomic pointer swaps  : %6llu            ║\n"
             "║  Handles retired (GC)  : %6llu            ║\n"
             "║  Handles freed   (GC)  : %6llu            ║\n"
-            "║  Work-queue depth now  : %6u            ║\n"
+            "║  Normal queue depth    : %6u            ║\n"
+            "║  Priority queue depth  : %6u            ║\n"
             "║  Max recompile count   : %6u            ║\n"
+            "╠══════════════════════════════════════════╣\n"
+            "║  Tier-skips (O0→O3)    : %6llu            ║\n"
+            "║  Predictive promotions : %6llu            ║\n"
             "╠══════════════════════════════════════════╣\n"
             "║  Artifact cache hits   : %6llu            ║\n"
             "║  Artifact cache misses : %6llu            ║\n"
@@ -1481,7 +1687,10 @@ void cjit_print_stats(const cjit_engine_t *engine)
             (unsigned long long)s.retired_handles,
             (unsigned long long)s.freed_handles,
             s.queue_depth,
+            s.prio_queue_depth,
             s.max_recompile_count,
+            (unsigned long long)s.tier_skips,
+            (unsigned long long)s.predictive_promotions,
             (unsigned long long)s.artifact_cache_hits,
             (unsigned long long)s.artifact_cache_misses,
             pnames[s.mem_pressure],
