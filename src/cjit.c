@@ -897,6 +897,69 @@ static void *monitor_thread_fn(void *arg)
                     prefetch_done[i] = true;
             }
 
+            /* ── O1 warm-up tier (optional, fires before tier-skip) ─────── */
+            /*
+             * When enable_o1_warmup is set, compile to OPT_O1 as soon as
+             * the EMA crosses warm_rate_t0 (default: hot_rate_t1 / 4).
+             * OPT_O1 is fast to compile (typically < 100 ms) and eliminates
+             * the window where the function runs as unoptimised baseline code
+             * while waiting for the hot_confirm_cycles streak required for
+             * OPT_O2.
+             *
+             * No streak gate: OPT_O1 is cheap enough that one false-positive
+             * is harmless.  The normal OPT_O2 and OPT_O3 gates are unaffected.
+             * hot_scan_streak is NOT reset here so O2's streak keeps building.
+             */
+            if (engine->cfg.enable_o1_warmup && cur_level < OPT_O1) {
+                uint64_t t0_wu = engine->cfg.warm_rate_t0;
+                if (t0_wu == 0) t0_wu = engine->cfg.hot_rate_t1 / 4;
+                if (t0_wu == 0) t0_wu = 1;
+
+                if ((uint64_t)ema_rate[i] >= t0_wu) {
+                    uint32_t last_dur_wu = atomic_load_explicit(
+                        &entry->last_compile_duration_ms, memory_order_relaxed);
+                    uint32_t eff_cooloff_wu = engine->cfg.compile_cooloff_ms;
+                    uint32_t last_dur_wu_x2 = (last_dur_wu <= UINT32_MAX / 2)
+                                                  ? last_dur_wu * 2 : UINT32_MAX;
+                    if (last_dur_wu_x2 > eff_cooloff_wu)
+                        eff_cooloff_wu = last_dur_wu_x2;
+
+                    if ((now - last_queued_ms[i]) >= eff_cooloff_wu) {
+                        bool exp_wu = false;
+                        if (atomic_compare_exchange_strong_explicit(
+                                &entry->in_queue, &exp_wu, true,
+                                memory_order_relaxed, memory_order_relaxed)) {
+                            uint32_t ver_wu = atomic_load_explicit(
+                                &entry->version, memory_order_relaxed);
+                            compile_task_t wu_task = {
+                                .func_id      = (func_id_t)i,
+                                .target_level = OPT_O1,
+                                .priority     = 1,
+                                .version_req  = ver_wu,
+                                .call_rate    = (uint64_t)ema_rate[i],
+                            };
+                            if (engine_enqueue_task(engine, &wu_task)) {
+                                last_queued_ms[i] = now;
+                                cnt_at_compile[i] = cur_cnt;
+                                if (engine->cfg.verbose)
+                                    fprintf(stderr,
+                                        "[cjit/monitor] O1-warmup '%s'"
+                                        " (rate=%.0f thresh=%llu)\n",
+                                        entry->name, (double)ema_rate[i],
+                                        (unsigned long long)t0_wu);
+                            } else {
+                                atomic_store_explicit(&entry->in_queue, false,
+                                                      memory_order_relaxed);
+                            }
+                        }
+                    }
+                    /* Fall through: normal T1/T2 gate runs this same cycle.
+                     * If rate also crosses hot_rate_t1 the CAS will fail
+                     * (in_queue already true) and the O2 task will be picked
+                     * up on the next scan cycle once O1 has been dequeued. */
+                }
+            }
+
             /* ── Tier-skip optimization ─────────────────────────────────── */
             /*
              * When tier_skip_multiplier > 0 and the function has not yet
@@ -1286,6 +1349,13 @@ cjit_config_t cjit_default_config(void)
     cfg.enable_fast_math     = false;
     cfg.verbose              = false;
 
+    /* O1 warm-up tier (disabled by default; opt-in). */
+    cfg.enable_o1_warmup = false;
+    cfg.warm_rate_t0     = 0;  /* auto: hot_rate_t1 / 4 */
+
+    /* Compiler thread CPU affinity (disabled by default; opt-in). */
+    cfg.pin_compiler_threads = false;
+
     cfg.hot_ir_cache_size         = 64;
     cfg.warm_ir_cache_size        = 128;
     cfg.mem_pressure_check_ms     = 500;
@@ -1412,6 +1482,28 @@ void cjit_start(cjit_engine_t *engine)
         engine->thread_args[i].thread_idx = i;
         pthread_create(&engine->compiler_threads[i], NULL,
                        compiler_thread_fn, &engine->thread_args[i]);
+#ifdef __linux__
+        /*
+         * Optionally pin each compiler thread to a CPU core.
+         *
+         * Pinning prevents thread migration between cores, which would
+         * otherwise cause cold cache misses in the compiler thread's working
+         * set (IR text, argv arrays, temp-file paths).  Each compiler thread
+         * is assigned to core (i % ncpu) so threads spread across available
+         * CPUs when there are more CPUs than compiler threads.
+         */
+        if (engine->cfg.pin_compiler_threads) {
+            long ncpu_pin = sysconf(_SC_NPROCESSORS_ONLN);
+            if (ncpu_pin > 0) {
+                cpu_set_t cs_pin;
+                CPU_ZERO(&cs_pin);
+                CPU_SET((int)((unsigned long)i % (unsigned long)ncpu_pin),
+                        &cs_pin);
+                pthread_setaffinity_np(engine->compiler_threads[i],
+                                       sizeof(cs_pin), &cs_pin);
+            }
+        }
+#endif
     }
 }
 
@@ -1483,6 +1575,41 @@ func_id_t cjit_register_function(cjit_engine_t *engine,
         ir_cache_register(engine->ir_cache, id, name, ir_source);
 
     return id;
+}
+
+size_t cjit_register_from_source(cjit_engine_t *engine,
+                                  const char    *source,
+                                  size_t         n,
+                                  const char *const names[],
+                                  func_id_t      ids_out[])
+{
+    if (!engine || !source || !names || n == 0) {
+        if (ids_out) {
+            for (size_t k = 0; k < n; ++k)
+                ids_out[k] = CJIT_INVALID_FUNC_ID;
+        }
+        return 0;
+    }
+
+    size_t registered = 0;
+    for (size_t k = 0; k < n; ++k) {
+        func_id_t id = CJIT_INVALID_FUNC_ID;
+        if (names[k])
+            id = cjit_register_function(engine, names[k], source, NULL);
+        if (ids_out)
+            ids_out[k] = id;
+        if (id != CJIT_INVALID_FUNC_ID)
+            registered++;
+    }
+    return registered;
+}
+
+jit_func_t cjit_get_func_by_name(cjit_engine_t *engine, const char *name)
+{
+    if (!engine || !name) return NULL;
+    func_id_t id = cjit_lookup_function(engine, name);
+    if (id == CJIT_INVALID_FUNC_ID) return NULL;
+    return cjit_get_func(engine, id);
 }
 
 /*

@@ -330,7 +330,19 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
         argv[n++] = "-fpeel-loops";
     }
 
-    if (opts->enable_native_arch && level >= OPT_O3)
+    /*
+     * -march=native: generate code tuned for the exact CPU the engine is
+     * running on, enabling all available SIMD extensions (AVX2, SSE4.2, etc.)
+     * and ISA-specific scheduling.
+     *
+     * Applied from OPT_O2 upwards (not just O3): for JIT workloads the
+     * compiled code always runs on the same machine, so there is never a
+     * reason to withhold native-ISA instructions.  The impact at O2 can be
+     * dramatic for vectorizable loops — AVX2 doubles SIMD lane width versus
+     * SSE4.2 — and the compile-time cost is negligible compared with the
+     * compiler subprocess overhead.
+     */
+    if (opts->enable_native_arch && level >= OPT_O2)
         argv[n++] = "-march=native";
 
     if (opts->enable_fast_math && level >= OPT_O3)

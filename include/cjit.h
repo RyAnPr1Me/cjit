@@ -400,10 +400,54 @@ typedef struct {
     bool     enable_vectorization;/**< Pass -ftree-vectorize to compiler.         */
     bool     enable_loop_unroll;  /**< Pass -funroll-loops to compiler.           */
     bool     enable_const_fold;   /**< Constant folding (enabled at -O1+).       */
-    bool     enable_native_arch;  /**< Pass -march=native at OPT_O3.             */
+    bool     enable_native_arch;  /**< Pass -march=native from OPT_O2 upwards.   */
     bool     enable_fast_math;    /**< Pass -ffast-math at OPT_O3 (may change
                                        floating-point semantics).                 */
     bool     verbose;             /**< Print compilation events to stderr.        */
+
+    /**
+     * Enable an O1 warm-up tier: automatically compile functions to OPT_O1
+     * before they are hot enough for the full OPT_O2 tier.
+     *
+     * When true, the monitor checks each function's call-rate EMA against
+     * warm_rate_t0.  The first time the EMA crosses that threshold the
+     * function is compiled at OPT_O1 (fast compile, decent performance),
+     * reducing the window during which it runs as uncompiled baseline code.
+     * Normal OPT_O2 and OPT_O3 promotions proceed as usual; OPT_O1 is
+     * merely an early-start step.
+     *
+     * Default: false (backward-compatible; OPT_O2 is still the first tier).
+     */
+    bool     enable_o1_warmup;
+
+    /**
+     * Minimum sustained call rate (calls/second) to trigger OPT_O1 warm-up.
+     *
+     * Ignored when enable_o1_warmup is false.
+     *
+     * When zero (the default), the threshold is auto-computed as hot_rate_t1/4
+     * (one quarter of the O2 trigger rate).  Set explicitly to override.
+     *
+     * The OPT_O1 warm-up fires immediately on the first monitor scan cycle
+     * where the EMA exceeds this threshold (no streak confirmation needed —
+     * OPT_O1 compiles quickly, so false positives are cheap).
+     */
+    uint64_t warm_rate_t0;
+
+    /**
+     * Pin each compiler background thread to its own CPU core (Linux only).
+     *
+     * When true, cjit_start() calls pthread_setaffinity_np() for each
+     * compiler thread, assigning it to core i % ncpu.  Pinning prevents
+     * thread migration between cores, keeping the compiler thread's cache
+     * lines warm and avoiding NUMA cross-socket overhead for large IR blobs.
+     *
+     * Has no effect on non-Linux platforms.  Safe to set on single-CPU
+     * systems — all threads will be pinned to the same core.
+     *
+     * Default: false.
+     */
+    bool     pin_compiler_threads;
 
     /* ── IR LRU cache settings ──────────────────────────────────────────── */
     uint32_t hot_ir_cache_size;   /**< Max HOT-gen IR entries in memory (def 64). */
@@ -892,6 +936,54 @@ func_id_t cjit_register_function(cjit_engine_t *engine,
                                   const char    *name,
                                   const char    *ir_source,
                                   jit_func_t     aot_fallback);
+
+/**
+ * Register multiple functions from a single C source string.
+ *
+ * Convenience wrapper that calls cjit_register_function(engine, names[i],
+ * source, NULL) for each i in [0, n).  Each function name must be a valid
+ * C symbol that can be located in the compiled shared object via dlsym.
+ *
+ * When the compiled-artifact cache is enabled (cfg.cache_dir non-empty),
+ * all functions sharing the same source at the same optimisation level
+ * produce identical compiled .so files.  The cache stores one copy; every
+ * subsequent lookup for a different function name in the same source finds
+ * the same .so and only needs a dlsym call — compiler spawns are reduced
+ * to one regardless of how many names are registered.
+ *
+ * @param engine   The engine (must be non-NULL).
+ * @param source   C source string shared by all n functions.
+ * @param n        Number of names to register.
+ * @param names    Array of n NUL-terminated function name strings.
+ * @param ids_out  Optional: receives the func_id_t for each name on success,
+ *                 or CJIT_INVALID_FUNC_ID on per-function failure.  May be
+ *                 NULL (IDs are discarded).
+ * @return         Number of successfully registered functions (0 on complete
+ *                 failure).  Any name that fails registration sets its
+ *                 ids_out slot to CJIT_INVALID_FUNC_ID.
+ */
+size_t cjit_register_from_source(cjit_engine_t *engine,
+                                  const char    *source,
+                                  size_t         n,
+                                  const char *const names[],
+                                  func_id_t      ids_out[]);
+
+/**
+ * Look up a function by name and return its current function pointer.
+ *
+ * Convenience wrapper combining cjit_lookup_function() and cjit_get_func()
+ * into a single call.  Useful for setup-time or diagnostic use where the
+ * func_id_t is not cached.
+ *
+ * Not suitable for hot-path dispatch — use cjit_get_func() with a cached
+ * func_id_t for zero-overhead dispatch.
+ *
+ * @param engine  The engine.
+ * @param name    Exact function name as passed to cjit_register_function().
+ * @return        Current function pointer, or NULL if the name is not found
+ *                or the function has not yet been compiled.
+ */
+jit_func_t cjit_get_func_by_name(cjit_engine_t *engine, const char *name);
 
 /**
  * Retrieve the current function pointer for the given ID.

@@ -47,6 +47,7 @@
  *              -funswitch-loops    (hoist invariant conditionals out of loops)
  *              -fpeel-loops        (peel first/last iterations; unroll small
  *                                  known-trip-count loops to straight-line)
+ *              -march=native        (if enable_native_arch)
  *   OPT_O3   : -O3 -fomit-frame-pointer -fno-semantic-interposition
  *              -mtune=native
  *              -fno-plt            (Linux/ELF only)
