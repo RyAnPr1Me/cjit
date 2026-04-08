@@ -48,12 +48,12 @@
  *                                        vectorise + unroll + march=native
  *                                        gives correct results over 1 000
  *                                        iterations.
- *   t19  Performance benchmark     – measures compile latency (ms) and
+ *   t19  Performance benchmark      – measures compile latency (ms) and
  *                                        dispatch throughput (Mcall/s) at AOT,
  *                                        O1, O2, O3 for an integer dot-product;
  *                                        reports speedup vs AOT; asserts
  *                                        correctness and compile < 10 s per
- *                                        tier and O3 not 3× slower than O1.
+ *                                        tier and O3 not >3× slower than O1.
  *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).
@@ -1101,6 +1101,7 @@ TEST(t15_extra_cflags)
     /* Inject a preprocessor define via extra_cflags. */
     strncpy(cfg.extra_cflags, "-DCJIT_MAGIC_VAL=7777",
             sizeof(cfg.extra_cflags) - 1);
+    cfg.extra_cflags[sizeof(cfg.extra_cflags) - 1] = '\0';
 
     cjit_engine_t *e = cjit_create(&cfg);
     CHECK(e != NULL, "engine creation failed");
@@ -1494,10 +1495,10 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t13_lookup_function",    t13_lookup_function    },
     { "t14_update_ir",          t14_update_ir          },
     { "t15_extra_cflags",       t15_extra_cflags       },
-    { "t16_jit_replaces_aot",         t16_jit_replaces_aot         },
-    { "t17_dladdr_compiled_object",   t17_dladdr_compiled_object   },
-    { "t18_o3_vectorised_correctness",t18_o3_vectorised_correctness},
-    { "t19_perf_benchmark",           t19_perf_benchmark           },
+    { "t16_jit_replaces_aot",          t16_jit_replaces_aot         },
+    { "t17_dladdr_compiled_object",    t17_dladdr_compiled_object   },
+    { "t18_o3_vectorised_correctness", t18_o3_vectorised_correctness},
+    { "t19_perf_benchmark",            t19_perf_benchmark           },
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 

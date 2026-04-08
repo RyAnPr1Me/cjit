@@ -802,8 +802,8 @@ bool codegen_compile(const char          *func_name,
             cc_argv[n_argv++] = tok;
             tok = strtok(NULL, " \t");
         }
-        cc_argv[n_argv] = NULL;
     }
+    cc_argv[n_argv] = NULL;  /* always ensure NULL-terminator for posix_spawnp */
 
     /* Determine which compiler binary to invoke. */
     const char *cc_bin = (opts && opts->cc_binary && opts->cc_binary[0])
