@@ -1443,6 +1443,46 @@ bool cjit_drain_queue(cjit_engine_t *engine, uint32_t timeout_ms);
  */
 bool cjit_compile_sync(cjit_engine_t *engine, func_id_t id, opt_level_t level);
 
+/**
+ * Print a formatted IR-cache statistics block to stderr.
+ *
+ * Covers hot/warm/cold counts, disk read/write counts, eviction/promotion
+ * counters, and memory-pressure state.  Useful for diagnostics and
+ * production-quality telemetry.
+ *
+ * Thread safety: safe to call from any thread at any time.
+ *
+ * @param engine  The engine whose IR cache should be reported.  A NULL
+ *                engine is silently ignored.
+ */
+void cjit_print_ir_cache_stats(const cjit_engine_t *engine);
+
+/**
+ * Asynchronously prefetch the IR for a function into WARM memory.
+ *
+ * If the engine was created with io_threads > 0, the prefetch request is
+ * queued for a background I/O thread, which reads the IR from disk and
+ * promotes the entry from COLD → WARM.  The call is non-blocking: it
+ * returns true as soon as the request is queued, before the I/O completes.
+ *
+ * If io_threads == 0, the function falls back to a synchronous
+ * ir_cache_get_ir() call in the calling thread, which may block for the
+ * duration of the disk read.
+ *
+ * Typical use: during application start-up, call cjit_ir_cache_prefetch()
+ * for every function that is expected to be compiled soon.  The compiler
+ * thread will then find the IR already in WARM memory (a cache hit) instead
+ * of needing to read it from disk while holding the compile_lock.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @return        true  — request queued (or synchronous load succeeded).
+ *                false — no IR cache configured, id invalid, prefetch queue
+ *                        full (transient; retry later), or io_threads == 0
+ *                        and the synchronous load failed.
+ */
+bool cjit_ir_cache_prefetch(cjit_engine_t *engine, func_id_t id);
+
 #ifdef __cplusplus
 }
 #endif

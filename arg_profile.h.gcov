@@ -1,7 +1,7 @@
         -:    0:Source:/home/runner/work/cjit/cjit/src/arg_profile.h
         -:    0:Graph:build_cov/CMakeFiles/cjit_lib.dir/src/codegen.c.gcno
         -:    0:Data:build_cov/CMakeFiles/cjit_lib.dir/src/codegen.c.gcda
-        -:    0:Runs:5
+        -:    0:Runs:9
         -:    1:/**
         -:    2: * arg_profile.h – Per-function argument-value profiling for the JIT engine.
         -:    3: *
@@ -168,10 +168,10 @@
         -:  164: * "Confident" = total_samples >= CJIT_PROFILE_MIN_SAMPLES AND
         -:  165: *               dominant_cnt * 100 / total_samples >= CJIT_PROFILE_MIN_CONFIDENCE_PCT.
         -:  166: */
-        4:  167:static inline bool cjit_arg_slot_confident(const cjit_arg_slot_t *slot)
+       13:  167:static inline bool cjit_arg_slot_confident(const cjit_arg_slot_t *slot)
         -:  168:{
-       4*:  169:    if (slot->total_samples < CJIT_PROFILE_MIN_SAMPLES) return false;
+      13*:  169:    if (slot->total_samples < CJIT_PROFILE_MIN_SAMPLES) return false;
         -:  170:    /* Avoid division: rearrange to dominant_cnt * 100 >= pct * total_samples */
-        4:  171:    return (uint64_t)slot->dominant_cnt * 100u
-        4:  172:               >= (uint64_t)CJIT_PROFILE_MIN_CONFIDENCE_PCT * slot->total_samples;
+       13:  171:    return (uint64_t)slot->dominant_cnt * 100u
+       13:  172:               >= (uint64_t)CJIT_PROFILE_MIN_CONFIDENCE_PCT * slot->total_samples;
         -:  173:}

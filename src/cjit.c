@@ -2278,3 +2278,27 @@ bool cjit_compile_sync(cjit_engine_t *engine, func_id_t id, opt_level_t level)
 
     return true;
 }
+
+/* ══════════════════════════ IR cache stats / prefetch ═════════════════════ */
+
+void cjit_print_ir_cache_stats(const cjit_engine_t *engine)
+{
+    if (!engine || !engine->ir_cache) return;
+    ir_cache_print_stats(engine->ir_cache);
+}
+
+bool cjit_ir_cache_prefetch(cjit_engine_t *engine, func_id_t id)
+{
+    if (!engine || !engine->ir_cache) return false;
+    if (!func_table_get(engine->ftable, id)) return false;
+
+    /* Try the async path first (io_threads > 0 in the IR cache). */
+    if (ir_cache_prefetch(engine->ir_cache, id))
+        return true;
+
+    /* Fall back to synchronous: read IR into warm memory now. */
+    char *ir = ir_cache_get_ir(engine->ir_cache, id);
+    if (!ir) return false;
+    free(ir);
+    return true;
+}

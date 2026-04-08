@@ -1,6 +1,8 @@
 build/
+build_cov/
 *.o
 *.a
 *.so
 *.d
+*.gcov
 /tmp/
