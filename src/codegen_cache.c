@@ -18,6 +18,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <pthread.h>
 
 /* ─────────────────────────── constants ─────────────────────────────────────── */
 
@@ -51,6 +52,74 @@ static uint64_t fnv1a_feed(uint64_t h, const void *data, size_t len)
         h ^= (uint64_t)p[i];
         h *= FNV1A_PRIME_64;
     }
+    return h;
+}
+
+/*
+ * Hash a C string with normalisation: strips C-style block comments and
+ * C++-style line comments, collapses runs of whitespace to a single space,
+ * and strips leading and trailing whitespace — all in a single pass.
+ *
+ * This normalisation ensures that two IR strings that are semantically
+ * identical (same tokens, same structure) but differ only in whitespace
+ * or comments produce the same cache key, improving artifact-cache hit rates
+ * for code that is regenerated with minor formatting differences.
+ *
+ * Implementation note: spaces are emitted lazily — a pending space is only
+ * flushed to the hash when the next non-space character arrives.  This
+ * naturally eliminates both leading and trailing whitespace.
+ */
+static uint64_t fnv1a_norm_ir(uint64_t h, const char *s)
+{
+    if (!s || !*s) {
+        const uint8_t zero = 0;
+        return fnv1a_feed(h, &zero, 1);
+    }
+
+    const char *p = s;
+    bool pending_space = false; /* deferred space, not yet hashed */
+    bool any_output    = false; /* suppress leading space */
+
+    while (*p) {
+        /* Skip C-style block comment. */
+        if (p[0] == '/' && p[1] == '*') {
+            p += 2;
+            while (*p) {
+                if (p[0] == '*' && p[1] == '/') { p += 2; break; }
+                p++;
+            }
+            /* A comment acts as a whitespace separator. */
+            if (any_output) pending_space = true;
+            continue;
+        }
+
+        /* Skip C++ line comment. */
+        if (p[0] == '/' && p[1] == '/') {
+            p += 2;
+            while (*p && *p != '\n') p++;
+            if (*p == '\n') p++;
+            if (any_output) pending_space = true;
+            continue;
+        }
+
+        /* Whitespace: defer. */
+        if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+            if (any_output) pending_space = true;
+            p++;
+            continue;
+        }
+
+        /* Normal character: flush pending space first, then hash the char. */
+        if (pending_space) {
+            const uint8_t sp = ' ';
+            h = fnv1a_feed(h, &sp, 1);
+            pending_space = false;
+        }
+        uint8_t c = (uint8_t)*p++;
+        h = fnv1a_feed(h, &c, 1);
+        any_output = true;
+    }
+    /* Trailing pending_space is intentionally discarded (strip trailing ws). */
     return h;
 }
 
@@ -184,7 +253,9 @@ uint64_t codegen_cache_key(const char *preamble,
     h = fnv1a_feed(h, &SEP, 1);
     h = fnv1a_str(h, spec_define);
     h = fnv1a_feed(h, &SEP, 1);
-    h = fnv1a_str(h, ir);
+    /* Use normalised hashing for user IR: strip comments + collapse whitespace
+     * so that trivially reformatted IR strings map to the same cache entry. */
+    h = fnv1a_norm_ir(h, ir);
     h = fnv1a_feed(h, &SEP, 1);
     h = fnv1a_str(h, level_str);
     h = fnv1a_feed(h, &SEP, 1);

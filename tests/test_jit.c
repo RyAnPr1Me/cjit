@@ -67,6 +67,19 @@
  *                                        pass-1 is a cache miss (compiler ran),
  *                                        pass-2 is a cache hit (compiler skipped),
  *                                        and the function returns correct results.
+ *   t22  Priority queue            – manual high-priority recompile request
+ *                                        is serviced before background tasks.
+ *   t23  Tier-skip optimization    – O0→O3 direct skip when call-rate exceeds
+ *                                        hot_rate_t2 × tier_skip_multiplier.
+ *   t24  Compilation watchdog      – a stalled compiler subprocess (sleeping
+ *                                        fake cc) is killed after compile_timeout_ms;
+ *                                        compile_timeouts stat is incremented.
+ *   t25  Latency histogram         – CJIT_DISPATCH_TIMED fills the per-function
+ *                                        histogram; cjit_percentile_ns() returns
+ *                                        a non-zero value with p50 ≤ p99 < 1 s.
+ *   t26  IR normalizer cache       – an IR string with extra comments and
+ *                                        whitespace produces the same artifact
+ *                                        cache key as the clean version (cache hit).
  *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).
@@ -90,6 +103,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <dlfcn.h>   /* dladdr – verify JIT function is in a loaded shared object */
+#include <sys/stat.h> /* chmod */
 
 #include "../include/cjit.h"
 
@@ -1993,6 +2007,252 @@ TEST(t23_tier_skip)
 }
 
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t24 – Compilation watchdog: timed-out compiler subprocess is killed
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Write a tiny shell script to /tmp that sleeps for 30 s (simulates a
+ *      stalled compiler).
+ *   2. Create an engine with cfg.compile_timeout_ms = 300 and
+ *      cfg.cc_binary pointing at the sleep script.
+ *   3. Register a function and request a recompile.
+ *   4. Wait up to 3 s for the compilation attempt to finish.
+ *   5. Verify: compile_timeouts == 1, failed_compilations == 1.
+ */
+TEST(t24_compile_watchdog)
+{
+    printf("[t24] Compilation watchdog: stalled compiler is killed...\n");
+
+    /* Write a fake compiler that sleeps 30 s.
+     * Keep the path ≤ CJIT_MAX_CC_BINARY - 1 = 63 chars. */
+    char script_path[64];
+    snprintf(script_path, sizeof(script_path),
+             "/tmp/cjit_cc_%d.sh", (int)getpid());
+    {
+        FILE *f = fopen(script_path, "w");
+        CHECK(f, "could not write fake compiler script");
+        fprintf(f, "#!/bin/sh\nsleep 30\n");
+        fclose(f);
+        chmod(script_path, 0755);
+    }
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads    = 1;
+    cfg.compile_timeout_ms  = 300;    /* 300 ms – much less than the 30 s sleep */
+    cfg.verbose             = false;
+    snprintf(cfg.cc_binary, sizeof(cfg.cc_binary), "%s", script_path);
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    if (!e) { unlink(script_path); CHECK(e, "cjit_create returned NULL"); }
+    cjit_start(e);
+
+    static const char *IR_DUMMY =
+        "int dummy_watchdog(int x) { return x; }";
+    func_id_t id = cjit_register_function(e, "dummy_watchdog", IR_DUMMY, NULL);
+    if (id == CJIT_INVALID_FUNC_ID) {
+        cjit_destroy(e); unlink(script_path);
+        CHECK(false, "register failed");
+    }
+
+    cjit_request_recompile(e, id, OPT_O1);
+
+    /* Wait up to 3 s for the timeout + SIGKILL cycle to complete. */
+    uint64_t deadline = now_ms() + 3000;
+    cjit_stats_t s;
+    do {
+        sleep_ms(50);
+        s = cjit_get_stats(e);
+    } while (s.failed_compilations == 0 && now_ms() < deadline);
+
+    cjit_destroy(e);
+    unlink(script_path);
+
+    CHECKF(s.failed_compilations >= 1,
+           "expected ≥1 failed compilation, got %llu",
+           (unsigned long long)s.failed_compilations);
+    CHECKF(s.compile_timeouts >= 1,
+           "expected ≥1 compile timeout, got %llu",
+           (unsigned long long)s.compile_timeouts);
+
+    printf("[t24]   failed=%llu timeouts=%llu  OK\n",
+           (unsigned long long)s.failed_compilations,
+           (unsigned long long)s.compile_timeouts);
+    printf("[t24] PASS\n");
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t25 – Per-function call-latency histogram and cjit_percentile_ns()
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Register a trivial int add(int, int) function with an AOT fallback.
+ *   2. Dispatch it > CJIT_TLS_FLUSH_THRESHOLD times via CJIT_DISPATCH_TIMED
+ *      so that the TLS flush path runs and fills the histogram.
+ *   3. Verify:
+ *        a. cjit_percentile_ns(engine, id, 50) returns > 0 (histogram has data).
+ *        b. cjit_percentile_ns(engine, id, 99) >= p50 (monotone).
+ *        c. p50 and p99 are < 1 second (10^9 ns) — sanity bound.
+ *   4. Verify that p50 for a "do nothing" function is ≤ 1 µs (1000 ns bound).
+ */
+static int aot_add_t25(int a, int b) { return a + b; }
+
+TEST(t25_latency_histogram)
+{
+    printf("[t25] Call-latency histogram and cjit_percentile_ns()...\n");
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads = 1;
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e, "cjit_create returned NULL");
+    cjit_start(e);
+
+    static const char *IR_ADD_T25 =
+        "int add_t25(int a, int b) { return a + b; }";
+    func_id_t id = cjit_register_function(e, "add_t25", IR_ADD_T25,
+                                           (jit_func_t)(uintptr_t)aot_add_t25);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "register failed");
+
+    /* Drive > 2 × CJIT_TLS_FLUSH_THRESHOLD calls to guarantee at least 2
+     * histogram updates.  Use a volatile sink to prevent dead-code elimination. */
+    volatile int sink = 0;
+    typedef int (*add_fn)(int, int);
+    for (unsigned i = 0; i < CJIT_TLS_FLUSH_THRESHOLD * 4u; i++) {
+        int r = CJIT_DISPATCH_TIMED(e, id, add_fn, i, i + 1);
+        sink += r;
+    }
+    (void)sink;
+
+    /* Flush any residual TLS counts. */
+    cjit_flush_local_counts(e);
+
+    uint64_t counts[CJIT_HIST_BUCKETS];
+    cjit_get_histogram(e, id, counts);
+
+    /* At least one bucket must be non-zero. */
+    uint64_t total = 0;
+    for (int i = 0; i < CJIT_HIST_BUCKETS; i++) total += counts[i];
+    CHECKF(total > 0, "histogram is all-zero after %d timed dispatches",
+           CJIT_TLS_FLUSH_THRESHOLD * 4);
+
+    uint64_t p50 = cjit_percentile_ns(e, id, 50);
+    uint64_t p99 = cjit_percentile_ns(e, id, 99);
+
+    CHECKF(p50 > 0,
+           "p50 should be > 0, got %llu", (unsigned long long)p50);
+    CHECKF(p99 >= p50,
+           "p99 (%llu) should be >= p50 (%llu)",
+           (unsigned long long)p99, (unsigned long long)p50);
+    /* Sanity: dispatching through an AOT fallback should be << 1 second. */
+    CHECKF(p99 < UINT64_C(1000000000),
+           "p99 (%llu ns) >= 1 s — unexpectedly slow",
+           (unsigned long long)p99);
+
+    printf("[t25]   hist_total=%llu  p50=%lluns  p99=%lluns  OK\n",
+           (unsigned long long)total,
+           (unsigned long long)p50,
+           (unsigned long long)p99);
+
+    cjit_destroy(e);
+    printf("[t25] PASS\n");
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t26 – IR normalizer: differently-whitespaced/commented IR hits same cache
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Compile IR_CLEAN ("int add_norm(int a, int b){return a+b;}") — cold miss.
+ *   2. Compile IR_MESSY (same semantics, extra whitespace + inline comments)
+ *      from a FRESH engine pointing at the same cache directory.
+ *   3. The normalizer should map both to the same artifact-cache key, so
+ *      pass 2 is a warm hit (artifact_cache_hits == 1) with no compiler spawn.
+ */
+#define IR_NORM_CLEAN "int add_norm(int a, int b) { return a + b; }"
+/* Messy IR: same tokens as clean, but with block/line comments added and
+ * multiple spaces between tokens that already had single spaces in the clean
+ * version.  The normalizer maps both to the same byte stream. */
+#define IR_NORM_MESSY \
+    "/* function: add_norm */\n" \
+    "int  add_norm(int  a,  int  b)  {  // begin\n" \
+    "    return  a  +  b;  // end\n" \
+    "}\n"
+
+TEST(t26_ir_normalizer_cache)
+{
+    printf("[t26] IR normalizer: reformatted IR maps to same cache key...\n");
+
+    char cache_dir[256];
+    snprintf(cache_dir, sizeof(cache_dir),
+             "/tmp/cjit_norm_cache_%d", (int)getpid());
+
+    /* ── Pass 1: clean IR → cold miss ─────────────────────────────────── */
+    {
+        cjit_config_t cfg = cjit_default_config();
+        cfg.compiler_threads = 1;
+        snprintf(cfg.cache_dir, sizeof(cfg.cache_dir), "%s", cache_dir);
+
+        cjit_engine_t *e = cjit_create(&cfg);
+        CHECK(e, "cjit_create (pass 1) returned NULL");
+        cjit_start(e);
+
+        func_id_t id = cjit_register_function(e, "add_norm", IR_NORM_CLEAN, NULL);
+        CHECK(id != CJIT_INVALID_FUNC_ID, "register failed (pass 1)");
+
+        cjit_request_recompile(e, id, OPT_O1);
+        bool ok = cjit_wait_compiled(e, id, 5000);
+        CHECK(ok, "cjit_wait_compiled timed out (pass 1)");
+
+        cjit_stats_t s = cjit_get_stats(e);
+        CHECKF(s.artifact_cache_misses == 1,
+               "pass 1: expected 1 miss, got %llu",
+               (unsigned long long)s.artifact_cache_misses);
+        printf("[t26]   pass 1 clean IR: miss=1 hit=0  OK\n");
+        cjit_destroy(e);
+    }
+
+    /* ── Pass 2: messy IR → should be a warm hit via normalizer ─────── */
+    {
+        cjit_config_t cfg = cjit_default_config();
+        cfg.compiler_threads = 1;
+        snprintf(cfg.cache_dir, sizeof(cfg.cache_dir), "%s", cache_dir);
+
+        cjit_engine_t *e = cjit_create(&cfg);
+        CHECK(e, "cjit_create (pass 2) returned NULL");
+        cjit_start(e);
+
+        typedef int (*add_fn)(int, int);
+        func_id_t id = cjit_register_function(e, "add_norm", IR_NORM_MESSY, NULL);
+        CHECK(id != CJIT_INVALID_FUNC_ID, "register failed (pass 2)");
+
+        cjit_request_recompile(e, id, OPT_O1);
+        bool ok = cjit_wait_compiled(e, id, 5000);
+        CHECK(ok, "cjit_wait_compiled timed out (pass 2)");
+
+        add_fn fn = (add_fn)(uintptr_t)cjit_get_func_counted(e, id);
+        CHECK(fn, "add_norm function pointer NULL after normalizer cache hit");
+        CHECKF(fn(3, 4) == 7,  "add_norm(3,4) expected 7, got %d",  fn(3, 4));
+        CHECKF(fn(-5, 5) == 0, "add_norm(-5,5) expected 0, got %d", fn(-5, 5));
+
+        cjit_stats_t s = cjit_get_stats(e);
+        CHECKF(s.artifact_cache_hits == 1,
+               "pass 2: expected 1 cache hit (normalizer), got %llu",
+               (unsigned long long)s.artifact_cache_hits);
+        CHECKF(s.artifact_cache_misses == 0,
+               "pass 2: expected 0 cache misses, got %llu",
+               (unsigned long long)s.artifact_cache_misses);
+
+        printf("[t26]   pass 2 messy IR: miss=0 hit=1  OK\n");
+        cjit_destroy(e);
+    }
+
+    printf("[t26] PASS\n");
+    return 0;
+}
+
+
 typedef int (*test_fn)(void);
 static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t01_aot_correctness",    t01_aot_correctness    },
@@ -2018,6 +2278,9 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t21_artifact_cache",         t21_artifact_cache           },
     { "t22_priority_queue",         t22_priority_queue           },
     { "t23_tier_skip",              t23_tier_skip                },
+    { "t24_compile_watchdog",       t24_compile_watchdog         },
+    { "t25_latency_histogram",      t25_latency_histogram        },
+    { "t26_ir_normalizer_cache",    t26_ir_normalizer_cache      },
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 

@@ -170,6 +170,29 @@ typedef struct {
      * looks ambiguous.
      */
     cjit_arg_profile_t          arg_profile;
+
+    /**
+     * Per-function call-latency histogram (32 log₂ buckets).
+     *
+     * Bucket k covers call durations in [2^(k-1), 2^k) nanoseconds (bucket 0
+     * covers [0, 1) ns — practically the sub-nanosecond noise floor).
+     * Bucket 31 accumulates all durations ≥ 2^30 ns (≈ 1.07 seconds).
+     *
+     * Counts are incremented atomically at the TLS flush boundary inside
+     * cjit_record_timed_call() — one atomic per CJIT_TLS_FLUSH_THRESHOLD calls
+     * per thread, same cadence as the call_cnt flush.  The average per-call
+     * latency of the flush batch (accumulated_ns / THRESHOLD) is used to
+     * select the bucket, giving a statistically accurate distribution for
+     * hot functions.
+     *
+     * Only populated when CJIT_DISPATCH_TIMED / cjit_record_timed_call() is
+     * used; counts remain zero for functions dispatched via CJIT_DISPATCH.
+     *
+     * Thread safety: atomic per-bucket increments; reads via
+     * cjit_get_histogram() take a non-synchronized snapshot, which is
+     * sufficient for profiling purposes.
+     */
+    atomic_uint_fast32_t        hist_counts[CJIT_HIST_BUCKETS];
 } func_table_entry_t;
 
 /* ─────────────────────────── table ─────────────────────────────────────────── */

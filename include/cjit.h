@@ -92,6 +92,21 @@ extern "C" {
 #define CJIT_MAX_CACHE_DIR      256
 
 /**
+ * Number of log₂ latency buckets in the per-function call-latency histogram.
+ *
+ * Bucket k covers durations in [2^(k-1), 2^k) nanoseconds.
+ * Bucket 0  : [0,   1) ns  (sub-nanosecond noise floor)
+ * Bucket 10 : [512ns, 1µs)
+ * Bucket 20 : [524µs, 1ms)
+ * Bucket 30 : [537ms, 1.07s)
+ * Bucket 31 : [1.07s, ∞)   (catch-all for very slow calls)
+ *
+ * The histogram is only populated when CJIT_DISPATCH_TIMED or
+ * cjit_record_timed_call() is used for dispatch.
+ */
+#define CJIT_HIST_BUCKETS 32
+
+/**
  * Per-calling-thread TLS call-counter flush threshold.
  *
  * Each calling thread maintains a private per-function byte counter in
@@ -672,6 +687,27 @@ typedef struct {
      * Maximum length: CJIT_MAX_CACHE_DIR - 1 characters.
      */
     char cache_dir[CJIT_MAX_CACHE_DIR];
+
+    /**
+     * Maximum wall-clock time (milliseconds) to wait for the C compiler
+     * subprocess to complete before killing it and marking the compilation
+     * as timed out.
+     *
+     * When a compilation times out:
+     *   • The compiler subprocess receives SIGTERM then SIGKILL (if needed).
+     *   • The compile task is marked failed (result->timed_out = true).
+     *   • cjit_stats_t.compile_timeouts is incremented.
+     *   • The function retains its previous pointer (AOT fallback or older
+     *     JIT tier) — no downgrade occurs.
+     *
+     * Pathological compilation (e.g., runaway template expansion, full disk,
+     * or a stalled cross-compiler) cannot block a compiler thread forever
+     * when this is set.
+     *
+     * 0 = no timeout (default, backward-compatible).  For interactive use a
+     * value of 30 000 (30 s) is a conservative starting point.
+     */
+    uint32_t compile_timeout_ms;
 } cjit_config_t;
 
 /* ══════════════════════════════ runtime stats ═════════════════════════════ */
@@ -682,6 +718,7 @@ typedef struct {
     uint32_t registered_functions;  /**< Total functions registered.            */
     uint64_t total_compilations;    /**< Total successful compilations.         */
     uint64_t failed_compilations;   /**< Total failed compilations.             */
+    uint64_t compile_timeouts;      /**< Compiler subprocesses killed (timeout).*/
     uint64_t total_swaps;           /**< Total atomic pointer swaps performed.  */
     uint64_t retired_handles;       /**< Total handles enqueued for deferred GC.*/
     uint64_t freed_handles;         /**< Total handles already freed.           */
@@ -1147,6 +1184,48 @@ bool cjit_update_ir(cjit_engine_t *engine,
 bool cjit_wait_compiled(cjit_engine_t *engine,
                         func_id_t      id,
                         uint32_t       timeout_ms);
+
+/**
+ * Copy a snapshot of the per-function call-latency histogram into out[].
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @param out     Array of at least CJIT_HIST_BUCKETS uint64_t values.
+ *                out[k] receives the count of flush-batches whose average
+ *                per-call latency fell in bucket k ([2^(k-1), 2^k) ns).
+ *
+ * The histogram is only populated when CJIT_DISPATCH_TIMED or
+ * cjit_record_timed_call() is used.  All buckets are zero for functions
+ * dispatched via CJIT_DISPATCH.
+ *
+ * Thread safety: non-synchronized relaxed loads — suitable for profiling
+ * and diagnostics; not suitable for strong consistency checks.
+ */
+void cjit_get_histogram(const cjit_engine_t *engine,
+                        func_id_t            id,
+                        uint64_t             out[CJIT_HIST_BUCKETS]);
+
+/**
+ * Estimate the p-th percentile call latency (in nanoseconds) from the
+ * per-function call-latency histogram.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID.
+ * @param pct     Percentile in [0, 100].  E.g. 50 = median, 99 = p99.
+ * @return        Estimated latency in nanoseconds (upper bound of the bucket
+ *                containing the p-th percentile); 0 if no samples are
+ *                available or id is invalid.
+ *
+ * The returned value is the upper bound of the histogram bucket that
+ * contains the p-th percentile sample (a power of two in nanoseconds),
+ * e.g. 1024 means the percentile falls in [512ns, 1024ns).  For most
+ * profiling purposes this resolution is sufficient.
+ *
+ * Thread safety: same as cjit_get_histogram().
+ */
+uint64_t cjit_percentile_ns(const cjit_engine_t *engine,
+                             func_id_t            id,
+                             unsigned             pct);
 
 #ifdef __cplusplus
 }

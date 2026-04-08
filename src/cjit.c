@@ -286,6 +286,7 @@ struct cjit_engine {
     /* Global statistics (relaxed atomics; no strict ordering needed). */
     atomic_uint_fast64_t stat_compilations;
     atomic_uint_fast64_t stat_failed;
+    atomic_uint_fast64_t stat_timeouts;          /**< Compiler subprocess timeouts.  */
     atomic_uint_fast64_t stat_swaps;
     atomic_uint_fast64_t stat_tier_skips;        /**< O0→O3 tier-skip promotions. */
     atomic_uint_fast64_t stat_predictive_promos; /**< Slope-lookahead early promotions. */
@@ -384,6 +385,7 @@ static void *compiler_thread_fn(void *raw_arg)
         .extra_cflags         = engine->cfg.extra_cflags[0] ? engine->cfg.extra_cflags : NULL,
         .cc_binary            = engine->cfg.cc_binary[0]    ? engine->cfg.cc_binary    : NULL,
         .cache                = engine->artifact_cache,   /* may be NULL */
+        .compile_timeout_ms   = engine->cfg.compile_timeout_ms,
     };
 
     while (!atomic_load_explicit(&engine->stop_requested, memory_order_acquire)) {
@@ -567,8 +569,16 @@ static void *compiler_thread_fn(void *raw_arg)
         if (!ok) {
             atomic_fetch_add_explicit(&engine->stat_failed, 1,
                                       memory_order_relaxed);
-            fprintf(stderr, "[cjit/compiler#%u] FAILED '%s': %s\n",
-                    me, entry->name, cres.errmsg);
+            if (cres.timed_out) {
+                atomic_fetch_add_explicit(&engine->stat_timeouts, 1,
+                                          memory_order_relaxed);
+                if (engine->cfg.verbose)
+                    fprintf(stderr, "[cjit/compiler#%u] TIMEOUT '%s' (>%u ms)\n",
+                            me, entry->name, engine->cfg.compile_timeout_ms);
+            } else {
+                fprintf(stderr, "[cjit/compiler#%u] FAILED '%s': %s\n",
+                        me, entry->name, cres.errmsg);
+            }
             pthread_mutex_unlock(&entry->compile_lock);
             /* Wake any cjit_wait_compiled() caller so it can detect failure. */
             pthread_mutex_lock(&engine->compile_done_mutex);
@@ -1290,6 +1300,7 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
     atomic_init(&e->stop_requested,        false);
     atomic_init(&e->stat_compilations,      0);
     atomic_init(&e->stat_failed,            0);
+    atomic_init(&e->stat_timeouts,          0);
     atomic_init(&e->stat_swaps,             0);
     atomic_init(&e->stat_tier_skips,        0);
     atomic_init(&e->stat_predictive_promos, 0);
@@ -1496,6 +1507,10 @@ void cjit_record_timed_call(cjit_engine_t *engine,
      * to the shared atomics with one call_cnt fetch_add and one (conditional)
      * total_elapsed_ns fetch_add.  This adds at most one extra atomic operation
      * per THRESHOLD calls compared to the non-timed path.
+     *
+     * The histogram bucket for the average per-call latency of this batch is
+     * also updated at the flush boundary — one additional atomic per THRESHOLD
+     * calls, zero overhead on the common (non-flush) path.
      */
     cjit_tls_elapsed[id] += elapsed_ns;
     if (__builtin_expect(++cjit_tls_counts[id] >= CJIT_TLS_FLUSH_THRESHOLD, 0)) {
@@ -1506,11 +1521,61 @@ void cjit_record_timed_call(cjit_engine_t *engine,
         if (__builtin_expect(e != NULL, 1)) {
             atomic_fetch_add_explicit(&e->call_cnt, CJIT_TLS_FLUSH_THRESHOLD,
                                       memory_order_relaxed);
-            if (acc > 0)
+            if (acc > 0) {
                 atomic_fetch_add_explicit(&e->total_elapsed_ns, acc,
                                           memory_order_relaxed);
+                /* Update histogram: bucket for the average per-call ns. */
+                uint64_t avg_ns = acc / CJIT_TLS_FLUSH_THRESHOLD;
+                int bucket = (avg_ns == 0) ? 0
+                    : (int)(63 - __builtin_clzll(avg_ns));
+                if (bucket >= CJIT_HIST_BUCKETS)
+                    bucket = CJIT_HIST_BUCKETS - 1;
+                atomic_fetch_add_explicit(&e->hist_counts[bucket], 1u,
+                                          memory_order_relaxed);
+            }
         }
     }
+}
+
+void cjit_get_histogram(const cjit_engine_t *engine,
+                        func_id_t            id,
+                        uint64_t             out[CJIT_HIST_BUCKETS])
+{
+    for (int i = 0; i < CJIT_HIST_BUCKETS; i++) out[i] = 0;
+    if (!engine) return;
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (!e) return;
+    for (int i = 0; i < CJIT_HIST_BUCKETS; i++)
+        out[i] = (uint64_t)atomic_load_explicit(&e->hist_counts[i],
+                                                 memory_order_relaxed);
+}
+
+uint64_t cjit_percentile_ns(const cjit_engine_t *engine,
+                             func_id_t            id,
+                             unsigned             pct)
+{
+    uint64_t counts[CJIT_HIST_BUCKETS];
+    cjit_get_histogram(engine, id, counts);
+
+    uint64_t total = 0;
+    for (int i = 0; i < CJIT_HIST_BUCKETS; i++) total += counts[i];
+    if (total == 0 || pct > 100) return 0;
+
+    /* Target: ceil(total * pct / 100) to find the bucket that contains pct%. */
+    uint64_t target = (total * (uint64_t)pct + 99) / 100;
+    uint64_t cum = 0;
+    for (int i = 0; i < CJIT_HIST_BUCKETS; i++) {
+        cum += counts[i];
+        if (cum >= target) {
+            /*
+             * Return the upper bound of bucket i: 2^i nanoseconds.
+             * Bucket 0 covers [0,1) ns → return 1.
+             * Bucket k covers [2^(k-1), 2^k) ns → return 2^k.
+             */
+            return (i == 0) ? 1ULL : (UINT64_C(1) << i);
+        }
+    }
+    return UINT64_C(1) << (CJIT_HIST_BUCKETS - 1);
 }
 
 uint64_t cjit_get_elapsed_ns(const cjit_engine_t *engine, func_id_t id)
@@ -1583,6 +1648,8 @@ cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
                                                    memory_order_relaxed);
     s.failed_compilations  = atomic_load_explicit(&engine->stat_failed,
                                                    memory_order_relaxed);
+    s.compile_timeouts     = atomic_load_explicit(&engine->stat_timeouts,
+                                                   memory_order_relaxed);
     s.total_swaps          = atomic_load_explicit(&engine->stat_swaps,
                                                    memory_order_relaxed);
     s.retired_handles      = atomic_load_explicit(&engine->dgc.total_retired,
@@ -1652,6 +1719,7 @@ void cjit_print_stats(const cjit_engine_t *engine)
             "║  Registered functions  : %6u            ║\n"
             "║  Total compilations    : %6llu            ║\n"
             "║  Failed compilations   : %6llu            ║\n"
+            "║  Compile timeouts      : %6llu            ║\n"
             "║  Atomic pointer swaps  : %6llu            ║\n"
             "║  Handles retired (GC)  : %6llu            ║\n"
             "║  Handles freed   (GC)  : %6llu            ║\n"
@@ -1683,6 +1751,7 @@ void cjit_print_stats(const cjit_engine_t *engine)
             s.registered_functions,
             (unsigned long long)s.total_compilations,
             (unsigned long long)s.failed_compilations,
+            (unsigned long long)s.compile_timeouts,
             (unsigned long long)s.total_swaps,
             (unsigned long long)s.retired_handles,
             (unsigned long long)s.freed_handles,

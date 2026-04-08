@@ -18,6 +18,7 @@
 #include <unistd.h>      /* unlink, getpid                         */
 #include <pthread.h>     /* pthread_self                           */
 #include <dlfcn.h>       /* dlopen, dlsym, dlerror                */
+#include <signal.h>      /* SIGTERM, SIGKILL, kill                 */
 #include <sys/types.h>
 #include <sys/stat.h>     /* stat, S_ISDIR                         */
 #include <sys/wait.h>     /* waitpid           */
@@ -801,6 +802,78 @@ static const char *level_to_str(opt_level_t level)
     }
 }
 
+/* ─────────────────────────── compiler watchdog ─────────────────────────────── */
+
+/**
+ * Wait for compiler subprocess `pid` to exit, with an optional timeout.
+ *
+ * @param pid         Compiler process PID.
+ * @param timeout_ms  Maximum milliseconds to wait (0 = block indefinitely).
+ * @param timed_out   Output: set to true iff the process was killed on timeout.
+ * @return            true iff the process exited with status 0.
+ *
+ * When timeout_ms > 0 the function polls with waitpid(WNOHANG) every 10 ms.
+ * On expiry: SIGTERM is sent (50 ms grace), then SIGKILL.  The process is
+ * always reaped before returning so no zombie is left behind.
+ */
+static bool cg_wait_compiler(pid_t pid, uint32_t timeout_ms, bool *timed_out)
+{
+    *timed_out = false;
+
+    if (timeout_ms == 0) {
+        /* Blocking wait — original behaviour. */
+        int status = 0;
+        waitpid(pid, &status, 0);
+        return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    }
+
+    /* Polling interval: 10 ms. */
+    const struct timespec poll_interval = { 0, 10 * 1000000L };
+
+    /* Deadline: current monotonic time + timeout. */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    uint64_t deadline_ns = (uint64_t)now.tv_sec * UINT64_C(1000000000)
+                         + (uint64_t)now.tv_nsec
+                         + (uint64_t)timeout_ms * UINT64_C(1000000);
+
+    for (;;) {
+        int status = 0;
+        pid_t ret = waitpid(pid, &status, WNOHANG);
+
+        if (ret == pid) {
+            /* Process exited normally. */
+            return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        }
+        if (ret < 0) {
+            /* waitpid error (e.g. ECHILD) — treat as failure. */
+            return false;
+        }
+
+        /* ret == 0: process still running; check deadline. */
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t now_ns = (uint64_t)now.tv_sec * UINT64_C(1000000000)
+                        + (uint64_t)now.tv_nsec;
+        if (now_ns >= deadline_ns) {
+            /* Timed out: send SIGTERM, wait 50 ms, then SIGKILL, then reap. */
+            kill(pid, SIGTERM);
+            const struct timespec grace = { 0, 50 * 1000000L };
+            nanosleep(&grace, NULL);
+
+            /* Quick non-blocking check in case SIGTERM was enough. */
+            ret = waitpid(pid, &status, WNOHANG);
+            if (ret != pid) {
+                kill(pid, SIGKILL);
+                waitpid(pid, &status, 0);  /* block to reap zombie */
+            }
+            *timed_out = true;
+            return false;
+        }
+
+        nanosleep(&poll_interval, NULL);
+    }
+}
+
 /* ─────────────────────────── main compilation ──────────────────────────────── */
 
 bool codegen_compile(const char          *func_name,
@@ -809,9 +882,10 @@ bool codegen_compile(const char          *func_name,
                      const codegen_opts_t *opts,
                      codegen_result_t     *result)
 {
-    result->fn      = NULL;
-    result->handle  = NULL;
-    result->success = false;
+    result->fn        = NULL;
+    result->handle    = NULL;
+    result->success   = false;
+    result->timed_out = false;
     result->errmsg[0] = '\0';
 
     /* ── 1. Optionally generate an argument-specialisation wrapper ─────── */
@@ -1089,9 +1163,20 @@ bool codegen_compile(const char          *func_name,
         return false;
     }
     {
-        int status = 0;
-        waitpid(cc_pid, &status, 0);
-        rc = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : 1;
+        bool timed_out = false;
+        uint32_t tmo = opts ? opts->compile_timeout_ms : 0;
+        bool cc_ok = cg_wait_compiler(cc_pid, tmo, &timed_out);
+        if (timed_out) {
+            result->timed_out = true;
+            snprintf(result->errmsg, sizeof(result->errmsg),
+                     "codegen: compiler subprocess timed out after %u ms", tmo);
+            if (src_is_memfd) close(src_fd); else unlink(src_path);
+            unlink(so_path);
+            unlink(err_path);
+            free(wrapper_src);
+            return false;
+        }
+        rc = cc_ok ? 0 : 1;
     }
 
     /* Source file is no longer needed. */

@@ -116,6 +116,7 @@ typedef struct {
     jit_func_t  fn;        /**< Pointer to the compiled function (NULL on err). */
     void       *handle;    /**< dlopen handle; pass to dgc_retire() when done.  */
     bool        success;   /**< True iff compilation succeeded.                 */
+    bool        timed_out; /**< True iff the compiler subprocess timed out.     */
     char        errmsg[4096]; /**< Human-readable error message on failure.     */
 } codegen_result_t;
 
@@ -169,6 +170,19 @@ typedef struct {
      * NULL disables caching for this compilation.
      */
     codegen_cache_t *cache;
+
+    /**
+     * Maximum wall-clock time (milliseconds) to wait for the compiler
+     * subprocess to complete.
+     *
+     * When non-zero, codegen_compile() polls waitpid(WNOHANG) in a loop with
+     * 10 ms sleeps.  If the process has not exited by the deadline, it is
+     * sent SIGTERM (with a 50 ms grace period) followed by SIGKILL, and the
+     * compilation is marked as timed out (result->timed_out = true).
+     *
+     * 0 = no timeout (default, backward-compatible).
+     */
+    uint32_t compile_timeout_ms;
 } codegen_opts_t;
 
 /* ─────────────────────────── API ───────────────────────────────────────────── */
