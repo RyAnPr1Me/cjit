@@ -989,9 +989,10 @@ bool codegen_compile(const char          *func_name,
                 const char *err = dlerror();
                 if (!err && sym) {
                     free(wrapper_src);
-                    result->fn      = (jit_func_t)(uintptr_t)sym;
-                    result->handle  = handle;
-                    result->success = true;
+                    result->fn        = (jit_func_t)(uintptr_t)sym;
+                    result->handle    = handle;
+                    result->success   = true;
+                    result->cache_hit = true;
                     if (opts->verbose)
                         fprintf(stderr,
                                 "[cjit/codegen] cache hit '%s' O%d → %p\n",

@@ -117,6 +117,7 @@ typedef struct {
     void       *handle;    /**< dlopen handle; pass to dgc_retire() when done.  */
     bool        success;   /**< True iff compilation succeeded.                 */
     bool        timed_out; /**< True iff the compiler subprocess timed out.     */
+    bool        cache_hit; /**< True iff the result came from the artifact cache.*/
     char        errmsg[4096]; /**< Human-readable error message on failure.     */
 } codegen_result_t;
 

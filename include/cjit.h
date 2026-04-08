@@ -770,6 +770,41 @@ typedef struct {
     uint64_t total_elapsed_ns;
 } cjit_stats_t;
 
+/* ══════════════════════════ compile-event callback ════════════════════════ */
+
+/**
+ * Event record delivered to a user-registered compile callback.
+ *
+ * Populated by the compiler thread after every compilation attempt
+ * (success, failure, or timeout) and passed to the callback before the
+ * compiler thread picks up its next task.
+ *
+ * The callback is invoked from a background compiler thread.  It must be
+ * async-signal-safe with respect to the calling thread: it may use
+ * mutexes and malloc but must not call back into the CJIT engine.
+ */
+typedef struct {
+    func_id_t   func_id;        /**< Numeric ID of the compiled function.      */
+    char        func_name[64];  /**< Symbol name (NUL-terminated, truncated).  */
+    opt_level_t level;          /**< Optimisation level that was attempted.    */
+    bool        success;        /**< True iff compilation succeeded and the
+                                 *   function pointer was swapped.              */
+    bool        timed_out;      /**< True iff the compiler was killed (timeout).*/
+    bool        cache_hit;      /**< True iff result came from artifact cache. */
+    uint32_t    duration_ms;    /**< Wall-clock time the compilation took (ms).*/
+    char        errmsg[256];    /**< Error message on failure (empty on success).*/
+} cjit_compile_event_t;
+
+/**
+ * Compile-event callback type.
+ *
+ * @param event     Read-only pointer to the event record; valid only for the
+ *                  duration of the callback.
+ * @param userdata  Opaque pointer passed to cjit_set_compile_callback().
+ */
+typedef void (*cjit_compile_callback_t)(const cjit_compile_event_t *event,
+                                         void                        *userdata);
+
 /* ══════════════════════════════ public API ════════════════════════════════ */
 
 /**
@@ -814,6 +849,25 @@ void cjit_start(cjit_engine_t *engine);
  * destroyed.  It is not safe to restart a stopped engine.
  */
 void cjit_stop(cjit_engine_t *engine);
+
+/**
+ * Register a compile-event callback.
+ *
+ * The callback is invoked by a compiler thread immediately after every
+ * compilation attempt (success, failure, or timeout).  Only one callback
+ * can be active at a time; a second call replaces the previous one.
+ * Pass NULL to remove the callback.
+ *
+ * Thread safety: safe to call before or after cjit_start().  The new
+ * callback is visible to compiler threads as soon as the function returns.
+ *
+ * @param engine    The engine.
+ * @param cb        Callback function, or NULL to deregister.
+ * @param userdata  Opaque value forwarded to cb unchanged.
+ */
+void cjit_set_compile_callback(cjit_engine_t           *engine,
+                                cjit_compile_callback_t  cb,
+                                void                    *userdata);
 
 /**
  * Register a function with the JIT engine.
@@ -1226,6 +1280,78 @@ void cjit_get_histogram(const cjit_engine_t *engine,
 uint64_t cjit_percentile_ns(const cjit_engine_t *engine,
                              func_id_t            id,
                              unsigned             pct);
+
+/**
+ * Pin a function, preventing the monitor thread from auto-promoting it.
+ *
+ * While pinned:
+ *   • The monitor will not enqueue automatic tier promotions for this function.
+ *   • Manual cjit_request_recompile() calls are unaffected (they work normally).
+ *   • The function can still be dispatched through the normal hot path.
+ *
+ * Pinning is useful when you want to control a function's optimisation level
+ * manually (e.g. after a hot-reload) without the monitor interfering.
+ *
+ * Thread safety: atomic store; safe to call at any time including while the
+ * engine is running.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @return        true on success, false if id is invalid.
+ */
+bool cjit_pin_function(cjit_engine_t *engine, func_id_t id);
+
+/**
+ * Unpin a previously pinned function, re-enabling automatic tier promotion.
+ *
+ * After unpinning, the monitor resumes normal tier-promotion logic.  Any
+ * EMA/streak state that accumulated while the function was pinned is retained;
+ * the function may be promoted on the next scan cycle if the gates are met.
+ *
+ * Thread safety: atomic store; safe to call at any time.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @return        true on success, false if id is invalid.
+ */
+bool cjit_unpin_function(cjit_engine_t *engine, func_id_t id);
+
+/**
+ * Query whether a function is currently pinned.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID.
+ * @return        true if pinned, false if not pinned or id is invalid.
+ */
+bool cjit_is_pinned(const cjit_engine_t *engine, func_id_t id);
+
+/**
+ * Write a snapshot of all registered function IR sources to a directory.
+ *
+ * Creates the directory if it does not exist (mode 0700).  For each
+ * registered function writes:
+ *   <dir>/<name>.c   – the raw IR source (as registered or last updated).
+ *
+ * Also writes a machine-readable manifest:
+ *   <dir>/manifest.txt – one line per function:
+ *       <func_id>\t<name>\t<gen>\t<call_count>\t<opt_level>\n
+ *   where <gen> is HOT, WARM, or COLD.
+ *
+ * IR for COLD functions is loaded from the on-disk IR cache on demand (the
+ * same promotion mechanism used by the compiler thread).  If loading fails
+ * for a COLD entry, that function is skipped and the count reflects only
+ * successfully written files.
+ *
+ * Thread safety: acquires the IR-cache mutex for each entry; safe to call
+ * while the engine is running.  The snapshot is a point-in-time best-effort
+ * copy; concurrent cjit_update_ir() calls may produce a mixed snapshot.
+ *
+ * @param engine  The engine.
+ * @param dir     Path to the output directory (created if absent).
+ * @return        Number of .c files written, or -1 on fatal error (NULL engine,
+ *                NULL dir, or directory creation failure).
+ */
+int cjit_snapshot_ir(cjit_engine_t *engine, const char *dir);
 
 #ifdef __cplusplus
 }

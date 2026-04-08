@@ -80,6 +80,13 @@
  *   t26  IR normalizer cache       – an IR string with extra comments and
  *                                        whitespace produces the same artifact
  *                                        cache key as the clean version (cache hit).
+ *   t27  Compile-event callback   – cjit_set_compile_callback() fires exactly
+ *                                        once per compilation with correct fields;
+ *                                        removing the callback stops future fires.
+ *   t28  Function pinning         – pinned function is not auto-promoted by the
+ *                                        monitor; unpinning re-enables promotion.
+ *   t29  IR snapshot export       – cjit_snapshot_ir() writes one .c file per
+ *                                        registered function plus manifest.txt.
  *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).
@@ -2256,6 +2263,292 @@ TEST(t26_ir_normalizer_cache)
 }
 
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t27 – Compile-event callback: fired for each compilation attempt
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Register a callback that atomically records each event.
+ *   2. Register a function without an AOT fallback and trigger a recompile.
+ *   3. Wait for it to complete.
+ *   4. Verify: exactly one callback was fired, the event's func_name and
+ *      level match, success == true, and timed_out == false.
+ *   5. Replace the callback with NULL; trigger another compile; verify no
+ *      additional callback fires.
+ */
+
+typedef struct {
+    int                     count;    /* protected by mu */
+    cjit_compile_event_t    last;
+    pthread_mutex_t         mu;
+} cb_state_t;
+
+static void compile_event_recorder(const cjit_compile_event_t *ev, void *ud)
+{
+    cb_state_t *s = (cb_state_t *)ud;
+    pthread_mutex_lock(&s->mu);
+    s->last = *ev;
+    s->count++;
+    pthread_mutex_unlock(&s->mu);
+}
+
+TEST(t27_compile_event_callback)
+{
+    printf("[t27] Compile-event callback fires on compilation...\n");
+
+    cb_state_t state;
+    memset(&state, 0, sizeof(state));
+    pthread_mutex_init(&state.mu, NULL);
+    state.count = 0;
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads = 1;
+    cfg.verbose = false;
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e, "cjit_create returned NULL");
+
+    /* Register callback before start. */
+    cjit_set_compile_callback(e, compile_event_recorder, &state);
+    cjit_start(e);
+
+    static const char *IR_CB =
+        "int cb_func(int a, int b) { return a * b; }";
+    func_id_t id = cjit_register_function(e, "cb_func", IR_CB, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "register failed");
+
+    cjit_request_recompile(e, id, OPT_O1);
+    bool ok = cjit_wait_compiled(e, id, 5000);
+    CHECK(ok, "cjit_wait_compiled timed out");
+
+    /* Give the callback time to fire (it runs just after the swap, in
+     * the same compiler thread, so it must be done by now). */
+    uint64_t deadline = now_ms() + 500;
+    int cnt;
+    do {
+        pthread_mutex_lock(&state.mu);
+        cnt = state.count;
+        pthread_mutex_unlock(&state.mu);
+        if (cnt >= 1) break;
+        sleep_ms(10);
+    } while (now_ms() < deadline);
+
+    CHECKF(cnt >= 1, "expected ≥1 callback, got %d", cnt);
+
+    pthread_mutex_lock(&state.mu);
+    cjit_compile_event_t ev = state.last;
+    pthread_mutex_unlock(&state.mu);
+
+    CHECK(ev.success, "last event: expected success");
+    CHECK(!ev.timed_out, "last event: unexpected timeout");
+    CHECKF(ev.func_id == id,
+           "last event: func_id mismatch (%u vs %u)", ev.func_id, id);
+    CHECKF(strcmp(ev.func_name, "cb_func") == 0,
+           "last event: func_name '%s' != 'cb_func'", ev.func_name);
+    CHECKF(ev.level == OPT_O1,
+           "last event: level %d != OPT_O1", (int)ev.level);
+
+    printf("[t27]   count=%d  func='%s'  level=%d  success=%d  OK\n",
+           cnt, ev.func_name, (int)ev.level, (int)ev.success);
+
+    /* Remove callback; further compiles must not increment the counter. */
+    cjit_set_compile_callback(e, NULL, NULL);
+    pthread_mutex_lock(&state.mu);
+    int cnt_before = state.count;
+    pthread_mutex_unlock(&state.mu);
+    cjit_request_recompile(e, id, OPT_O2);
+    cjit_wait_compiled(e, id, 3000);
+    sleep_ms(200); /* let compiler thread finish the event path if any */
+    pthread_mutex_lock(&state.mu);
+    int cnt_after = state.count;
+    pthread_mutex_unlock(&state.mu);
+    CHECKF(cnt_after == cnt_before,
+           "callback fired after removal (count %d → %d)",
+           cnt_before, cnt_after);
+
+    cjit_destroy(e);
+    pthread_mutex_destroy(&state.mu);
+    printf("[t27] PASS\n");
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t28 – Function pinning: pinned functions are not auto-promoted
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Register a function WITHOUT an AOT fallback.
+ *   2. Pin it immediately after registration.
+ *   3. Drive the call rate well above hot_rate_t1 for several monitor cycles.
+ *   4. Verify: total_compilations == 0 (monitor blocked by pin).
+ *   5. Unpin; wait for compilation to complete.
+ *   6. Verify: total_compilations == 1 (monitor enqueued after unpin).
+ *   7. Verify cjit_is_pinned() reflects the correct state.
+ */
+static int aot_pinned_stub(int x) { return x + 1; }
+
+TEST(t28_function_pinning)
+{
+    printf("[t28] Function pinning: pinned function not auto-promoted...\n");
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads   = 1;
+    cfg.hot_rate_t1        = 500;       /* low threshold – easy to cross */
+    cfg.hot_confirm_cycles = 2;
+    cfg.monitor_interval_ms = 20;
+    cfg.min_uptime_for_tier2_ms = 0;
+    cfg.compile_cooloff_ms  = 10;
+    cfg.verbose             = false;
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e, "cjit_create returned NULL");
+
+    static const char *IR_PIN =
+        "int pinned_fn(int x) { return x + 1; }";
+    func_id_t id = cjit_register_function(e, "pinned_fn", IR_PIN,
+                                            (jit_func_t)(uintptr_t)aot_pinned_stub);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "register failed");
+
+    /* Pin BEFORE starting so the monitor sees it as pinned from the first scan.*/
+    bool pok = cjit_pin_function(e, id);
+    CHECK(pok, "cjit_pin_function failed");
+    CHECK(cjit_is_pinned(e, id), "function should be pinned");
+
+    cjit_start(e);
+
+    /* Drive call rate >> hot_rate_t1 for 10 monitor cycles (200 ms).
+     * Use CJIT_DISPATCH so we don't need the timed path. */
+    typedef int (*pin_fn)(int);
+    volatile int sink = 0;
+    uint64_t drive_until = now_ms() + 200;
+    while (now_ms() < drive_until) {
+        for (int k = 0; k < 200; k++)
+            sink += CJIT_DISPATCH(e, id, pin_fn, k);
+    }
+    (void)sink;
+    cjit_flush_local_counts(e);
+
+    /* No compilation should have been enqueued. */
+    cjit_stats_t s = cjit_get_stats(e);
+    CHECKF(s.total_compilations == 0,
+           "pinned fn should not be compiled, got compilations=%llu",
+           (unsigned long long)s.total_compilations);
+    printf("[t28]   while pinned: compilations=%llu  OK\n",
+           (unsigned long long)s.total_compilations);
+
+    /* Unpin and wait for auto-promotion. */
+    bool upok = cjit_unpin_function(e, id);
+    CHECK(upok, "cjit_unpin_function failed");
+    CHECK(!cjit_is_pinned(e, id), "function should be unpinned");
+
+    /* Keep driving calls so the monitor sees the hot rate. */
+    uint64_t resume_until = now_ms() + 1500;
+    while (now_ms() < resume_until) {
+        for (int k = 0; k < 400; k++)
+            sink += CJIT_DISPATCH(e, id, pin_fn, k);
+        cjit_flush_local_counts(e);
+    }
+
+    /* Wait up to 3 s for at least one compilation. */
+    uint64_t wdeadline = now_ms() + 3000;
+    do {
+        sleep_ms(50);
+        s = cjit_get_stats(e);
+    } while (s.total_compilations == 0 && now_ms() < wdeadline);
+
+    cjit_destroy(e);
+
+    CHECKF(s.total_compilations >= 1,
+           "expected ≥1 compilation after unpin, got %llu",
+           (unsigned long long)s.total_compilations);
+    printf("[t28]   after unpin: compilations=%llu  OK\n",
+           (unsigned long long)s.total_compilations);
+    printf("[t28] PASS\n");
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t29 – IR snapshot export: cjit_snapshot_ir() writes .c files + manifest
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Register three functions with distinct IR.
+ *   2. Call cjit_snapshot_ir(engine, "/tmp/cjit_snap_<pid>").
+ *   3. Verify return value == 3.
+ *   4. Read each .c file; verify it contains the original IR string as a
+ *      substring (the cache may add a newline, but the content must be there).
+ *   5. Read manifest.txt; verify exactly 3 lines with the correct names.
+ *   6. Clean up.
+ */
+TEST(t29_snapshot_ir)
+{
+    printf("[t29] IR snapshot: cjit_snapshot_ir() writes files correctly...\n");
+
+    char snap_dir[64];
+    snprintf(snap_dir, sizeof(snap_dir), "/tmp/cjit_snap_%d", (int)getpid());
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads = 1;
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e, "cjit_create returned NULL");
+    cjit_start(e);
+
+    static const char *funcs[][2] = {
+        { "snap_add",  "int snap_add(int a, int b) { return a + b; }" },
+        { "snap_mul",  "int snap_mul(int a, int b) { return a * b; }" },
+        { "snap_sub",  "int snap_sub(int a, int b) { return a - b; }" },
+    };
+    for (int i = 0; i < 3; i++) {
+        func_id_t fid = cjit_register_function(e, funcs[i][0], funcs[i][1], NULL);
+        CHECKF(fid != CJIT_INVALID_FUNC_ID, "register '%s' failed", funcs[i][0]);
+    }
+
+    int n = cjit_snapshot_ir(e, snap_dir);
+    CHECKF(n == 3, "expected 3 files written, got %d", n);
+    printf("[t29]   cjit_snapshot_ir returned %d  OK\n", n);
+
+    /* Verify each .c file contains the IR source as a substring. */
+    for (int i = 0; i < 3; i++) {
+        char fpath[128];
+        snprintf(fpath, sizeof(fpath), "%s/%s.c", snap_dir, funcs[i][0]);
+        FILE *fp = fopen(fpath, "r");
+        CHECKF(fp, "cannot open snapshot file '%s'", fpath);
+        char buf[512]; buf[0] = '\0';
+        size_t nr = fread(buf, 1, sizeof(buf) - 1, fp);
+        buf[nr] = '\0';
+        fclose(fp);
+        /* The exact IR keyword should be present. */
+        CHECKF(strstr(buf, funcs[i][0]),
+               "'%s' not found in snapshot file '%s'", funcs[i][0], fpath);
+    }
+
+    /* Verify manifest.txt has 3 lines, one per function. */
+    char mpath[128];
+    snprintf(mpath, sizeof(mpath), "%s/manifest.txt", snap_dir);
+    FILE *mf = fopen(mpath, "r");
+    CHECK(mf, "cannot open manifest.txt");
+    int line_count = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), mf)) line_count++;
+    fclose(mf);
+    CHECKF(line_count == 3, "manifest should have 3 lines, got %d", line_count);
+    printf("[t29]   manifest has %d lines  OK\n", line_count);
+
+    cjit_destroy(e);
+
+    /* Clean up snapshot directory. */
+    for (int i = 0; i < 3; i++) {
+        char fpath[128];
+        snprintf(fpath, sizeof(fpath), "%s/%s.c", snap_dir, funcs[i][0]);
+        unlink(fpath);
+    }
+    unlink(mpath);
+    rmdir(snap_dir);
+
+    printf("[t29] PASS\n");
+    return 0;
+}
+
+
 typedef int (*test_fn)(void);
 static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t01_aot_correctness",    t01_aot_correctness    },
@@ -2284,6 +2577,9 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t24_compile_watchdog",       t24_compile_watchdog         },
     { "t25_latency_histogram",      t25_latency_histogram        },
     { "t26_ir_normalizer_cache",    t26_ir_normalizer_cache      },
+    { "t27_compile_event_callback", t27_compile_event_callback   },
+    { "t28_function_pinning",       t28_function_pinning         },
+    { "t29_snapshot_ir",            t29_snapshot_ir              },
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 

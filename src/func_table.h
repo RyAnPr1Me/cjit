@@ -193,6 +193,14 @@ typedef struct {
      * sufficient for profiling purposes.
      */
     atomic_uint_fast32_t        hist_counts[CJIT_HIST_BUCKETS];
+
+    /**
+     * Pin flag: when true the monitor thread will not auto-promote this
+     * function.  Written by cjit_pin_function() / cjit_unpin_function();
+     * read by the monitor thread (relaxed load).
+     * Manual cjit_request_recompile() is never blocked by this flag.
+     */
+    atomic_bool                 pinned;
 } func_table_entry_t;
 
 /* ─────────────────────────── table ─────────────────────────────────────────── */

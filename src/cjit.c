@@ -145,6 +145,7 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <sys/stat.h>  /* mkdir */
 #ifdef __linux__
 #include <sched.h>    /* sched_getaffinity, CPU_COUNT */
 #endif
@@ -304,6 +305,21 @@ struct cjit_engine {
      */
     pthread_mutex_t compile_done_mutex;
     pthread_cond_t  compile_done_cond;
+
+    /*
+     * Compile-event callback (optional).
+     *
+     * Called by compiler threads after every compilation attempt (success,
+     * failure, or timeout) with a cjit_compile_event_t snapshot.
+     *
+     * Both fields are protected by a single mutex so that the callback + its
+     * userdata are always updated and read atomically.  The mutex is acquired
+     * once per compilation event — an infrequent operation, never on the hot
+     * dispatch path.
+     */
+    pthread_mutex_t         cb_mutex;
+    cjit_compile_callback_t compile_cb;
+    void                   *compile_cb_userdata;
 };
 
 /* ══════════════════════════ internal helpers ══════════════════════════════ */
@@ -584,6 +600,24 @@ static void *compiler_thread_fn(void *raw_arg)
             pthread_mutex_lock(&engine->compile_done_mutex);
             pthread_cond_broadcast(&engine->compile_done_cond);
             pthread_mutex_unlock(&engine->compile_done_mutex);
+            /* Fire compile-event callback (failure path). */
+            pthread_mutex_lock(&engine->cb_mutex);
+            cjit_compile_callback_t cb = engine->compile_cb;
+            void *cb_ud = engine->compile_cb_userdata;
+            pthread_mutex_unlock(&engine->cb_mutex);
+            if (cb) {
+                cjit_compile_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.func_id    = task.func_id;
+                snprintf(ev.func_name, sizeof(ev.func_name), "%s", entry->name);
+                ev.level      = task.target_level;
+                ev.success    = false;
+                ev.timed_out  = cres.timed_out;
+                ev.cache_hit  = false;
+                ev.duration_ms = dur_ms;
+                snprintf(ev.errmsg, sizeof(ev.errmsg), "%.255s", cres.errmsg);
+                cb(&ev, cb_ud);
+            }
             continue;
         }
 
@@ -605,6 +639,24 @@ static void *compiler_thread_fn(void *raw_arg)
         pthread_mutex_lock(&engine->compile_done_mutex);
         pthread_cond_broadcast(&engine->compile_done_cond);
         pthread_mutex_unlock(&engine->compile_done_mutex);
+
+        /* Fire compile-event callback (success path). */
+        pthread_mutex_lock(&engine->cb_mutex);
+        cjit_compile_callback_t cb2 = engine->compile_cb;
+        void *cb2_ud = engine->compile_cb_userdata;
+        pthread_mutex_unlock(&engine->cb_mutex);
+        if (cb2) {
+            cjit_compile_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.func_id    = task.func_id;
+            snprintf(ev.func_name, sizeof(ev.func_name), "%s", entry->name);
+            ev.level      = task.target_level;
+            ev.success    = true;
+            ev.timed_out  = false;
+            ev.cache_hit  = cres.cache_hit;
+            ev.duration_ms = dur_ms;
+            cb2(&ev, cb2_ud);
+        }
 
         if (engine->cfg.verbose)
             fprintf(stderr,
@@ -806,6 +858,10 @@ static void *monitor_thread_fn(void *arg)
                 tier_skip_pending[i] = false;
                 continue;
             }
+
+            /* ── Pinned: skip auto-promotion ────────────────────────────── */
+            if (atomic_load_explicit(&entry->pinned, memory_order_relaxed))
+                continue;
 
             /* ── Warm-up prefetch (one-shot, non-blocking) ─────────────── */
             if (!prefetch_done[i] && engine->ir_cache &&
@@ -1279,6 +1335,11 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
     pthread_mutex_init(&e->compile_done_mutex, NULL);
     pthread_cond_init(&e->compile_done_cond, NULL);
 
+    /* Compile-event callback (starts with no callback registered). */
+    pthread_mutex_init(&e->cb_mutex, NULL);
+    e->compile_cb          = NULL;
+    e->compile_cb_userdata = NULL;
+
     /* Dynamic thread arrays. */
     e->compiler_threads = calloc(e->cfg.compiler_threads, sizeof(pthread_t));
     e->thread_args      = calloc(e->cfg.compiler_threads,
@@ -1374,6 +1435,7 @@ void cjit_destroy(cjit_engine_t *engine)
 
     pthread_cond_destroy(&engine->compile_done_cond);
     pthread_mutex_destroy(&engine->compile_done_mutex);
+    pthread_mutex_destroy(&engine->cb_mutex);
 
     free(engine->work_queues);
     free(engine->compiler_threads);
@@ -1880,4 +1942,117 @@ bool cjit_wait_compiled(cjit_engine_t *engine,
                   != NULL);
     pthread_mutex_unlock(&engine->compile_done_mutex);
     return ready;
+}
+
+/* ══════════════════════════ Feature D: compile-event callback ═════════════ */
+
+void cjit_set_compile_callback(cjit_engine_t           *engine,
+                                cjit_compile_callback_t  cb,
+                                void                    *userdata)
+{
+    if (!engine) return;
+    pthread_mutex_lock(&engine->cb_mutex);
+    engine->compile_cb          = cb;
+    engine->compile_cb_userdata = userdata;
+    pthread_mutex_unlock(&engine->cb_mutex);
+}
+
+/* ══════════════════════════ Feature E: function pinning ════════════════════ */
+
+bool cjit_pin_function(cjit_engine_t *engine, func_id_t id)
+{
+    if (!engine) return false;
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (!e) return false;
+    atomic_store_explicit(&e->pinned, true, memory_order_relaxed);
+    return true;
+}
+
+bool cjit_unpin_function(cjit_engine_t *engine, func_id_t id)
+{
+    if (!engine) return false;
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (!e) return false;
+    atomic_store_explicit(&e->pinned, false, memory_order_relaxed);
+    return true;
+}
+
+bool cjit_is_pinned(const cjit_engine_t *engine, func_id_t id)
+{
+    if (!engine) return false;
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (!e) return false;
+    return atomic_load_explicit(&e->pinned, memory_order_relaxed);
+}
+
+/* ══════════════════════════ Feature F: IR snapshot export ══════════════════ */
+
+int cjit_snapshot_ir(cjit_engine_t *engine, const char *dir)
+{
+    if (!engine || !dir) return -1;
+
+    /* Create the directory if it does not exist (mode 0700). */
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+        return -1;
+
+    uint32_t nf = atomic_load_explicit(&engine->ftable->count,
+                                        memory_order_acquire);
+    if (nf == 0) return 0;
+
+    /* Open the manifest file first; if this fails return error. */
+    char manifest_path[512];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.txt", dir);
+    FILE *mf = fopen(manifest_path, "w");
+    if (!mf) return -1;
+
+    static const char *gen_names[] = { "HOT", "WARM", "COLD" };
+
+    int written = 0;
+    for (uint32_t i = 0; i < nf; i++) {
+        func_table_entry_t *entry = &engine->ftable->entries[i];
+
+        /* Retrieve IR from the cache (promotes COLD → WARM as a side effect;
+         * returns a heap copy that we must free). */
+        char *ir = NULL;
+        if (engine->ir_cache)
+            ir = ir_cache_get_ir(engine->ir_cache, (func_id_t)i);
+
+        if (!ir) {
+            /* Fall back to the pointer in the function-table entry (may be
+             * the original registration pointer if not yet cached on disk). */
+            ir = engine->ftable->entries[i].ir_source
+                     ? strdup(engine->ftable->entries[i].ir_source)
+                     : NULL;
+        }
+
+        /* Write the .c file. */
+        if (ir) {
+            char fpath[512];
+            snprintf(fpath, sizeof(fpath), "%s/%s.c", dir, entry->name);
+            FILE *fp = fopen(fpath, "w");
+            if (fp) {
+                fputs(ir, fp);
+                fputc('\n', fp);
+                fclose(fp);
+                written++;
+            }
+            free(ir);
+        }
+
+        /* Manifest line: id  name  gen  call_cnt  opt_level */
+        uint8_t gen = engine->ir_cache
+            ? ir_cache_get_generation(engine->ir_cache, (func_id_t)i)
+            : (uint8_t)0;
+        if (gen > 2) gen = 2;
+        uint64_t calls = atomic_load_explicit(&entry->call_cnt,
+                                               memory_order_relaxed);
+        int lvl = atomic_load_explicit(&entry->cur_level,
+                                        memory_order_relaxed);
+        fprintf(mf, "%u\t%s\t%s\t%llu\t%d\n",
+                i, entry->name, gen_names[gen],
+                (unsigned long long)calls, lvl);
+    }
+
+    fclose(mf);
+    return written;
 }
