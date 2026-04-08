@@ -48,6 +48,12 @@
  *                                        vectorise + unroll + march=native
  *                                        gives correct results over 1 000
  *                                        iterations.
+ *   t19  Performance benchmark     – measures compile latency (ms) and
+ *                                        dispatch throughput (Mcall/s) at AOT,
+ *                                        O1, O2, O3 for an integer dot-product;
+ *                                        reports speedup vs AOT; asserts
+ *                                        correctness and compile < 10 s per
+ *                                        tier and O3 not 3× slower than O1.
  *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).
@@ -134,6 +140,14 @@ static int  aot_identity(int x)        { return x; }
 static long aot_sum_range(int lo, int hi) /* inclusive */
 {
     long s = 0; for (int i = lo; i <= hi; ++i) s += i; return s;
+}
+
+/* Reference dot-product used as the AOT baseline in t19_perf_benchmark. */
+static long aot_dot_int(const int *a, const int *b, int n)
+{
+    long s = 0;
+    for (int i = 0; i < n; ++i) s += (long)a[i] * b[i];
+    return s;
 }
 
 /* Reference prime sieve (returns count of primes ≤ limit). */
@@ -1113,10 +1127,15 @@ TEST(t15_extra_cflags)
 /* ─────────────────────────────────────────────────────────────────────────
  * t16 – JIT pointer is NOT the AOT fallback after compilation
  * ─────────────────────────────────────────────────────────────────────────
- * Verifies end-to-end that cjit_request_recompile() + cjit_wait_compiled()
- * results in the function-table entry being updated to a NEW pointer that is
- * distinct from the original AOT fallback — proving that a real compiled
- * binary was loaded and installed, not just the fallback pointer kept.
+ * Verifies end-to-end that cjit_request_recompile() results in the
+ * function-table entry being updated to a NEW pointer distinct from the
+ * original AOT fallback — proving that a real compiled binary was loaded
+ * and installed, not just the fallback pointer kept.
+ *
+ * NOTE: cjit_wait_compiled() fast-paths when func_ptr is already non-NULL
+ * (i.e. the AOT fallback is set), so we use wait_for(check_opt, …) which
+ * waits until cur_level reaches the requested tier — that transition only
+ * occurs after a successful JIT compilation and pointer swap.
  */
 TEST(t16_jit_replaces_aot)
 {
@@ -1135,14 +1154,21 @@ TEST(t16_jit_replaces_aot)
     cjit_start(e);
     cjit_request_recompile(e, id, OPT_O2);
 
-    bool ok = cjit_wait_compiled(e, id, 5000);
-    CHECK(ok, "JIT compilation did not complete within 5 s");
+    /*
+     * Wait until cur_level reaches OPT_O2.  cur_level is updated by the
+     * compiler thread only AFTER func_table_swap() completes, so reaching
+     * OPT_O2 here is a strict proof that (a) compilation succeeded and
+     * (b) the new JIT pointer was atomically installed.
+     */
+    wait_arg_t wa = { e, id, OPT_O2 };
+    bool ok = wait_for(check_opt, &wa, 5000);
+    CHECK(ok, "JIT compilation did not reach OPT_O2 within 5 s");
 
     jit_func_t post = cjit_get_func(e, id);
 
     /* Core assertion: a new pointer was installed (not the AOT fallback). */
-    CHECK(post != NULL,                  "func_ptr is NULL after compilation");
-    CHECK(post != (jit_func_t)aot_add,  "func_ptr still points to AOT fallback after JIT compile");
+    CHECK(post != NULL,                 "func_ptr is NULL after compilation");
+    CHECK(post != (jit_func_t)aot_add, "func_ptr still points to AOT fallback after JIT compile");
     CHECK(cjit_get_recompile_count(e, id) >= 1, "recompile_count == 0 after JIT compile");
     CHECK(cjit_get_current_opt_level(e, id) == OPT_O2, "opt_level != OPT_O2 after O2 compile");
 
@@ -1292,6 +1318,163 @@ TEST(t18_o3_vectorised_correctness)
     return 0;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+ * t19 – JIT performance benchmark
+ * ─────────────────────────────────────────────────────────────────────────
+ * Measures three dimensions of JIT quality for an integer dot-product
+ * workload (N = 1024 elements):
+ *
+ *   1. Compilation latency (ms)   – how long does it take to JIT-compile
+ *      the function at each optimisation tier?
+ *
+ *   2. Dispatch throughput (Mcall/s) – how many calls/second can the
+ *      JIT-compiled function sustain compared to the AOT baseline?
+ *
+ *   3. Speedup vs AOT – ratio of AOT-ns / JIT-ns for each tier.
+ *
+ * PASS conditions (hard assertions):
+ *   • Every compilation completes within 10 seconds.
+ *   • Every JIT tier produces the correct result.
+ *   • O3 throughput is not more than 3× worse than O1 (guards against
+ *     catastrophic flag regressions; 3× gives generous CI-noise margin).
+ *
+ * All timing numbers are printed so they can be inspected in CI logs
+ * without needing a dedicated profiler run.
+ */
+
+/* Number of call repetitions per tier for the throughput measurement.
+ * 100 000 reps × 1024 multiply-adds ≈ 100 M MACs per tier sweep,
+ * yielding a clean ≥ 10 ms wall-clock window even on slow CI machines. */
+#define PERF_REPS 100000
+
+TEST(t19_perf_benchmark)
+{
+    printf("[t19] Performance benchmark: compile latency + dispatch throughput...\n");
+
+    /* ── Test vectors ─────────────────────────────────────────────────── */
+    enum { PN = 1024 };
+    int  pa[PN], pb[PN];
+    long pref = 0;
+    for (int i = 0; i < PN; ++i) {
+        pa[i] = i + 1;
+        pb[i] = PN - i;
+        pref += (long)pa[i] * pb[i];
+    }
+
+    /* ── AOT baseline throughput ──────────────────────────────────────── */
+    volatile long psink = 0;
+    uint64_t pt0 = cjit_timestamp_ns();
+    for (int i = 0; i < PERF_REPS; ++i)
+        psink += aot_dot_int(pa, pb, PN);
+    uint64_t aot_ns = cjit_timestamp_ns() - pt0;
+    (void)psink;
+
+    double aot_mcps = (double)PERF_REPS / (double)aot_ns * 1000.0;
+    printf("[t19]   AOT baseline : %7.2f Mcall/s  (%4llu ms for %d calls, N=%d)\n",
+           aot_mcps,
+           (unsigned long long)(aot_ns / 1000000ULL),
+           PERF_REPS, PN);
+
+    /* ── JIT engine with full optimisations ──────────────────────────── */
+    cjit_config_t cfg        = cjit_default_config();
+    cfg.verbose              = false;
+    cfg.monitor_interval_ms  = 50;
+    cfg.enable_inlining      = true;
+    cfg.enable_vectorization = true;
+    cfg.enable_loop_unroll   = true;
+    cfg.enable_native_arch   = true;
+    cfg.hot_ir_cache_size    = 4;
+    cfg.warm_ir_cache_size   = 8;
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e != NULL, "engine creation failed");
+
+    func_id_t pid = cjit_register_function(e, "dot_int", IR_DOT_INT,
+                                            (jit_func_t)aot_dot_int);
+    CHECK(pid != CJIT_INVALID_FUNC_ID, "registration failed");
+    cjit_start(e);
+
+    typedef long (*dot_fn_t)(const int *, const int *, int);
+
+    struct {
+        opt_level_t  lvl;
+        const char  *name;
+        uint64_t     compile_ns; /* wall-clock from request → tier reached  */
+        uint64_t     run_ns;     /* wall-clock for PERF_REPS calls           */
+    } tiers[] = {
+        { OPT_O1, "O1", 0, 0 },
+        { OPT_O2, "O2", 0, 0 },
+        { OPT_O3, "O3", 0, 0 },
+    };
+
+    for (int ti = 0; ti < 3; ++ti) {
+
+        /* ── Request compilation and time it ───────────────────────── */
+        uint64_t compile_start = cjit_timestamp_ns();
+        cjit_request_recompile(e, pid, tiers[ti].lvl);
+
+        wait_arg_t wa = { e, pid, tiers[ti].lvl };
+        bool compiled = wait_for(check_opt, &wa, 10000);
+        tiers[ti].compile_ns = cjit_timestamp_ns() - compile_start;
+
+        CHECKF(compiled,
+               "Compile to %s timed out after %.0f ms",
+               tiers[ti].name, (double)tiers[ti].compile_ns / 1e6);
+
+        CHECKF(tiers[ti].compile_ns < (uint64_t)10000 * 1000000ULL,
+               "Compile to %s took %.0f ms — exceeds 10 000 ms limit",
+               tiers[ti].name, (double)tiers[ti].compile_ns / 1e6);
+
+        /* ── Correctness check at this tier ─────────────────────── */
+        dot_fn_t fn = (dot_fn_t)cjit_get_func(e, pid);
+        CHECK(fn != NULL, "func_ptr NULL after compilation");
+
+        long pgot = fn(pa, pb, PN);
+        CHECKF(pgot == pref,
+               "%s dot_int(N=%d) = %ld, want %ld",
+               tiers[ti].name, PN, pgot, pref);
+
+        /* ── Throughput measurement ──────────────────────────────── */
+        volatile long psink2 = 0;
+        pt0 = cjit_timestamp_ns();
+        for (int i = 0; i < PERF_REPS; ++i)
+            psink2 += fn(pa, pb, PN);
+        tiers[ti].run_ns = cjit_timestamp_ns() - pt0;
+        (void)psink2;
+
+        double mcps    = (double)PERF_REPS / (double)tiers[ti].run_ns * 1000.0;
+        double speedup = (double)aot_ns    / (double)tiers[ti].run_ns;
+
+        printf("[t19]   JIT %-2s      : %7.2f Mcall/s  (%4llu ms) | "
+               "compile %4llu ms | speedup %.2fx vs AOT\n",
+               tiers[ti].name, mcps,
+               (unsigned long long)(tiers[ti].run_ns   / 1000000ULL),
+               (unsigned long long)(tiers[ti].compile_ns / 1000000ULL),
+               speedup);
+    }
+
+    /* ── Sanity assertion: O3 must not catastrophically regress vs O1 ── *
+     * 3× slack is intentionally generous to absorb CI load spikes.      *
+     * This specifically catches broken compiler-flag configurations where *
+     * O3 produces slower code than O1 (e.g. flag typo, wrong cc_binary). */
+    CHECKF(tiers[2].run_ns <= tiers[0].run_ns * 3,
+           "O3 throughput catastrophically worse than O1: "
+           "O3=%llu ns, O1=%llu ns (ratio=%.1fx > 3.0x limit)",
+           (unsigned long long)tiers[2].run_ns,
+           (unsigned long long)tiers[0].run_ns,
+           (double)tiers[2].run_ns / (double)tiers[0].run_ns);
+
+    cjit_stats_t ps = cjit_get_stats(e);
+    printf("[t19]   engine stats : compilations=%llu swaps=%llu queue_depth=%u\n",
+           (unsigned long long)ps.total_compilations,
+           (unsigned long long)ps.total_swaps,
+           ps.queue_depth);
+
+    cjit_destroy(e);
+    printf("[t19] PASS\n");
+    return 0;
+}
+
 
 
 typedef int (*test_fn)(void);
@@ -1314,6 +1497,7 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t16_jit_replaces_aot",         t16_jit_replaces_aot         },
     { "t17_dladdr_compiled_object",   t17_dladdr_compiled_object   },
     { "t18_o3_vectorised_correctness",t18_o3_vectorised_correctness},
+    { "t19_perf_benchmark",           t19_perf_benchmark           },
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 
