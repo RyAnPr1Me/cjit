@@ -112,6 +112,7 @@
 #include <pthread.h>
 #include <dlfcn.h>   /* dladdr – verify JIT function is in a loaded shared object */
 #include <sys/stat.h> /* chmod */
+#include <dirent.h>  /* opendir, readdir — for rmdir_recursive */
 
 #include "../include/cjit.h"
 
@@ -157,6 +158,23 @@ static bool wait_for(bool (*fn)(void *), void *arg, long timeout_ms)
         sleep_ms(50);
     }
     return fn(arg);
+}
+
+/* Recursively delete a directory containing only regular files (no nesting).
+ * Used to clean up /tmp cache and snapshot directories created by tests. */
+static void rmdir_recursive(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue; /* skip . and .. */
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        unlink(path);
+    }
+    closedir(d);
+    rmdir(dir);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1740,8 +1758,9 @@ TEST(t21_artifact_cache)
     printf("[t21] Artifact cache: warm-hit skips compiler subprocess...\n");
 
     /* Use a unique temporary directory scoped to this test run. */
-    char cache_dir[256];
-    snprintf(cache_dir, sizeof(cache_dir), "/tmp/cjit_test_cache_%d", (int)getpid());
+    char cache_dir_template[] = "/tmp/cjit_test_cache_XXXXXX";
+    char *cache_dir = mkdtemp(cache_dir_template);
+    CHECK(cache_dir, "mkdtemp for cache_dir failed");
 
     /* ── Pass 1: cold miss → compiler runs, result cached ────────────── */
     {
@@ -1835,11 +1854,7 @@ TEST(t21_artifact_cache)
     }
 
     /* Clean up the temporary cache directory (best effort). */
-    {
-        char cmd[300];
-        snprintf(cmd, sizeof(cmd), "rm -rf %s", cache_dir);
-        int _r = system(cmd); (void)_r;
-    }
+    rmdir_recursive(cache_dir);
 
     printf("[t21] PASS\n");
     return 0;
@@ -2034,18 +2049,17 @@ TEST(t24_compile_watchdog)
 
     /* Write a fake compiler that sleeps 30 s.
      * Keep the path ≤ CJIT_MAX_CC_BINARY - 1 = 63 chars. */
-    char script_path[64];
-    snprintf(script_path, sizeof(script_path),
-             "/tmp/cjit_cc_%d.sh", (int)getpid());
-    {
-        /* Create with 0755 at open() time to avoid TOCTOU between write and chmod. */
-        int sfd = open(script_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-        CHECK(sfd >= 0, "could not create fake compiler script");
-        FILE *f = fdopen(sfd, "w");
-        if (!f) { close(sfd); CHECK(false, "fdopen failed for fake compiler script"); }
-        fprintf(f, "#!/bin/sh\nsleep 30\n");
-        fclose(f);  /* also closes sfd */
-    }
+    /* Create the fake "compiler" script via mkstemp to avoid a predictable
+     * /tmp path.  We need the path to pass it to the engine as cc_binary. */
+    char script_path[] = "/tmp/cjit_cc_XXXXXX";
+    int sfd = mkstemp(script_path);
+    CHECK(sfd >= 0, "mkstemp for fake compiler script failed");
+    /* Make the script executable before writing content. */
+    fchmod(sfd, 0700);
+    FILE *f = fdopen(sfd, "w");
+    if (!f) { close(sfd); unlink(script_path); CHECK(false, "fdopen failed for fake compiler script"); }
+    fprintf(f, "#!/bin/sh\nsleep 30\n");
+    fclose(f);  /* also closes sfd */
 
     cjit_config_t cfg = cjit_default_config();
     cfg.compiler_threads    = 1;
@@ -2194,9 +2208,9 @@ TEST(t26_ir_normalizer_cache)
 {
     printf("[t26] IR normalizer: reformatted IR maps to same cache key...\n");
 
-    char cache_dir[256];
-    snprintf(cache_dir, sizeof(cache_dir),
-             "/tmp/cjit_norm_cache_%d", (int)getpid());
+    char cache_dir_t26[] = "/tmp/cjit_norm_cache_XXXXXX";
+    char *cache_dir = mkdtemp(cache_dir_t26);
+    CHECK(cache_dir, "mkdtemp for t26 cache_dir failed");
 
     /* ── Pass 1: clean IR → cold miss ─────────────────────────────────── */
     {
@@ -2258,6 +2272,7 @@ TEST(t26_ir_normalizer_cache)
         cjit_destroy(e);
     }
 
+    rmdir_recursive(cache_dir);
     printf("[t26] PASS\n");
     return 0;
 }
@@ -2472,7 +2487,7 @@ TEST(t28_function_pinning)
  *
  * Strategy:
  *   1. Register three functions with distinct IR.
- *   2. Call cjit_snapshot_ir(engine, "/tmp/cjit_snap_<pid>").
+ *   2. Call cjit_snapshot_ir(engine, mkdtemp("/tmp/cjit_snap_XXXXXX")).
  *   3. Verify return value == 3.
  *   4. Read each .c file; verify it contains the original IR string as a
  *      substring (the cache may add a newline, but the content must be there).
@@ -2483,8 +2498,10 @@ TEST(t29_snapshot_ir)
 {
     printf("[t29] IR snapshot: cjit_snapshot_ir() writes files correctly...\n");
 
-    char snap_dir[64];
-    snprintf(snap_dir, sizeof(snap_dir), "/tmp/cjit_snap_%d", (int)getpid());
+    /* Use a randomised temp directory to avoid symlink-attack vectors. */
+    char snap_dir_template[] = "/tmp/cjit_snap_XXXXXX";
+    char *snap_dir = mkdtemp(snap_dir_template);
+    CHECK(snap_dir, "mkdtemp for snap_dir failed");
 
     cjit_config_t cfg = cjit_default_config();
     cfg.compiler_threads = 1;
@@ -2536,13 +2553,7 @@ TEST(t29_snapshot_ir)
     cjit_destroy(e);
 
     /* Clean up snapshot directory. */
-    for (int i = 0; i < 3; i++) {
-        char fpath[128];
-        snprintf(fpath, sizeof(fpath), "%s/%s.c", snap_dir, funcs[i][0]);
-        unlink(fpath);
-    }
-    unlink(mpath);
-    rmdir(snap_dir);
+    rmdir_recursive(snap_dir);
 
     printf("[t29] PASS\n");
     return 0;

@@ -17,6 +17,8 @@
 #include <stdatomic.h>   /* atomic_fetch_add                       */
 #include <unistd.h>      /* unlink, getpid                         */
 #include <pthread.h>     /* pthread_self                           */
+#include <stdint.h>      /* uintptr_t                              */
+#include <inttypes.h>    /* PRIxPTR                                */
 #include <dlfcn.h>       /* dlopen, dlsym, dlerror                */
 #include <signal.h>      /* SIGTERM, SIGKILL, kill                 */
 #include <sys/types.h>
@@ -763,9 +765,9 @@ static void make_temp_prefix(char *buf, size_t sz)
 {
     uint64_t serial = atomic_fetch_add_explicit(&codegen_serial, 1,
                                                 memory_order_relaxed);
-    snprintf(buf, sz, "/tmp/cjit_%d_%lu_%llu",
+    snprintf(buf, sz, "/tmp/cjit_%d_%"PRIxPTR"_%llu",
              (int)getpid(),
-             (unsigned long)pthread_self(),
+             (uintptr_t)pthread_self(),
              (unsigned long long)serial);
 }
 
@@ -782,10 +784,10 @@ static void make_so_path(char *buf, size_t sz)
 {
     uint64_t serial = atomic_fetch_add_explicit(&codegen_serial, 1,
                                                 memory_order_relaxed);
-    snprintf(buf, sz, "%s/cjit_%d_%lu_%llu.so",
+    snprintf(buf, sz, "%s/cjit_%d_%"PRIxPTR"_%llu.so",
              cg_so_tmpdir(),
              (int)getpid(),
-             (unsigned long)pthread_self(),
+             (uintptr_t)pthread_self(),
              (unsigned long long)serial);
 }
 

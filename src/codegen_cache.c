@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <pthread.h>
+#include <inttypes.h>   /* PRIx64 */
 
 /* ─────────────────────────── constants ─────────────────────────────────────── */
 
@@ -156,8 +157,7 @@ struct codegen_cache {
 static void cc_make_path(const codegen_cache_t *c, uint64_t key,
                           char *out, size_t outsz)
 {
-    snprintf(out, outsz, "%s/%016llx.so", c->dir,
-             (unsigned long long)key);
+    snprintf(out, outsz, "%s/%016" PRIx64 ".so", c->dir, key);
 }
 
 /*
@@ -306,9 +306,9 @@ bool codegen_cache_store(codegen_cache_t *c, uint64_t key, const char *so_path)
          * rename within the cache dir (same device → atomic).
          */
         char tmp[CC_PATH_MAX + 32];
-        snprintf(tmp, sizeof(tmp), "%s/.tmp_%016llx_%d_%lu.so",
-                 c->dir, (unsigned long long)key, (int)getpid(),
-                 (unsigned long)pthread_self());
+        snprintf(tmp, sizeof(tmp), "%s/.tmp_%016" PRIx64 "_%d_%"PRIxPTR ".so",
+                 c->dir, (uint64_t)key, (int)getpid(),
+                 (uintptr_t)pthread_self());
 
         if (!cc_copy_file(so_path, tmp)) {
             /* Copy failed; keep so_path intact for the caller to unlink. */
