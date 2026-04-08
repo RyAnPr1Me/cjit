@@ -292,6 +292,19 @@ struct cjit_engine {
     atomic_uint_fast64_t stat_tier_skips;        /**< O0→O3 tier-skip promotions. */
     atomic_uint_fast64_t stat_predictive_promos; /**< Slope-lookahead early promotions. */
 
+    /**
+     * Count of compiler threads that have acquired compile_lock and are
+     * actively compiling (between compile_lock acquire and release).
+     *
+     * Incremented by every compiler thread (or cjit_compile_sync) just
+     * before acquiring compile_lock; decremented immediately after
+     * releasing it.  Used by cjit_drain_queue() to detect the window
+     * between in_queue=false (cleared before the lock) and the actual
+     * end of compilation.  Written and read with relaxed ordering since
+     * cjit_drain_queue() polls with nanosleep pauses between reads.
+     */
+    atomic_uint_fast32_t active_compilations;
+
     /*
      * Condition variable signaled after every compilation attempt (success or
      * failure).  Used by cjit_wait_compiled() to block efficiently without
@@ -498,8 +511,14 @@ static void *compiler_thread_fn(void *raw_arg)
             continue;
         }
 
-        /* Acquire per-entry compile lock (non-blocking trylock). */
+        /* Acquire per-entry compile lock (non-blocking trylock).
+         * Increment active_compilations first so cjit_drain_queue() can
+         * observe in-flight work even after in_queue is cleared. */
+        atomic_fetch_add_explicit(&engine->active_compilations, 1,
+                                  memory_order_relaxed);
         if (pthread_mutex_trylock(&entry->compile_lock) != 0) {
+            atomic_fetch_sub_explicit(&engine->active_compilations, 1,
+                                      memory_order_relaxed);
             /*
              * Another thread is already compiling this function.
              *
@@ -555,6 +574,8 @@ static void *compiler_thread_fn(void *raw_arg)
             fprintf(stderr, "[cjit/compiler#%u] no IR for '%s'\n",
                     me, entry->name);
             pthread_mutex_unlock(&entry->compile_lock);
+            atomic_fetch_sub_explicit(&engine->active_compilations, 1,
+                                      memory_order_relaxed);
             free(ir_cache_copy);
             continue;
         }
@@ -596,6 +617,8 @@ static void *compiler_thread_fn(void *raw_arg)
                         me, entry->name, cres.errmsg);
             }
             pthread_mutex_unlock(&entry->compile_lock);
+            atomic_fetch_sub_explicit(&engine->active_compilations, 1,
+                                      memory_order_relaxed);
             /* Wake any cjit_wait_compiled() caller so it can detect failure. */
             pthread_mutex_lock(&engine->compile_done_mutex);
             pthread_cond_broadcast(&engine->compile_done_cond);
@@ -631,6 +654,8 @@ static void *compiler_thread_fn(void *raw_arg)
         atomic_fetch_add_explicit(&engine->stat_swaps, 1,
                                   memory_order_relaxed);
         pthread_mutex_unlock(&entry->compile_lock);
+        atomic_fetch_sub_explicit(&engine->active_compilations, 1,
+                                  memory_order_relaxed);
 
         /* Retire old handle – GC thread dlclose's after the grace period. */
         dgc_retire(&engine->dgc, old_handle);
@@ -2055,4 +2080,201 @@ int cjit_snapshot_ir(cjit_engine_t *engine, const char *dir)
 
     fclose(mf);
     return written;
+}
+
+/* ══════════════════════════ Feature G: per-function stats reset ════════════ */
+
+bool cjit_reset_function_stats(cjit_engine_t *engine, func_id_t id)
+{
+    if (!engine) return false;
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (!e) return false;
+
+    atomic_store_explicit(&e->call_cnt,          0, memory_order_relaxed);
+    atomic_store_explicit(&e->total_elapsed_ns,  0, memory_order_relaxed);
+    atomic_store_explicit(&e->recompile_count,   0, memory_order_relaxed);
+
+    for (int k = 0; k < CJIT_HIST_BUCKETS; k++)
+        atomic_store_explicit(&e->hist_counts[k], 0, memory_order_relaxed);
+
+    return true;
+}
+
+/* ══════════════════════════ Feature H: queue drain ════════════════════════ */
+
+bool cjit_drain_queue(cjit_engine_t *engine, uint32_t timeout_ms)
+{
+    if (!engine) return false;
+
+    uint64_t deadline = (timeout_ms == 0) ? 0 : (engine_now_ms() + timeout_ms);
+
+    do {
+        /* Sum all queue depths across both lanes for all compiler threads. */
+        uint32_t depth = 0;
+        for (uint32_t t = 0; t < engine->cfg.compiler_threads; t++) {
+            depth += mpmc_size(&engine->work_queues[2 * t + 0]);
+            depth += mpmc_size(&engine->work_queues[2 * t + 1]);
+        }
+
+        /* Also check active_compilations: a function may have been dequeued
+         * (in_queue cleared) but compilation is still in progress
+         * (compile_lock held inside the compiler thread). */
+        if (depth == 0 &&
+            atomic_load_explicit(&engine->active_compilations,
+                                 memory_order_relaxed) == 0)
+            return true;
+
+        if (timeout_ms == 0)
+            return false;
+
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 5000000L }; /* 5 ms */
+        nanosleep(&ts, NULL);
+
+    } while (engine_now_ms() < deadline);
+
+    /* Final re-check. */
+    uint32_t depth = 0;
+    for (uint32_t t = 0; t < engine->cfg.compiler_threads; t++) {
+        depth += mpmc_size(&engine->work_queues[2 * t + 0]);
+        depth += mpmc_size(&engine->work_queues[2 * t + 1]);
+    }
+    if (depth > 0) return false;
+    if (atomic_load_explicit(&engine->active_compilations,
+                             memory_order_relaxed) > 0)
+        return false;
+    return true;
+}
+
+/* ══════════════════════════ Feature I: synchronous compile ════════════════ */
+
+bool cjit_compile_sync(cjit_engine_t *engine, func_id_t id, opt_level_t level)
+{
+    if (!engine) return false;
+    func_table_entry_t *entry = func_table_get(engine->ftable, id);
+    if (!entry) return false;
+
+    /* Build codegen options identical to the compiler thread. */
+    codegen_opts_t copts = {
+        .enable_inlining      = engine->cfg.enable_inlining,
+        .enable_vectorization = engine->cfg.enable_vectorization,
+        .enable_loop_unroll   = engine->cfg.enable_loop_unroll,
+        .enable_native_arch   = engine->cfg.enable_native_arch,
+        .enable_fast_math     = engine->cfg.enable_fast_math,
+        .verbose              = engine->cfg.verbose,
+        .extra_cflags         = engine->cfg.extra_cflags[0] ? engine->cfg.extra_cflags : NULL,
+        .cc_binary            = engine->cfg.cc_binary[0]    ? engine->cfg.cc_binary    : NULL,
+        .cache                = engine->artifact_cache,
+        .compile_timeout_ms   = engine->cfg.compile_timeout_ms,
+        .arg_profile          = NULL,
+    };
+
+    /* Fetch IR (promotes COLD → WARM as a side effect). */
+    char       *ir_cache_copy = NULL;
+    const char *ir_to_use     = NULL;
+    if (engine->ir_cache)
+        ir_cache_copy = ir_cache_get_ir(engine->ir_cache, id);
+    ir_to_use = ir_cache_copy ? ir_cache_copy : entry->ir_source;
+
+    if (!ir_to_use) {
+        free(ir_cache_copy);
+        if (engine->cfg.verbose)
+            fprintf(stderr, "[cjit/sync] no IR for '%s'\n", entry->name);
+        return false;
+    }
+
+    /* Take the per-entry compile lock (blocking, unlike trylock in bg thread).
+     * This serialises against any concurrent background compilation.
+     * Count this as an active compilation so cjit_drain_queue() waits for us. */
+    atomic_fetch_add_explicit(&engine->active_compilations, 1,
+                              memory_order_relaxed);
+    pthread_mutex_lock(&entry->compile_lock);
+
+    /* Attach the current arg profile for potential specialisation. */
+    copts.arg_profile = &entry->arg_profile;
+
+    uint64_t t0 = engine_now_ms();
+    codegen_result_t cres;
+    bool ok = codegen_compile(entry->name, ir_to_use, level, &copts, &cres);
+    copts.arg_profile = NULL;
+    free(ir_cache_copy);
+
+    uint32_t dur_ms = (uint32_t)(engine_now_ms() - t0);
+    atomic_store_explicit(&entry->last_compile_duration_ms, dur_ms,
+                          memory_order_relaxed);
+
+    if (!ok) {
+        atomic_fetch_add_explicit(&engine->stat_failed, 1, memory_order_relaxed);
+        if (cres.timed_out)
+            atomic_fetch_add_explicit(&engine->stat_timeouts, 1,
+                                      memory_order_relaxed);
+        pthread_mutex_unlock(&entry->compile_lock);
+        atomic_fetch_sub_explicit(&engine->active_compilations, 1,
+                                  memory_order_relaxed);
+
+        /* Wake cjit_wait_compiled() callers so they can detect the failure. */
+        pthread_mutex_lock(&engine->compile_done_mutex);
+        pthread_cond_broadcast(&engine->compile_done_cond);
+        pthread_mutex_unlock(&engine->compile_done_mutex);
+
+        /* Fire compile-event callback. */
+        pthread_mutex_lock(&engine->cb_mutex);
+        cjit_compile_callback_t cb = engine->compile_cb;
+        void *cb_ud = engine->compile_cb_userdata;
+        pthread_mutex_unlock(&engine->cb_mutex);
+        if (cb) {
+            cjit_compile_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.func_id     = id;
+            snprintf(ev.func_name, sizeof(ev.func_name), "%s", entry->name);
+            ev.level       = level;
+            ev.success     = false;
+            ev.timed_out   = cres.timed_out;
+            ev.cache_hit   = false;
+            ev.duration_ms = dur_ms;
+            snprintf(ev.errmsg, sizeof(ev.errmsg), "%.255s", cres.errmsg);
+            cb(&ev, cb_ud);
+        }
+        return false;
+    }
+
+    atomic_fetch_add_explicit(&engine->stat_compilations, 1, memory_order_relaxed);
+
+    void *old_handle = func_table_swap(engine->ftable, id,
+                                        cres.fn, cres.handle, level);
+    atomic_fetch_add_explicit(&engine->stat_swaps, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&entry->compile_lock);
+    atomic_fetch_sub_explicit(&engine->active_compilations, 1,
+                              memory_order_relaxed);
+
+    dgc_retire(&engine->dgc, old_handle);
+
+    /* Wake cjit_wait_compiled() callers. */
+    pthread_mutex_lock(&engine->compile_done_mutex);
+    pthread_cond_broadcast(&engine->compile_done_cond);
+    pthread_mutex_unlock(&engine->compile_done_mutex);
+
+    /* Fire compile-event callback (success). */
+    pthread_mutex_lock(&engine->cb_mutex);
+    cjit_compile_callback_t cb2 = engine->compile_cb;
+    void *cb2_ud = engine->compile_cb_userdata;
+    pthread_mutex_unlock(&engine->cb_mutex);
+    if (cb2) {
+        cjit_compile_event_t ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.func_id     = id;
+        snprintf(ev.func_name, sizeof(ev.func_name), "%s", entry->name);
+        ev.level       = level;
+        ev.success     = true;
+        ev.timed_out   = false;
+        ev.cache_hit   = cres.cache_hit;
+        ev.duration_ms = dur_ms;
+        cb2(&ev, cb2_ud);
+    }
+
+    if (engine->cfg.verbose)
+        fprintf(stderr,
+                "[cjit/sync] compiled '%s' O%d in %u ms\n",
+                entry->name, (int)level, dur_ms);
+
+    return true;
 }

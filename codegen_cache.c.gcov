@@ -1,0 +1,349 @@
+        -:    0:Source:/home/runner/work/cjit/cjit/src/codegen_cache.c
+        -:    0:Graph:build_cov/CMakeFiles/cjit_lib.dir/src/codegen_cache.c.gcno
+        -:    0:Data:build_cov/CMakeFiles/cjit_lib.dir/src/codegen_cache.c.gcda
+        -:    0:Runs:5
+        -:    1:/**
+        -:    2: * codegen_cache.c – Persistent compiled-artifact cache implementation.
+        -:    3: *
+        -:    4: * See codegen_cache.h for the full design description.
+        -:    5: */
+        -:    6:
+        -:    7:#ifndef _GNU_SOURCE
+        -:    8:#define _GNU_SOURCE
+        -:    9:#endif
+        -:   10:
+        -:   11:#include "codegen_cache.h"
+        -:   12:
+        -:   13:#include <stdlib.h>
+        -:   14:#include <string.h>
+        -:   15:#include <stdio.h>
+        -:   16:#include <stdatomic.h>
+        -:   17:#include <unistd.h>
+        -:   18:#include <sys/stat.h>
+        -:   19:#include <fcntl.h>
+        -:   20:#include <errno.h>
+        -:   21:#include <pthread.h>
+        -:   22:#include <inttypes.h>   /* PRIx64 */
+        -:   23:
+        -:   24:/* ─────────────────────────── constants ─────────────────────────────────────── */
+        -:   25:
+        -:   26:/** Maximum length of the cache root directory path (including NUL). */
+        -:   27:#define CC_DIR_MAX 256
+        -:   28:
+        -:   29:/** Maximum length of a cache file path (CC_DIR_MAX + "/" + 16 hex + ".so" + NUL). */
+        -:   30:#define CC_PATH_MAX (CC_DIR_MAX + 32)
+        -:   31:
+        -:   32:/* ─────────────────────────── FNV-1a 64-bit hash ────────────────────────────── */
+        -:   33:
+        -:   34:/*
+        -:   35: * FNV-1a (Fowler–Noll–Vo) 64-bit variant.
+        -:   36: *
+        -:   37: * Chosen for: simplicity, speed, and avalanche properties adequate for a
+        -:   38: * non-cryptographic content-address key.  The prime and offset are the
+        -:   39: * standard FNV-1a-64 constants.
+        -:   40: *
+        -:   41: * The hash is computed in a streaming fashion: callers can chain multiple
+        -:   42: * fnv1a_feed() calls with the accumulated state to hash composite values.
+        -:   43: */
+        -:   44:
+        -:   45:#define FNV1A_PRIME_64   UINT64_C(1099511628211)
+        -:   46:#define FNV1A_OFFSET_64  UINT64_C(14695981039346656037)
+        -:   47:
+        -:   48:/* Update running hash with `len` bytes of `data`. */
+      856:   49:static uint64_t fnv1a_feed(uint64_t h, const void *data, size_t len)
+        -:   50:{
+      856:   51:    const uint8_t *p = (const uint8_t *)data;
+    28896:   52:    for (size_t i = 0; i < len; ++i) {
+    28040:   53:        h ^= (uint64_t)p[i];
+    28040:   54:        h *= FNV1A_PRIME_64;
+        -:   55:    }
+      856:   56:    return h;
+        -:   57:}
+        -:   58:
+        -:   59:/*
+        -:   60: * Hash a C string with normalisation: strips C-style block comments and
+        -:   61: * C++-style line comments, collapses runs of whitespace to a single space,
+        -:   62: * and strips leading and trailing whitespace — all in a single pass.
+        -:   63: *
+        -:   64: * This normalisation ensures that two IR strings that are semantically
+        -:   65: * identical (same tokens, same structure) but differ only in whitespace
+        -:   66: * or comments produce the same cache key, improving artifact-cache hit rates
+        -:   67: * for code that is regenerated with minor formatting differences.
+        -:   68: *
+        -:   69: * Implementation note: spaces are emitted lazily — a pending space is only
+        -:   70: * flushed to the hash when the next non-space character arrives.  This
+        -:   71: * naturally eliminates both leading and trailing whitespace.
+        -:   72: */
+       16:   73:static uint64_t fnv1a_norm_ir(uint64_t h, const char *s)
+        -:   74:{
+       16:   75:    if (!s || !*s) {
+    #####:   76:        const uint8_t zero = 0;
+    #####:   77:        return fnv1a_feed(h, &zero, 1);
+        -:   78:    }
+        -:   79:
+       16:   80:    const char *p = s;
+       16:   81:    bool pending_space = false; /* deferred space, not yet hashed */
+       16:   82:    bool any_output    = false; /* suppress leading space */
+        -:   83:
+      764:   84:    while (*p) {
+        -:   85:        /* Skip C-style block comment. */
+      748:   86:        if (p[0] == '/' && p[1] == '*') {
+        4:   87:            p += 2;
+       84:   88:            while (*p) {
+       84:   89:                if (p[0] == '*' && p[1] == '/') { p += 2; break; }
+       80:   90:                p++;
+        -:   91:            }
+        -:   92:            /* A comment acts as a whitespace separator. */
+       4*:   93:            if (any_output) pending_space = true;
+      244:   94:            continue;
+        -:   95:        }
+        -:   96:
+        -:   97:        /* Skip C++ line comment. */
+      744:   98:        if (p[0] == '/' && p[1] == '/') {
+        8:   99:            p += 2;
+       48:  100:            while (*p && *p != '\n') p++;
+        8:  101:            if (*p == '\n') p++;
+        8:  102:            if (any_output) pending_space = true;
+        8:  103:            continue;
+        -:  104:        }
+        -:  105:
+        -:  106:        /* Whitespace: defer. */
+      736:  107:        if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+      232:  108:            if (any_output) pending_space = true;
+      232:  109:            p++;
+      232:  110:            continue;
+        -:  111:        }
+        -:  112:
+        -:  113:        /* Normal character: flush pending space first, then hash the char. */
+      504:  114:        if (pending_space) {
+      160:  115:            const uint8_t sp = ' ';
+      160:  116:            h = fnv1a_feed(h, &sp, 1);
+      160:  117:            pending_space = false;
+        -:  118:        }
+      504:  119:        uint8_t c = (uint8_t)*p++;
+      504:  120:        h = fnv1a_feed(h, &c, 1);
+      504:  121:        any_output = true;
+        -:  122:    }
+        -:  123:    /* Trailing pending_space is intentionally discarded (strip trailing ws). */
+       16:  124:    return h;
+        -:  125:}
+        -:  126:
+        -:  127:/*
+        -:  128: * Hash a C string.
+        -:  129: *
+        -:  130: * NULL and "" both contribute a single zero byte so that absent components
+        -:  131: * are distinguishable from each other when combined with a per-field separator.
+        -:  132: */
+       96:  133:static uint64_t fnv1a_str(uint64_t h, const char *s)
+        -:  134:{
+       96:  135:    if (s && *s)
+       48:  136:        return fnv1a_feed(h, s, strlen(s));
+        -:  137:    /* Absent/empty: hash a single zero byte to distinguish from "nothing". */
+       48:  138:    const uint8_t zero = 0;
+       48:  139:    return fnv1a_feed(h, &zero, 1);
+        -:  140:}
+        -:  141:
+        -:  142:/* ─────────────────────────── struct ────────────────────────────────────────── */
+        -:  143:
+        -:  144:struct codegen_cache {
+        -:  145:    char                 dir[CC_DIR_MAX]; /**< Cache root (no trailing slash). */
+        -:  146:    atomic_uint_fast64_t hits;            /**< Cache hits since creation.      */
+        -:  147:    atomic_uint_fast64_t misses;          /**< Cache misses since creation.    */
+        -:  148:};
+        -:  149:
+        -:  150:/* ─────────────────────────── helpers ───────────────────────────────────────── */
+        -:  151:
+        -:  152:/*
+        -:  153: * Write the canonical cache file path for `key` into out[0..outsz).
+        -:  154: *
+        -:  155: * Format: "<dir>/<16-hex-digit-key>.so"
+        -:  156: */
+       24:  157:static void cc_make_path(const codegen_cache_t *c, uint64_t key,
+        -:  158:                          char *out, size_t outsz)
+        -:  159:{
+       24:  160:    snprintf(out, outsz, "%s/%016" PRIx64 ".so", c->dir, key);
+       24:  161:}
+        -:  162:
+        -:  163:/*
+        -:  164: * Copy a file from `src` to `dst` using a buffered read-write loop.
+        -:  165: *
+        -:  166: * Returns true on success, false on any I/O error.  `dst` is unlinked on
+        -:  167: * failure to avoid leaving a partial file in the cache directory.
+        -:  168: */
+        8:  169:static bool cc_copy_file(const char *src, const char *dst)
+        -:  170:{
+        8:  171:    int fd_src = open(src, O_RDONLY | O_CLOEXEC);
+       8*:  172:    if (fd_src < 0) return false;
+        -:  173:
+        8:  174:    int fd_dst = open(dst, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        8:  175:    if (fd_dst < 0) {
+    #####:  176:        close(fd_src);
+    #####:  177:        return false;
+        -:  178:    }
+        -:  179:
+        -:  180:    char buf[65536];
+        -:  181:    ssize_t nr;
+        8:  182:    bool ok = true;
+       16:  183:    while ((nr = read(fd_src, buf, sizeof(buf))) > 0) {
+        8:  184:        ssize_t nw = 0;
+       16:  185:        while (nw < nr) {
+        8:  186:            ssize_t w = write(fd_dst, buf + nw, (size_t)(nr - nw));
+       8*:  187:            if (w < 0) { ok = false; break; }
+        8:  188:            nw += w;
+        -:  189:        }
+       8*:  190:        if (!ok) break;
+        -:  191:    }
+       8*:  192:    if (nr < 0) ok = false;
+        -:  193:
+        8:  194:    close(fd_src);
+       8*:  195:    if (close(fd_dst) != 0) ok = false;
+       8*:  196:    if (!ok) unlink(dst);
+        8:  197:    return ok;
+        -:  198:}
+        -:  199:
+        -:  200:/* ─────────────────────────── public API ────────────────────────────────────── */
+        -:  201:
+       16:  202:codegen_cache_t *codegen_cache_create(const char *dir)
+        -:  203:{
+      16*:  204:    if (!dir || !dir[0]) return NULL;
+        -:  205:
+       16:  206:    codegen_cache_t *c = calloc(1, sizeof(*c));
+      16*:  207:    if (!c) return NULL;
+        -:  208:
+        -:  209:    /* Copy dir, strip trailing slashes. */
+       16:  210:    snprintf(c->dir, sizeof(c->dir), "%s", dir);
+       16:  211:    size_t len = strlen(c->dir);
+      16*:  212:    while (len > 1 && c->dir[len - 1] == '/') c->dir[--len] = '\0';
+        -:  213:
+        -:  214:    /* Create the directory if it does not already exist. */
+       16:  215:    if (mkdir(c->dir, 0700) != 0 && errno != EEXIST) {
+    #####:  216:        free(c);
+    #####:  217:        return NULL;
+        -:  218:    }
+        -:  219:
+       16:  220:    atomic_init(&c->hits,   0);
+       16:  221:    atomic_init(&c->misses, 0);
+       16:  222:    return c;
+        -:  223:}
+        -:  224:
+      136:  225:void codegen_cache_destroy(codegen_cache_t *c)
+        -:  226:{
+      136:  227:    free(c);
+      136:  228:}
+        -:  229:
+       16:  230:uint64_t codegen_cache_key(const char *preamble,
+        -:  231:                            const char *wrapper_src,
+        -:  232:                            const char *spec_define,
+        -:  233:                            const char *ir,
+        -:  234:                            const char *level_str,
+        -:  235:                            const char *cflags,
+        -:  236:                            const char *cc_binary)
+        -:  237:{
+        -:  238:    /*
+        -:  239:     * Separator byte injected between fields to prevent trivial length-extension
+        -:  240:     * collisions where the concatenation of two distinct (a, b) pairs could
+        -:  241:     * produce the same byte sequence.
+        -:  242:     *
+        -:  243:     * e.g., ("ab", "c") vs ("a", "bc") are different inputs with the same
+        -:  244:     * naive concatenation "abc"; the separator makes them ("ab\xFF" "c") vs
+        -:  245:     * ("a\xFF" "bc"), which have distinct byte sequences.
+        -:  246:     */
+        -:  247:    static const uint8_t SEP = 0xFF;
+        -:  248:
+       16:  249:    uint64_t h = FNV1A_OFFSET_64;
+       16:  250:    h = fnv1a_str(h, preamble);
+       16:  251:    h = fnv1a_feed(h, &SEP, 1);
+       16:  252:    h = fnv1a_str(h, wrapper_src);
+       16:  253:    h = fnv1a_feed(h, &SEP, 1);
+       16:  254:    h = fnv1a_str(h, spec_define);
+       16:  255:    h = fnv1a_feed(h, &SEP, 1);
+        -:  256:    /* Use normalised hashing for user IR: strip comments + collapse whitespace
+        -:  257:     * so that trivially reformatted IR strings map to the same cache entry. */
+       16:  258:    h = fnv1a_norm_ir(h, ir);
+       16:  259:    h = fnv1a_feed(h, &SEP, 1);
+       16:  260:    h = fnv1a_str(h, level_str);
+       16:  261:    h = fnv1a_feed(h, &SEP, 1);
+       16:  262:    h = fnv1a_str(h, cflags);
+       16:  263:    h = fnv1a_feed(h, &SEP, 1);
+      16*:  264:    h = fnv1a_str(h, cc_binary ? cc_binary : "cc");
+       16:  265:    return h;
+        -:  266:}
+        -:  267:
+       16:  268:bool codegen_cache_lookup(codegen_cache_t *c, uint64_t key,
+        -:  269:                           char *out, size_t outsz)
+        -:  270:{
+       16:  271:    cc_make_path(c, key, out, outsz);
+        -:  272:
+       16:  273:    if (access(out, R_OK) == 0) {
+        8:  274:        atomic_fetch_add_explicit(&c->hits, 1, memory_order_relaxed);
+        8:  275:        return true;
+        -:  276:    }
+        8:  277:    atomic_fetch_add_explicit(&c->misses, 1, memory_order_relaxed);
+        8:  278:    return false;
+        -:  279:}
+        -:  280:
+        8:  281:bool codegen_cache_store(codegen_cache_t *c, uint64_t key, const char *so_path)
+        -:  282:{
+        -:  283:    char dest[CC_PATH_MAX];
+        8:  284:    cc_make_path(c, key, dest, sizeof(dest));
+        -:  285:
+        -:  286:    /* Fast path: same filesystem – atomic rename. */
+        8:  287:    if (rename(so_path, dest) == 0)
+    #####:  288:        return true;
+        -:  289:
+        8:  290:    if (errno == EEXIST) {
+        -:  291:        /*
+        -:  292:         * A concurrent compilation (same key) already stored the entry.
+        -:  293:         * Both compilations produce identical output for identical input,
+        -:  294:         * so the existing entry is authoritative.  Remove our copy.
+        -:  295:         */
+    #####:  296:        unlink(so_path);
+    #####:  297:        return true;
+        -:  298:    }
+        -:  299:
+        8:  300:    if (errno == EXDEV) {
+        -:  301:        /*
+        -:  302:         * Cross-device rename: the compiled .so is on a different filesystem
+        -:  303:         * than the cache directory (e.g., /dev/shm vs ~/.cache/cjit).
+        -:  304:         *
+        -:  305:         * Strategy: copy to a private temp name inside the cache dir, then
+        -:  306:         * rename within the cache dir (same device → atomic).
+        -:  307:         */
+        -:  308:        char tmp[CC_PATH_MAX + 32];
+        8:  309:        snprintf(tmp, sizeof(tmp), "%s/.tmp_%016" PRIx64 "_%d_%"PRIxPTR ".so",
+       16:  310:                 c->dir, (uint64_t)key, (int)getpid(),
+        8:  311:                 (uintptr_t)pthread_self());
+        -:  312:
+        8:  313:        if (!cc_copy_file(so_path, tmp)) {
+        -:  314:            /* Copy failed; keep so_path intact for the caller to unlink. */
+    #####:  315:            return false;
+        -:  316:        }
+        -:  317:
+        -:  318:        /* Intra-cache rename – atomic on any single filesystem. */
+        8:  319:        if (rename(tmp, dest) != 0) {
+    #####:  320:            if (errno == EEXIST) {
+        -:  321:                /* Concurrent store won; our temp copy is redundant. */
+    #####:  322:                unlink(tmp);
+        -:  323:            } else {
+    #####:  324:                unlink(tmp);
+    #####:  325:                unlink(so_path);
+    #####:  326:                return false;
+        -:  327:            }
+        -:  328:        }
+        8:  329:        unlink(so_path);  /* original is no longer needed after copy */
+        8:  330:        return true;
+        -:  331:    }
+        -:  332:
+        -:  333:    /* Unexpected error: leave so_path for the caller to handle. */
+    #####:  334:    return false;
+        -:  335:}
+        -:  336:
+       16:  337:uint64_t codegen_cache_hits(const codegen_cache_t *c)
+        -:  338:{
+       16:  339:    return atomic_load_explicit(&c->hits, memory_order_relaxed);
+        -:  340:}
+        -:  341:
+       16:  342:uint64_t codegen_cache_misses(const codegen_cache_t *c)
+        -:  343:{
+       16:  344:    return atomic_load_explicit(&c->misses, memory_order_relaxed);
+        -:  345:}

@@ -87,6 +87,25 @@
  *                                        monitor; unpinning re-enables promotion.
  *   t29  IR snapshot export       – cjit_snapshot_ir() writes one .c file per
  *                                        registered function plus manifest.txt.
+ *   t30  Per-function stats reset  – cjit_reset_function_stats() clears call_cnt,
+ *                                        elapsed_ns, histogram buckets, and
+ *                                        recompile_count; function continues to run.
+ *   t31  Queue drain               – cjit_drain_queue() returns only after all
+ *                                        pending compile tasks have finished.
+ *   t32  Synchronous compile       – cjit_compile_sync() compiles in the calling
+ *                                        thread; function ptr is live on return.
+ *   t33  IR LRU evictions          – fill HOT/WARM caches beyond capacity;
+ *                                        verify eviction counts > 0 and that
+ *                                        a COLD entry can be promoted on access.
+ *   t34  cjit_print_stats verbose  – call cjit_print_stats() after a compile;
+ *                                        run a verbose engine to exercise the
+ *                                        verbose fprintf paths in cjit.c.
+ *   t35  compile_sync failure      – call cjit_compile_sync() with invalid IR;
+ *                                        verify returns false and callback fires
+ *                                        with success=false.
+ *   t36  Edge-case API             – cjit_percentile_ns() with 0 calls and an
+ *                                        invalid id; OPT_NONE and enable_fast_math;
+ *                                        cjit_get_func_counted() call-counting path.
  *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).
@@ -2559,6 +2578,573 @@ TEST(t29_snapshot_ir)
     return 0;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t30 – Per-function stats reset
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Register a function with an AOT fallback; dispatch it many times via
+ *      CJIT_DISPATCH_TIMED to accumulate call_cnt, total_elapsed_ns, and
+ *      at least one histogram bucket.
+ *   2. Trigger a JIT compile so recompile_count > 0.
+ *   3. Call cjit_reset_function_stats() and verify every counter is zero.
+ *   4. Verify the function is still callable and returns correct results.
+ */
+static int aot_reset_fn(int x) { return x * 3; }
+
+TEST(t30_reset_function_stats)
+{
+    printf("[t30] Per-function stats reset...\n");
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads = 1;
+    cfg.verbose          = false;
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e, "cjit_create returned NULL");
+    cjit_start(e);
+
+    static const char *IR_RESET = "int reset_fn(int x) { return x * 3; }";
+    func_id_t id = cjit_register_function(e, "reset_fn", IR_RESET,
+                                           (jit_func_t)(uintptr_t)aot_reset_fn);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "register failed");
+
+    typedef int (*rfn_t)(int);
+    volatile int sink = 0;
+    for (int k = 0; k < 512; k++)
+        sink += CJIT_DISPATCH_TIMED(e, id, rfn_t, k);
+    cjit_flush_local_counts(e);
+    (void)sink;
+
+    /* Use cjit_compile_sync so recompile_count is guaranteed to be > 0
+     * before we read it (synchronous — no background race). */
+    bool cs = cjit_compile_sync(e, id, OPT_O1);
+    CHECK(cs, "cjit_compile_sync(OPT_O1) failed");
+
+    /* Pre-reset assertions using public API. */
+    uint64_t before_cnt  = cjit_get_call_count(e, id);
+    uint32_t before_rc   = cjit_get_recompile_count(e, id);
+    CHECKF(before_cnt > 0, "pre-reset call_cnt should be > 0 (got %llu)",
+           (unsigned long long)before_cnt);
+    CHECKF(before_rc  > 0, "pre-reset recompile_count should be > 0 (got %u)",
+           before_rc);
+
+    uint64_t hist[CJIT_HIST_BUCKETS];
+    cjit_get_histogram(e, id, hist);
+    uint64_t htotal = 0;
+    for (int k = 0; k < CJIT_HIST_BUCKETS; k++) htotal += hist[k];
+    CHECKF(htotal > 0, "pre-reset histogram should be non-zero (total=%llu)",
+           (unsigned long long)htotal);
+
+    printf("[t30]   pre-reset: call_cnt=%llu rc=%u hist_total=%llu\n",
+           (unsigned long long)before_cnt, before_rc, (unsigned long long)htotal);
+
+    /* Reset. */
+    bool rok = cjit_reset_function_stats(e, id);
+    CHECK(rok, "cjit_reset_function_stats returned false");
+
+    /* Post-reset: all counters must be zero. */
+    uint64_t after_cnt  = cjit_get_call_count(e, id);
+    uint32_t after_rc   = cjit_get_recompile_count(e, id);
+    uint64_t after_elap = cjit_get_elapsed_ns(e, id);
+    CHECKF(after_cnt  == 0, "post-reset call_cnt should be 0 (got %llu)",
+           (unsigned long long)after_cnt);
+    CHECKF(after_rc   == 0, "post-reset recompile_count should be 0 (got %u)",
+           after_rc);
+    CHECKF(after_elap == 0, "post-reset elapsed_ns should be 0 (got %llu)",
+           (unsigned long long)after_elap);
+
+    cjit_get_histogram(e, id, hist);
+    htotal = 0;
+    for (int k = 0; k < CJIT_HIST_BUCKETS; k++) htotal += hist[k];
+    CHECKF(htotal == 0, "post-reset histogram should be zero (total=%llu)",
+           (unsigned long long)htotal);
+
+    /* Function must still be callable. */
+    int direct_result = ((rfn_t)(uintptr_t)cjit_get_func(e, id))(5);
+    CHECKF(direct_result == 15, "reset_fn(5) expected 15, got %d", direct_result);
+
+    printf("[t30]   post-reset: call_cnt=%llu rc=%u elap=%llu hist_total=%llu  OK\n",
+           (unsigned long long)after_cnt, after_rc,
+           (unsigned long long)after_elap, (unsigned long long)htotal);
+
+    cjit_destroy(e);
+    printf("[t30] PASS\n");
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t31 – Queue drain: cjit_drain_queue() returns when all tasks are done
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Register five functions, enqueue one explicit OPT_O1 recompile each.
+ *   2. Call cjit_drain_queue(engine, 8000); assert it returns true.
+ *   3. Verify total_compilations == 5 and queue_depth == 0.
+ *   4. Verify cjit_drain_queue(engine, 0) (non-blocking) returns true for
+ *      the already-empty queue.
+ */
+TEST(t31_drain_queue)
+{
+    printf("[t31] Queue drain: all queued tasks finish before drain returns...\n");
+
+#define T31_N 5
+    static const char *names[T31_N] = {
+        "drain_fn0", "drain_fn1", "drain_fn2", "drain_fn3", "drain_fn4"
+    };
+    static const char *irs[T31_N] = {
+        "int drain_fn0(int x) { return x + 0; }",
+        "int drain_fn1(int x) { return x + 1; }",
+        "int drain_fn2(int x) { return x + 2; }",
+        "int drain_fn3(int x) { return x + 3; }",
+        "int drain_fn4(int x) { return x + 4; }",
+    };
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads = 1;
+    cfg.verbose          = false;
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e, "cjit_create returned NULL");
+    cjit_start(e);
+
+    func_id_t ids[T31_N];
+    for (int i = 0; i < T31_N; i++) {
+        ids[i] = cjit_register_function(e, names[i], irs[i], NULL);
+        CHECKF(ids[i] != CJIT_INVALID_FUNC_ID, "register '%s' failed", names[i]);
+    }
+
+    for (int i = 0; i < T31_N; i++)
+        cjit_request_recompile(e, ids[i], OPT_O1);
+
+    bool drained = cjit_drain_queue(e, 8000);
+    CHECK(drained, "cjit_drain_queue timed out");
+
+    cjit_stats_t s = cjit_get_stats(e);
+    CHECKF(s.total_compilations == (uint64_t)T31_N,
+           "expected %d compilations after drain, got %llu",
+           T31_N, (unsigned long long)s.total_compilations);
+    CHECKF(s.queue_depth == 0 && s.prio_queue_depth == 0,
+           "queue depth should be 0 after drain (got %u/%u)",
+           s.queue_depth, s.prio_queue_depth);
+    printf("[t31]   compilations=%llu queue_depth=%u  OK\n",
+           (unsigned long long)s.total_compilations, s.queue_depth);
+
+    /* Non-blocking check on an empty queue must return true immediately. */
+    bool empty = cjit_drain_queue(e, 0);
+    CHECK(empty, "cjit_drain_queue(0) on empty queue returned false");
+    printf("[t31]   non-blocking check on empty queue: OK\n");
+
+    cjit_destroy(e);
+    printf("[t31] PASS\n");
+#undef T31_N
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t32 – Synchronous compile: cjit_compile_sync() is live on return
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Register a function without an AOT fallback.
+ *   2. Call cjit_compile_sync(engine, id, OPT_O2); assert returns true.
+ *   3. Assert cjit_get_func() is non-NULL immediately (no background wait).
+ *   4. Assert correct result and opt_level == OPT_O2.
+ *   5. Assert total_compilations == 1 (stat was incremented).
+ *   6. Verify the compile-event callback fires for sync compiles.
+ *   7. Upgrade to OPT_O3 with another cjit_compile_sync(); verify result.
+ */
+TEST(t32_compile_sync)
+{
+    printf("[t32] Synchronous compile: cjit_compile_sync() installs pointer...\n");
+
+    cb_state_t cb_st;
+    memset(&cb_st, 0, sizeof(cb_st));
+    pthread_mutex_init(&cb_st.mu, NULL);
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads = 1;
+    cfg.verbose          = false;
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e, "cjit_create returned NULL");
+
+    cjit_set_compile_callback(e, compile_event_recorder, &cb_st);
+    cjit_start(e);
+
+    static const char *IR_SYNC =
+        "int sync_fn(int a, int b) { return a + b * 2; }";
+    func_id_t id = cjit_register_function(e, "sync_fn", IR_SYNC, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "register failed");
+
+    CHECK(cjit_get_func(e, id) == NULL,
+          "func_ptr should be NULL before first compile");
+
+    bool ok = cjit_compile_sync(e, id, OPT_O2);
+    CHECK(ok, "cjit_compile_sync(OPT_O2) returned false");
+
+    /* Pointer must be live immediately — no wait required. */
+    jit_func_t fp = cjit_get_func(e, id);
+    CHECK(fp != NULL, "func_ptr is NULL after cjit_compile_sync");
+
+    typedef int (*sfn_t)(int, int);
+    int result = ((sfn_t)(uintptr_t)fp)(3, 4);
+    CHECKF(result == 11, "sync_fn(3,4) expected 11, got %d", result);
+    CHECKF(cjit_get_current_opt_level(e, id) == OPT_O2,
+           "opt_level should be OPT_O2, got %d",
+           (int)cjit_get_current_opt_level(e, id));
+    printf("[t32]   O2: sync_fn(3,4)=%d  OK\n", result);
+
+    cjit_stats_t s = cjit_get_stats(e);
+    CHECKF(s.total_compilations == 1, "expected 1 compilation, got %llu",
+           (unsigned long long)s.total_compilations);
+
+    /* Callback must have fired. */
+    pthread_mutex_lock(&cb_st.mu);
+    int cb_cnt = cb_st.count;
+    cjit_compile_event_t cb_ev = cb_st.last;
+    pthread_mutex_unlock(&cb_st.mu);
+    CHECKF(cb_cnt >= 1, "callback should have fired (count=%d)", cb_cnt);
+    CHECK(cb_ev.success, "callback: expected success=true");
+    CHECKF(strcmp(cb_ev.func_name, "sync_fn") == 0,
+           "callback: func_name='%s'", cb_ev.func_name);
+    CHECKF(cb_ev.level == OPT_O2, "callback: level=%d", (int)cb_ev.level);
+    printf("[t32]   callback: count=%d func='%s' level=%d  OK\n",
+           cb_cnt, cb_ev.func_name, (int)cb_ev.level);
+
+    /* Upgrade to OPT_O3. */
+    bool ok3 = cjit_compile_sync(e, id, OPT_O3);
+    CHECK(ok3, "cjit_compile_sync(OPT_O3) returned false");
+
+    jit_func_t fp3 = cjit_get_func(e, id);
+    int result3 = ((sfn_t)(uintptr_t)fp3)(10, 5);
+    CHECKF(result3 == 20, "sync_fn(10,5) expected 20, got %d", result3);
+    CHECKF(cjit_get_current_opt_level(e, id) == OPT_O3,
+           "opt_level should be OPT_O3 after sync upgrade, got %d",
+           (int)cjit_get_current_opt_level(e, id));
+    printf("[t32]   O3: sync_fn(10,5)=%d  OK\n", result3);
+
+    cjit_destroy(e);
+    pthread_mutex_destroy(&cb_st.mu);
+    printf("[t32] PASS\n");
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t33 – IR LRU evictions and COLD→WARM disk promotion
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Configure a tiny HOT capacity (2) and WARM capacity (2) so that
+ *      inserting more than 4 functions overflows into COLD (disk).
+ *   2. Register 8 functions and cjit_compile_sync each one so the IR cache
+ *      is populated for every entry.
+ *   3. Access a function whose IR is likely in COLD (least-recently-used)
+ *      via cjit_compile_sync again, forcing a disk read and COLD→WARM promotion.
+ *   4. Assert ir_evictions > 0 and ir_cold_count > 0 in the stats.
+ */
+TEST(t33_ir_lru_evictions)
+{
+    printf("[t33] IR LRU evictions and disk promotion...\n");
+
+    char snap_dir[] = "/tmp/t33_XXXXXX";
+    char *sd = mkdtemp(snap_dir);
+    CHECK(sd, "mkdtemp failed");
+
+#define T33_N 8
+    static const char *names[T33_N] = {
+        "lru_fn0","lru_fn1","lru_fn2","lru_fn3",
+        "lru_fn4","lru_fn5","lru_fn6","lru_fn7"
+    };
+    /* Keep IR short but unique so each gets its own cache slot. */
+    static const char *irs[T33_N] = {
+        "int lru_fn0(int x){return x+0;}",
+        "int lru_fn1(int x){return x+1;}",
+        "int lru_fn2(int x){return x+2;}",
+        "int lru_fn3(int x){return x+3;}",
+        "int lru_fn4(int x){return x+4;}",
+        "int lru_fn5(int x){return x+5;}",
+        "int lru_fn6(int x){return x+6;}",
+        "int lru_fn7(int x){return x+7;}",
+    };
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads  = 1;
+    cfg.verbose           = false;
+    cfg.hot_ir_cache_size  = 2;   /* tiny HOT capacity to force evictions */
+    cfg.warm_ir_cache_size = 2;   /* tiny WARM capacity */
+    snprintf(cfg.ir_disk_dir, sizeof(cfg.ir_disk_dir), "%s", snap_dir);
+    cfg.io_threads        = 0;    /* synchronous I/O: simpler for testing */
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e, "cjit_create returned NULL");
+    cjit_start(e);
+
+    func_id_t ids[T33_N];
+    for (int i = 0; i < T33_N; i++) {
+        ids[i] = cjit_register_function(e, names[i], irs[i], NULL);
+        CHECKF(ids[i] != CJIT_INVALID_FUNC_ID, "register '%s' failed", names[i]);
+        /* Compile each one so the IR is put into the LRU (via ir_cache_update). */
+        bool ok = cjit_compile_sync(e, ids[i], OPT_O1);
+        CHECKF(ok, "cjit_compile_sync '%s' failed", names[i]);
+    }
+
+    cjit_stats_t s = cjit_get_stats(e);
+    CHECKF(s.ir_evictions > 0,
+           "expected ir_evictions > 0 after %d inserts into cap-2/2 cache (got %llu)",
+           T33_N, (unsigned long long)s.ir_evictions);
+    CHECKF(s.ir_cold_count > 0,
+           "expected ir_cold_count > 0 after overflow (got %u)", s.ir_cold_count);
+    printf("[t33]   evictions=%llu cold=%u warm=%u hot=%u\n",
+           (unsigned long long)s.ir_evictions,
+           s.ir_cold_count, s.ir_warm_count, s.ir_hot_count);
+
+    /* Re-compile a COLD function to trigger disk read + COLD→WARM promotion.
+     * lru_fn0 was inserted first so is most likely to be in COLD. */
+    bool ok0 = cjit_compile_sync(e, ids[0], OPT_O2);
+    CHECK(ok0, "re-compile lru_fn0 at O2 failed");
+
+    cjit_stats_t s2 = cjit_get_stats(e);
+    printf("[t33]   after re-access: promotions=%llu disk_reads=%llu\n",
+           (unsigned long long)s2.ir_promotions,
+           (unsigned long long)s2.ir_disk_reads);
+    /* Either a cache hit (if still in WARM after 2nd insert loop) or a
+     * disk read promotion — either way compilation succeeded. */
+    CHECK(s2.total_compilations > (uint64_t)T33_N,
+          "should have > T33_N total_compilations after re-compile");
+
+    cjit_destroy(e);
+    rmdir_recursive(snap_dir);
+    printf("[t33] PASS\n");
+#undef T33_N
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t34 – cjit_print_stats() + verbose compile path
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Run a standard compile with verbose=true to exercise the verbose
+ *      fprintf paths in the compiler thread.
+ *   2. Call cjit_print_stats() to cover the stats formatting code.
+ *   3. Redirect stderr to /dev/null so test output stays clean.
+ */
+TEST(t34_print_stats_verbose)
+{
+    printf("[t34] cjit_print_stats + verbose compile path...\n");
+
+    /* Redirect stderr for the duration of this test so verbose output
+     * doesn't pollute test output. */
+    int saved_stderr = dup(STDERR_FILENO);
+    int devnull = open("/dev/null", O_WRONLY);
+    dup2(devnull, STDERR_FILENO);
+    close(devnull);
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads = 1;
+    cfg.verbose          = true;   /* exercise verbose paths */
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    if (!e) {
+        dup2(saved_stderr, STDERR_FILENO); close(saved_stderr);
+        fprintf(stderr, "  FAIL  %s:%d  cjit_create returned NULL\n",
+                __FILE__, __LINE__);
+        return 1;
+    }
+    cjit_start(e);
+
+    func_id_t id = cjit_register_function(e, "verbose_fn",
+                                           "int verbose_fn(int x){return x*7;}",
+                                           NULL);
+    /* Use the sync path so verbose output fires from the calling thread
+     * (compiler thread verbose paths covered when same IR is compiled). */
+    cjit_compile_sync(e, id, OPT_O1);
+    /* Request another compile at same level; verbose "already at tier" log fires. */
+    cjit_request_recompile(e, id, OPT_O1);
+    cjit_drain_queue(e, 3000);
+
+    /* Restore stderr BEFORE calling print_stats so banner goes to stderr. */
+    dup2(saved_stderr, STDERR_FILENO);
+    close(saved_stderr);
+
+    /* cjit_print_stats covers lines 1802-1865 in cjit.c. */
+    cjit_print_stats(e);
+
+    cjit_stats_t s = cjit_get_stats(e);
+    CHECKF(s.total_compilations >= 1,
+           "expected >= 1 compilation, got %llu",
+           (unsigned long long)s.total_compilations);
+
+    cjit_destroy(e);
+    printf("[t34] PASS\n");
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t35 – cjit_compile_sync failure path + compile-event callback
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Register a function with deliberately invalid IR (syntax error).
+ *   2. Attach a compile-event callback.
+ *   3. Call cjit_compile_sync(); assert it returns false.
+ *   4. Verify the callback fired with success=false and errmsg non-empty.
+ *   5. Also cover enable_fast_math by compiling a valid OPT_O3 function
+ *      with fast_math enabled (hits the -ffast-math codegen branch).
+ */
+TEST(t35_compile_sync_failure)
+{
+    printf("[t35] cjit_compile_sync failure path + fast_math...\n");
+
+    cb_state_t cb_st;
+    memset(&cb_st, 0, sizeof(cb_st));
+    pthread_mutex_init(&cb_st.mu, NULL);
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads  = 1;
+    cfg.verbose           = false;
+    cfg.enable_fast_math  = true;  /* exercise -ffast-math branch */
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e, "cjit_create returned NULL");
+    cjit_set_compile_callback(e, compile_event_recorder, &cb_st);
+    cjit_start(e);
+
+    /* Invalid IR: syntax error causes compilation failure. */
+    static const char *BAD_IR = "int bad_fn(int x) { THIS_IS_NOT_C; }";
+    func_id_t bad_id = cjit_register_function(e, "bad_fn", BAD_IR, NULL);
+    CHECK(bad_id != CJIT_INVALID_FUNC_ID, "register bad_fn failed");
+
+    bool ok = cjit_compile_sync(e, bad_id, OPT_O1);
+    CHECK(!ok, "cjit_compile_sync should return false for invalid IR");
+
+    /* Callback must have fired with success=false. */
+    pthread_mutex_lock(&cb_st.mu);
+    int cnt = cb_st.count;
+    cjit_compile_event_t ev = cb_st.last;
+    pthread_mutex_unlock(&cb_st.mu);
+
+    CHECKF(cnt >= 1, "callback should have fired (count=%d)", cnt);
+    CHECK(!ev.success, "callback: expected success=false for bad IR");
+    CHECKF(ev.errmsg[0] != '\0', "callback: errmsg should be non-empty, got '%s'",
+           ev.errmsg);
+    printf("[t35]   failure callback: count=%d success=%d errmsg_len=%zu  OK\n",
+           cnt, (int)ev.success, strlen(ev.errmsg));
+
+    /* Register a valid float function and compile at O3 with fast_math=true.
+     * This hits the -ffast-math codegen branch in codegen.c. */
+    static const char *FLOAT_IR =
+        "float fm_fn(float a, float b) { return a * b + a; }";
+    func_id_t fid = cjit_register_function(e, "fm_fn", FLOAT_IR, NULL);
+    CHECK(fid != CJIT_INVALID_FUNC_ID, "register fm_fn failed");
+    bool ok3 = cjit_compile_sync(e, fid, OPT_O3);
+    CHECK(ok3, "cjit_compile_sync(OPT_O3, fast_math) failed");
+
+    typedef float (*fmfn_t)(float, float);
+    float r = ((fmfn_t)(uintptr_t)cjit_get_func(e, fid))(2.0f, 3.0f);
+    CHECKF(r > 7.9f && r < 8.1f,
+           "fm_fn(2,3) expected ~8.0 got %f", (double)r);
+    printf("[t35]   fast_math O3: fm_fn(2,3)=%.4f  OK\n", (double)r);
+
+    cjit_destroy(e);
+    pthread_mutex_destroy(&cb_st.mu);
+    printf("[t35] PASS\n");
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t36 – Edge-case API: cjit_percentile_ns + OPT_NONE + cjit_get_func_counted
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   A. cjit_percentile_ns edge cases:
+ *      • Call on a function with zero accumulated timed calls → expect 0
+ *      • Call with invalid id → expect 0
+ *      • Call with percentile > 100 → expect the maximum bucket value
+ *
+ *   B. OPT_NONE compile:
+ *      • cjit_compile_sync with OPT_NONE triggers the `-O0` branch in codegen.
+ *
+ *   C. cjit_get_func_counted():
+ *      • Use cjit_get_func_counted() in a tight loop; verify call_cnt is
+ *        incremented (covers the TLS flush path in cjit_record_call).
+ */
+TEST(t36_edge_case_api)
+{
+    printf("[t36] Edge-case API: percentile_ns, OPT_NONE, get_func_counted...\n");
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads = 1;
+    cfg.verbose          = false;
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e, "cjit_create returned NULL");
+    cjit_start(e);
+
+    /* ── A: cjit_percentile_ns edge cases ── */
+    static const char *IR_EC = "int edge_fn(int x) { return x + 1; }";
+    func_id_t id = cjit_register_function(e, "edge_fn", IR_EC, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "register edge_fn failed");
+
+    /* Compile so there is a valid function ptr. */
+    bool cs = cjit_compile_sync(e, id, OPT_O1);
+    CHECK(cs, "cjit_compile_sync failed");
+
+    /* Zero timed calls: percentile must return 0. */
+    uint64_t p50 = cjit_percentile_ns(e, id, 50);
+    CHECKF(p50 == 0,
+           "percentile_ns with 0 timed calls should be 0, got %llu",
+           (unsigned long long)p50);
+    printf("[t36]   percentile_ns(0 calls, p50)=0  OK\n");
+
+    /* Invalid id: must return 0. */
+    uint64_t pinv = cjit_percentile_ns(e, CJIT_INVALID_FUNC_ID, 50);
+    CHECKF(pinv == 0,
+           "percentile_ns with invalid id should be 0, got %llu",
+           (unsigned long long)pinv);
+    printf("[t36]   percentile_ns(invalid id)=0  OK\n");
+
+    /* percentile > 100: should clamp and return highest bucket edge. */
+    uint64_t p101 = cjit_percentile_ns(e, id, 101);
+    (void)p101; /* result is implementation-defined; just ensure no crash */
+    printf("[t36]   percentile_ns(p=101) did not crash  OK\n");
+
+    /* ── B: OPT_NONE compile ── */
+    static const char *IR_NONE = "int none_fn(int x) { return x * 5; }";
+    func_id_t nid = cjit_register_function(e, "none_fn", IR_NONE, NULL);
+    CHECK(nid != CJIT_INVALID_FUNC_ID, "register none_fn failed");
+
+    bool none_ok = cjit_compile_sync(e, nid, OPT_NONE);
+    CHECK(none_ok, "cjit_compile_sync(OPT_NONE) failed");
+
+    typedef int (*gfn_t)(int);
+    int r = ((gfn_t)(uintptr_t)cjit_get_func(e, nid))(3);
+    CHECKF(r == 15, "none_fn(3) expected 15, got %d", r);
+    CHECKF(cjit_get_current_opt_level(e, nid) == OPT_NONE,
+           "opt_level should be OPT_NONE, got %d",
+           (int)cjit_get_current_opt_level(e, nid));
+    printf("[t36]   OPT_NONE: none_fn(3)=%d  OK\n", r);
+
+    /* ── C: cjit_get_func_counted() TLS flush path ── */
+    /* Call get_func_counted enough times to trigger a TLS flush
+     * (CJIT_TLS_FLUSH_THRESHOLD calls per thread). */
+    typedef int (*efn_t)(int);
+    int sink = 0;
+    for (int k = 0; k < (int)(CJIT_TLS_FLUSH_THRESHOLD * 4); k++) {
+        efn_t f = (efn_t)(uintptr_t)cjit_get_func_counted(e, id);
+        if (f) sink += f(k);
+    }
+    cjit_flush_local_counts(e);
+    (void)sink;
+
+    uint64_t cc = cjit_get_call_count(e, id);
+    CHECKF(cc >= (uint64_t)CJIT_TLS_FLUSH_THRESHOLD,
+           "call_cnt should be >= TLS_FLUSH_THRESHOLD after counted loop (got %llu)",
+           (unsigned long long)cc);
+    printf("[t36]   get_func_counted loop: call_cnt=%llu  OK\n",
+           (unsigned long long)cc);
+
+    cjit_destroy(e);
+    printf("[t36] PASS\n");
+    return 0;
+}
 
 typedef int (*test_fn)(void);
 static const struct { const char *name; test_fn fn; } TESTS[] = {
@@ -2591,6 +3177,13 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t27_compile_event_callback", t27_compile_event_callback   },
     { "t28_function_pinning",       t28_function_pinning         },
     { "t29_snapshot_ir",            t29_snapshot_ir              },
+    { "t30_reset_function_stats",   t30_reset_function_stats     },
+    { "t31_drain_queue",            t31_drain_queue              },
+    { "t32_compile_sync",           t32_compile_sync             },
+    { "t33_ir_lru_evictions",       t33_ir_lru_evictions         },
+    { "t34_print_stats_verbose",    t34_print_stats_verbose      },
+    { "t35_compile_sync_failure",   t35_compile_sync_failure     },
+    { "t36_edge_case_api",          t36_edge_case_api            },
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 

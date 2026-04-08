@@ -1,0 +1,1290 @@
+        -:    0:Source:/home/runner/work/cjit/cjit/src/codegen.c
+        -:    0:Graph:build_cov/CMakeFiles/cjit_lib.dir/src/codegen.c.gcno
+        -:    0:Data:build_cov/CMakeFiles/cjit_lib.dir/src/codegen.c.gcda
+        -:    0:Runs:5
+        -:    1:/**
+        -:    2: * codegen.c – System-compiler JIT backend.
+        -:    3: *
+        -:    4: * See codegen.h for the design description.
+        -:    5: */
+        -:    6:
+        -:    7:#ifndef _GNU_SOURCE
+        -:    8:#define _GNU_SOURCE
+        -:    9:#endif
+        -:   10:#include "codegen.h"
+        -:   11:#include "codegen_cache.h"
+        -:   12:#include "func_table.h"   /* CJIT_NAME_MAX */
+        -:   13:
+        -:   14:#include <stdio.h>       /* FILE, fopen, fclose, snprintf, fprintf */
+        -:   15:#include <stdlib.h>      /* free, system                           */
+        -:   16:#include <string.h>      /* strlen, strncpy, snprintf              */
+        -:   17:#include <stdatomic.h>   /* atomic_fetch_add                       */
+        -:   18:#include <unistd.h>      /* unlink, getpid                         */
+        -:   19:#include <pthread.h>     /* pthread_self                           */
+        -:   20:#include <stdint.h>      /* uintptr_t                              */
+        -:   21:#include <inttypes.h>    /* PRIxPTR                                */
+        -:   22:#include <dlfcn.h>       /* dlopen, dlsym, dlerror                */
+        -:   23:#include <signal.h>      /* SIGTERM, SIGKILL, kill                 */
+        -:   24:#include <sys/types.h>
+        -:   25:#include <sys/stat.h>     /* stat, S_ISDIR                         */
+        -:   26:#include <sys/wait.h>     /* waitpid           */
+        -:   27:#include <spawn.h>        /* posix_spawnp      */
+        -:   28:#include <fcntl.h>        /* O_WRONLY etc.     */
+        -:   29:#ifdef __linux__
+        -:   30:#include <sys/syscall.h>  /* SYS_memfd_create  */
+        -:   31:#endif
+        -:   32:
+        -:   33:/* ─────────────────────────── memfd helper (Linux) ─────────────────────────── */
+        -:   34:
+        -:   35:#ifdef __linux__
+        -:   36:/**
+        -:   37: * Thin wrapper around the memfd_create(2) kernel interface.
+        -:   38: *
+        -:   39: * Using a raw syscall avoids a glibc version dependency: the libc wrapper for
+        -:   40: * memfd_create was added in glibc 2.27 (2018), but the kernel syscall has
+        -:   41: * been available since Linux 3.17 (2014).  Both GCC and Clang are happy with
+        -:   42: * syscall() here.
+        -:   43: *
+        -:   44: * We do NOT set MFD_CLOEXEC because the file descriptor must remain open in
+        -:   45: * the compiler child process so that /proc/<ppid>/fd/<fd> continues to refer
+        -:   46: * to a valid, open file while cc reads the source.  The fd is closed
+        -:   47: * explicitly by codegen_compile() after waitpid() returns.
+        -:   48: *
+        -:   49: * Returns a valid file descriptor on success, or -1 on any failure (old
+        -:   50: * kernel, seccomp restriction, etc.).  Callers must check for -1 and fall
+        -:   51: * back to the ordinary /tmp tmpfile path.
+        -:   52: */
+        -:   53:#  ifdef __NR_memfd_create
+      211:   54:static int cg_memfd_create(const char *name)
+        -:   55:{
+      211:   56:    return (int)syscall(__NR_memfd_create, name, 0u);
+        -:   57:}
+        -:   58:#  else
+        -:   59:/* Kernel too old to support memfd_create — fall back to tmpfile. */
+        -:   60:static int cg_memfd_create(const char *name) { (void)name; return -1; }
+        -:   61:#  endif /* __NR_memfd_create */
+        -:   62:#endif /* __linux__ */
+        -:   63:
+        -:   64:/* ─────────────────────────── output tmpdir selection ───────────────────────── */
+        -:   65:
+        -:   66:/**
+        -:   67: * Return the best available temporary directory for .so output files.
+        -:   68: *
+        -:   69: * On Linux, /dev/shm is a RAM-backed tmpfs that avoids any real-disk I/O for
+        -:   70: * the compiled shared object.  On systems where /tmp is itself a tmpfs (most
+        -:   71: * modern Linux distributions) the difference is negligible, but on systems
+        -:   72: * with a disk-backed /tmp the saving is measurable: a typical 20-40 KB JIT
+        -:   73: * .so file avoids an inode create, a write, a dlopen (read), and an unlink —
+        -:   74: * all against a spinning disk instead of RAM.
+        -:   75: *
+        -:   76: * The probe is performed once and cached in an atomic flag to avoid repeated
+        -:   77: * stat(2) calls.  The benign race (two threads computing the same result
+        -:   78: * simultaneously) converges within one call.
+        -:   79: *
+        -:   80: * On non-Linux systems /tmp is always returned.
+        -:   81: */
+      211:   82:static const char *cg_so_tmpdir(void)
+        -:   83:{
+        -:   84:#ifdef __linux__
+        -:   85:    /* -1 = unknown, 0 = /tmp, 1 = /dev/shm */
+        -:   86:    static _Atomic int shm_available = -1;
+      211:   87:    int av = atomic_load_explicit(&shm_available, memory_order_relaxed);
+      211:   88:    if (av < 0) {
+        -:   89:        struct stat st;
+       5*:   90:        av = (stat("/dev/shm", &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+        5:   91:        atomic_store_explicit(&shm_available, av, memory_order_relaxed);
+        -:   92:    }
+      211:   93:    if (av) return "/dev/shm";
+        -:   94:#endif
+    #####:   95:    return "/tmp";
+        -:   96:}
+        -:   97:
+        -:   98:
+        -:   99:
+        -:  100:/**
+        -:  101: * Helper macros injected at the top of every compiled translation unit.
+        -:  102: *
+        -:  103: * These are injected as raw text prepended to the user's C source so that
+        -:  104: * user code can use LIKELY/UNLIKELY/HOT/NOINLINE without depending on any
+        -:  105: * cjit header.
+        -:  106: *
+        -:  107: * __attribute__((hot)) instructs the compiler to optimise the function more
+        -:  108: * aggressively and place it in the "hot" section for better cache locality.
+        -:  109: */
+        -:  110:static const char CODEGEN_PREAMBLE[] =
+        -:  111:    "/* cjit auto-generated preamble */\n"
+        -:  112:    "#ifndef CJIT_PREAMBLE_H\n"
+        -:  113:    "#define CJIT_PREAMBLE_H\n"
+        -:  114:    "#ifdef __GNUC__\n"
+        -:  115:    "#  define LIKELY(x)                  __builtin_expect(!!(x), 1)\n"
+        -:  116:    "#  define UNLIKELY(x)                __builtin_expect(!!(x), 0)\n"
+        -:  117:    "#  define HOT                        __attribute__((hot))\n"
+        -:  118:    "#  define COLD                       __attribute__((cold))\n"
+        -:  119:    "#  define NOINLINE                   __attribute__((noinline))\n"
+        -:  120:    "#  define ALWAYS_INLINE              __attribute__((always_inline)) inline\n"
+        -:  121:    "#  define ALIGNED(n)                 __attribute__((aligned(n)))\n"
+        -:  122:    /* Pure: reads global state but has no side effects; same args → same result. */
+        -:  123:    "#  define PURE                       __attribute__((pure))\n"
+        -:  124:    /* Const: like PURE but must not read global state – result depends only on args. */
+        -:  125:    "#  define CONST_FUNC                 __attribute__((const))\n"
+        -:  126:    /* Restrict: pointer aliasing hint – tells the compiler this pointer is unique. */
+        -:  127:    "#  define RESTRICT                   __restrict__\n"
+        -:  128:    /* Prefetch: software prefetch hint (rw: 0=read,1=write; locality: 0-3). */
+        -:  129:    "#  define PREFETCH(addr, rw, loc)    __builtin_prefetch((addr), (rw), (loc))\n"
+        -:  130:    /* Assume aligned: lets the compiler omit alignment-fixup code for SIMD. */
+        -:  131:    "#  define ASSUME_ALIGNED(ptr, n)     __builtin_assume_aligned((ptr), (n))\n"
+        -:  132:    /*
+        -:  133:     * FLATTEN: forces the compiler to inline every function called from within
+        -:  134:     * the annotated function, recursively.  More powerful than ALWAYS_INLINE
+        -:  135:     * (which applies only to the immediate callee): a FLATTEN function becomes
+        -:  136:     * a single block of straight-line code with no internal call overhead at
+        -:  137:     * all.  Particularly useful for hot inner loops that call small helpers —
+        -:  138:     * apply it to the outer loop function to guarantee the helpers disappear.
+        -:  139:     */
+        -:  140:    "#  define FLATTEN                    __attribute__((flatten))\n"
+        -:  141:    /*
+        -:  142:     * NORETURN: annotates a function guaranteed never to return (e.g. one that
+        -:  143:     * calls exit() unconditionally or loops forever).  Allows the compiler to
+        -:  144:     * elide the return sequence at call sites and remove dead code after the
+        -:  145:     * call, reducing both binary size and branch overhead.
+        -:  146:     */
+        -:  147:    "#  define NORETURN                   __attribute__((noreturn))\n"
+        -:  148:    /*
+        -:  149:     * CJIT_EXPORT: explicitly marks a symbol as having default (exported)
+        -:  150:     * visibility so it remains accessible via dlsym() even when the
+        -:  151:     * translation unit is compiled with -fvisibility=hidden.  Without that
+        -:  152:     * flag all symbols have default visibility anyway, so CJIT_EXPORT is a
+        -:  153:     * no-op in normal builds.  It becomes useful when user IR passes
+        -:  154:     * -fvisibility=hidden via cfg.extra_cflags to hide internal helpers and
+        -:  155:     * only export the specific entry-point function the engine looks up.
+        -:  156:     */
+        -:  157:    "#  define CJIT_EXPORT                __attribute__((visibility(\"default\")))\n"
+        -:  158:    /*
+        -:  159:     * MALLOC_FUNC: asserts that the annotated function returns a freshly-
+        -:  160:     * allocated pointer that is not aliased by any other live pointer in the
+        -:  161:     * program.  Enables the alias analyser to eliminate many conservative
+        -:  162:     * load/store assumptions when the caller uses the returned pointer,
+        -:  163:     * allowing aggressive reordering and vectorisation of subsequent code.
+        -:  164:     */
+        -:  165:    "#  define MALLOC_FUNC                __attribute__((malloc))\n"
+        -:  166:    "#else\n"
+        -:  167:    "#  define LIKELY(x)                  (x)\n"
+        -:  168:    "#  define UNLIKELY(x)                (x)\n"
+        -:  169:    "#  define HOT\n"
+        -:  170:    "#  define COLD\n"
+        -:  171:    "#  define NOINLINE\n"
+        -:  172:    "#  define ALWAYS_INLINE              inline\n"
+        -:  173:    "#  define ALIGNED(n)\n"
+        -:  174:    "#  define PURE\n"
+        -:  175:    "#  define CONST_FUNC\n"
+        -:  176:    "#  define RESTRICT\n"
+        -:  177:    "#  define PREFETCH(addr, rw, loc)    ((void)(addr))\n"
+        -:  178:    "#  define ASSUME_ALIGNED(ptr, n)     (ptr)\n"
+        -:  179:    "#  define FLATTEN\n"
+        -:  180:    "#  define NORETURN\n"
+        -:  181:    "#  define CJIT_EXPORT\n"
+        -:  182:    "#  define MALLOC_FUNC\n"
+        -:  183:    "#endif\n"
+        -:  184:    "#include <stdint.h>\n"
+        -:  185:    "#include <string.h>\n"
+        -:  186:    "#include <stdlib.h>\n"
+        -:  187:    /*
+        -:  188:     * <limits.h>: provides INT_MAX, INT_MIN, LONG_MAX, etc.  Commonly
+        -:  189:     * required for overflow guards and sentinel values in JIT functions.
+        -:  190:     */
+        -:  191:    "#include <limits.h>\n"
+        -:  192:    /*
+        -:  193:     * <stdbool.h>: provides bool, true, false in C99/C11.  In C23 these are
+        -:  194:     * built-in keywords and the header is a no-op; including it is always safe.
+        -:  195:     */
+        -:  196:    "#include <stdbool.h>\n"
+        -:  197:    "#endif /* CJIT_PREAMBLE_H */\n";
+        -:  198:
+        -:  199:/* ─────────────────────────── optimisation flags ───────────────────────────── */
+        -:  200:
+        -:  201:/**
+        -:  202: * Maximum number of arguments passed to the compiler subprocess.
+        -:  203: *
+        -:  204: * cc(1) + -shared + -fPIC + opt-level + up to 14 optional flags
+        -:  205: * (including -funswitch-loops, -fpeel-loops) +
+        -:  206: * JIT-specific flags (-fno-stack-protector, -fno-asynchronous-unwind-tables,
+        -:  207: * -fno-ident) + -w + -o + so_path + -x + c + src_path + NULL = at most 26
+        -:  208: * entries.  When argument specialisation is active, two more entries are
+        -:  209: * added (-D <func=_cjit_i_func>).  Extra user flags (extra_cflags) may add
+        -:  210: * up to ~50 more tokens.  96 gives comfortable headroom.
+        -:  211: */
+        -:  212:#define MAX_CC_ARGS 96
+        -:  213:
+        -:  214:/**
+        -:  215: * Build the compiler argv array for posix_spawnp().
+        -:  216: *
+        -:  217: * Fills argv[0..n] where argv[n] == NULL and returns n.
+        -:  218: * All string pointers are either string literals (stable) or the caller-
+        -:  219: * supplied so_path / src_path (valid for the duration of codegen_compile).
+        -:  220: */
+      211:  221:static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
+        -:  222:                                const char *so_path,
+        -:  223:                                const char *src_path,
+        -:  224:                                opt_level_t level,
+        -:  225:                                const codegen_opts_t *opts)
+        -:  226:{
+      211:  227:    int n = 0;
+      211:  228:    argv[n++] = (opts && opts->cc_binary && opts->cc_binary[0])
+      422:  229:                    ? opts->cc_binary : "cc";
+      211:  230:    argv[n++] = "-shared";
+      211:  231:    argv[n++] = "-fPIC";
+        -:  232:
+        -:  233:    /* Base optimisation level */
+      211:  234:    switch (level) {
+        1:  235:    case OPT_NONE: argv[n++] = "-O0"; break;
+       84:  236:    case OPT_O1:   argv[n++] = "-O1"; break;
+       89:  237:    case OPT_O2:   argv[n++] = "-O2"; break;
+       37:  238:    case OPT_O3:   argv[n++] = "-O3"; break;
+    #####:  239:    default:       argv[n++] = "-O2"; break;
+        -:  240:    }
+        -:  241:
+        -:  242:    /*
+        -:  243:     * Flags applied from O1 upward.
+        -:  244:     *
+        -:  245:     * -fomit-frame-pointer: omit the frame pointer register save/restore in
+        -:  246:     *   function prologues and epilogues, freeing an extra general-purpose
+        -:  247:     *   register and reducing stack frame setup cost.  Always safe for JIT
+        -:  248:     *   functions since we never need to unwind through them at the C level.
+        -:  249:     *
+        -:  250:     * -fno-semantic-interposition: assume that symbols in this translation
+        -:  251:     *   unit cannot be interposed by LD_PRELOAD, allowing the compiler to
+        -:  252:     *   inline and devirtualize calls to locally-defined functions.  Correct
+        -:  253:     *   because every JIT .so is loaded with RTLD_LOCAL.
+        -:  254:     */
+      211:  255:    if (level >= OPT_O1) {
+      210:  256:        argv[n++] = "-fomit-frame-pointer";
+      210:  257:        argv[n++] = "-fno-semantic-interposition";
+        -:  258:
+        -:  259:        /*
+        -:  260:         * -mtune=native: schedule instructions for the CPU that is actually
+        -:  261:         * running this JIT engine.  Unlike -march=native, this does NOT change
+        -:  262:         * the instruction set (the binary is still baseline x86-64, ARM64,
+        -:  263:         * etc.), so it is always safe to emit.  It improves throughput for all
+        -:  264:         * JIT-compiled code by choosing pipeline-optimal instruction ordering,
+        -:  265:         * register allocation hints, and branch alignment for the host µarch.
+        -:  266:         */
+      210:  267:        argv[n++] = "-mtune=native";
+        -:  268:
+        -:  269:#ifdef __linux__
+        -:  270:        /*
+        -:  271:         * -fno-plt: replace PLT indirection stubs with direct GOT-relative
+        -:  272:         * calls for any external functions called from within JIT code (e.g.
+        -:  273:         * malloc, memcpy, libc helpers).
+        -:  274:         *
+        -:  275:         * Without this flag: call → PLT stub → GOT load → function  (2 hops)
+        -:  276:         * With this flag:    call *GOT_entry@GOTPCREL(%rip)           (1 hop)
+        -:  277:         *
+        -:  278:         * The saving is one indirect-branch instruction and one potential
+        -:  279:         * branch-target-buffer miss per unique external call site.  For
+        -:  280:         * JIT functions that call many libc routines this is a measurable
+        -:  281:         * win at zero correctness risk, because:
+        -:  282:         *   (a) We already dlopen() with RTLD_NOW so all GOT entries are
+        -:  283:         *       fully resolved before any JIT code executes.
+        -:  284:         *   (b) We use RTLD_LOCAL so there is no inter-.so PLT sharing.
+        -:  285:         *
+        -:  286:         * Linux/ELF only.  Mach-O (macOS) uses a different ABI and does
+        -:  287:         * not recognise this flag.  On non-Linux platforms the `#ifdef`
+        -:  288:         * simply skips it — no error, just the optimisation is omitted.
+        -:  289:         */
+      210:  290:        argv[n++] = "-fno-plt";
+        -:  291:#endif
+        -:  292:    }
+        -:  293:
+      211:  294:    if (opts->enable_inlining && level >= OPT_O2)
+      126:  295:        argv[n++] = "-finline-functions";
+        -:  296:
+      211:  297:    if (opts->enable_loop_unroll && level >= OPT_O2)
+      126:  298:        argv[n++] = "-funroll-loops";
+        -:  299:
+      211:  300:    if (opts->enable_vectorization && level >= OPT_O2)
+      126:  301:        argv[n++] = "-ftree-vectorize";
+        -:  302:
+      211:  303:    if (level >= OPT_O2) {
+        -:  304:        /*
+        -:  305:         * -funswitch-loops: hoist loop-invariant conditionals out of the loop
+        -:  306:         * body.  When a loop contains `if (mode == 0) { … } else { … }` and
+        -:  307:         * `mode` does not change across iterations, the compiler emits two
+        -:  308:         * separate loops (one per branch) rather than re-testing the condition
+        -:  309:         * on every iteration.  The result is fewer branch mispredictions, a
+        -:  310:         * tighter inner loop, and better vectorisation opportunities.
+        -:  311:         *
+        -:  312:         * GCC enables this only at -O3 by default; we apply it at O2 as well
+        -:  313:         * since JIT workloads very commonly contain dispatch-style inner loops
+        -:  314:         * with invariant flag or mode parameters.
+        -:  315:         */
+      126:  316:        argv[n++] = "-funswitch-loops";
+        -:  317:
+        -:  318:        /*
+        -:  319:         * -fpeel-loops: peel the first (and last) iterations from loops where
+        -:  320:         * the compiler has high confidence they execute very few times — either
+        -:  321:         * from profile feedback or when the trip count is statically known and
+        -:  322:         * small (e.g. a 3-iteration initialisation loop becomes straight-line
+        -:  323:         * code).  Peeling the first iteration also often achieves better
+        -:  324:         * alignment for the main loop body, reducing the cycle cost of the
+        -:  325:         * hot path.
+        -:  326:         *
+        -:  327:         * GCC enables this only at -O3 by default; we apply it at O2 for the
+        -:  328:         * same reasons as -funswitch-loops.
+        -:  329:         */
+      126:  330:        argv[n++] = "-fpeel-loops";
+        -:  331:    }
+        -:  332:
+      211:  333:    if (opts->enable_native_arch && level >= OPT_O3)
+       37:  334:        argv[n++] = "-march=native";
+        -:  335:
+      211:  336:    if (opts->enable_fast_math && level >= OPT_O3)
+        1:  337:        argv[n++] = "-ffast-math";
+        -:  338:
+        -:  339:    /*
+        -:  340:     * JIT-specific flags applied at every optimisation level.
+        -:  341:     *
+        -:  342:     * -fno-stack-protector: disable the stack-smashing canary.  Every JIT
+        -:  343:     *   function otherwise gets 2-4 extra instructions (load guard, compare,
+        -:  344:     *   conditional branch) in its prologue and epilogue.  The canary is
+        -:  345:     *   irrelevant for JIT code because the IR is trusted/controlled by the
+        -:  346:     *   calling application.
+        -:  347:     *
+        -:  348:     * -fno-asynchronous-unwind-tables: omit the .eh_frame section from the
+        -:  349:     *   compiled .so.  This section is required for C++ exception unwinding
+        -:  350:     *   and debugger backtraces through JIT frames, neither of which applies
+        -:  351:     *   here.  Removing it reduces .so binary size (often 20-30% for small
+        -:  352:     *   functions), which lowers dlopen overhead and improves I-cache density.
+        -:  353:     */
+      211:  354:    argv[n++] = "-fno-stack-protector";
+      211:  355:    argv[n++] = "-fno-asynchronous-unwind-tables";
+        -:  356:
+        -:  357:    /*
+        -:  358:     * -fno-ident: suppress the `.comment` ELF section that GCC and Clang
+        -:  359:     * normally emit into every compiled object.  This section contains the
+        -:  360:     * compiler version string (e.g. "GCC: (GNU) 13.2.0") and is never read
+        -:  361:     * at runtime.  Removing it makes each JIT .so a few hundred bytes smaller
+        -:  362:     * and reduces the amount of data that dlopen() must map and process.
+        -:  363:     */
+      211:  364:    argv[n++] = "-fno-ident";
+        -:  365:
+        -:  366:    /*
+        -:  367:     * -pipe: instruct the compiler to use pipes instead of temporary files for
+        -:  368:     * communication between compilation stages (preprocessor → compiler →
+        -:  369:     * assembler).  This eliminates multiple temporary-file round-trips through
+        -:  370:     * the filesystem for every JIT compilation and is particularly beneficial
+        -:  371:     * on systems where /tmp is disk-backed.  The flag is safe and well-supported
+        -:  372:     * by both GCC and Clang; it has no effect on the correctness or semantics
+        -:  373:     * of the compiled output.
+        -:  374:     */
+      211:  375:    argv[n++] = "-pipe";
+        -:  376:
+      211:  377:    argv[n++] = "-w";   /* suppress warnings from user snippets */
+      211:  378:    argv[n++] = "-o";
+      211:  379:    argv[n++] = so_path;
+        -:  380:    /*
+        -:  381:     * Explicit language specification before the source path.
+        -:  382:     *
+        -:  383:     * When the source file is an in-memory (memfd) path such as
+        -:  384:     * /proc/self/fd/3, the compiler cannot infer "C source" from the file
+        -:  385:     * extension.  Adding "-x c" before the path is safe even when the file
+        -:  386:     * has a ".c" extension — it is redundant but harmless in that case, so
+        -:  387:     * we always emit it to keep the logic unconditional.
+        -:  388:     */
+      211:  389:    argv[n++] = "-x";
+      211:  390:    argv[n++] = "c";
+      211:  391:    argv[n++] = src_path;
+      211:  392:    argv[n]   = NULL;
+      211:  393:    return n;
+        -:  394:}
+        -:  395:
+        -:  396:/* ─────────────── argument-profile specialisation helpers ──────────────────── */
+        -:  397:
+        -:  398:/*
+        -:  399: * Per-parameter info extracted from a parsed C function signature.
+        -:  400: *
+        -:  401: * Limits: 64 bytes for the type string + 32 for the name — sufficient for any
+        -:  402: * realistic JIT parameter.  Oversized tokens are truncated; in the worst case
+        -:  403: * the wrapping step simply decides not to specialise that slot.
+        -:  404: */
+        -:  405:#define SPEC_MAX_PARAMS   CJIT_MAX_PROFILED_ARGS   /* at most 8 params tracked */
+        -:  406:#define SPEC_TYPE_MAX     80
+        -:  407:#define SPEC_NAME_MAX     40
+        -:  408:
+        -:  409:typedef struct {
+        -:  410:    char type[SPEC_TYPE_MAX];
+        -:  411:    char name[SPEC_NAME_MAX];
+        -:  412:    bool valid;
+        -:  413:} param_info_t;
+        -:  414:
+        -:  415:/*
+        -:  416: * Copy up to `n` non-whitespace-leading, non-whitespace-trailing characters
+        -:  417: * of [begin, end) into `out` (NUL-terminated).
+        -:  418: */
+       16:  419:static void copy_trimmed(char *out, size_t outsz, const char *begin, const char *end)
+        -:  420:{
+       16:  421:    while (begin < end && (*begin == ' ' || *begin == '\t' || *begin == '\n' || *begin == '\r'))
+    #####:  422:        begin++;
+       24:  423:    while (end > begin && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r'))
+        8:  424:        end--;
+       16:  425:    size_t len = (size_t)(end - begin);
+      16*:  426:    if (len >= outsz) len = outsz - 1;
+       16:  427:    memcpy(out, begin, len);
+       16:  428:    out[len] = '\0';
+       16:  429:}
+        -:  430:
+        -:  431:/*
+        -:  432: * Return true if the type string is a plain integer type (suitable for
+        -:  433: * constant specialisation).  We look for known integer keywords and reject
+        -:  434: * anything containing '*' (pointer), "float", "double", or "void".
+        -:  435: *
+        -:  436: * This is intentionally conservative: it is safer to miss a specialisation
+        -:  437: * opportunity than to produce a specialisation for a non-integer argument.
+        -:  438: */
+        4:  439:static bool is_integer_type(const char *type)
+        -:  440:{
+       4*:  441:    if (strstr(type, "*"))      return false;
+       4*:  442:    if (strstr(type, "float"))  return false;
+       4*:  443:    if (strstr(type, "double")) return false;
+       4*:  444:    if (strstr(type, "void"))   return false;
+        -:  445:    /* Accept any of the standard integer-like keywords */
+        4:  446:    if (strstr(type, "int"))    return true;
+    #####:  447:    if (strstr(type, "long"))   return true;
+    #####:  448:    if (strstr(type, "short"))  return true;
+    #####:  449:    if (strstr(type, "char"))   return true;
+    #####:  450:    if (strstr(type, "size_t")) return true;
+    #####:  451:    if (strstr(type, "uint"))   return true;
+    #####:  452:    if (strstr(type, "int8"))   return true;
+    #####:  453:    if (strstr(type, "int16"))  return true;
+    #####:  454:    if (strstr(type, "int32"))  return true;
+    #####:  455:    if (strstr(type, "int64"))  return true;
+    #####:  456:    if (strstr(type, "bool"))   return true;
+    #####:  457:    return false;
+        -:  458:}
+        -:  459:
+        -:  460:/*
+        -:  461: * Parse a comma-separated parameter list of the form:
+        -:  462: *   "int a, const float *b, unsigned long c"
+        -:  463: * into an array of param_info_t structs.
+        -:  464: *
+        -:  465: * Returns the number of params successfully parsed (≥ 0).
+        -:  466: * Stops at SPEC_MAX_PARAMS even if the source has more.
+        -:  467: * A parameter with an unnamed argument (e.g. "int") sets .valid = false.
+        -:  468: */
+        4:  469:static int parse_param_list(const char *params, param_info_t *out, int max_out)
+        -:  470:{
+        4:  471:    int count = 0;
+        4:  472:    const char *p = params;
+        8:  473:    while (*p && count < max_out) {
+        -:  474:        /* Find end of this parameter (next comma at depth 0) */
+        4:  475:        const char *start = p;
+        4:  476:        int depth = 0;
+      24*:  477:        while (*p && !(*p == ',' && depth == 0)) {
+      20*:  478:            if (*p == '(') depth++;
+      20*:  479:            else if (*p == ')') { if (depth > 0) depth--; else break; }
+       20:  480:            p++;
+        -:  481:        }
+        4:  482:        const char *end = p;
+       4*:  483:        if (*p == ',') p++; /* consume comma */
+        -:  484:
+        -:  485:        /* Trim the parameter token */
+       4*:  486:        while (start < end && (*start == ' ' || *start == '\t')) start++;
+       4*:  487:        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+       4*:  488:        if (start == end) continue;  /* empty token */
+        -:  489:
+        -:  490:        /*
+        -:  491:         * Split "type name" at the last identifier boundary.
+        -:  492:         * Scan backwards for the end of the parameter name.
+        -:  493:         */
+        4:  494:        const char *name_end = end;
+        -:  495:        /* Skip trailing [] if any (array params) */
+        8:  496:        while (name_end > start && name_end[-1] == ']') {
+    #####:  497:            while (name_end > start && name_end[-1] != '[') name_end--;
+    #####:  498:            if (name_end > start) name_end--;  /* skip '[' */
+        -:  499:        }
+        4:  500:        const char *name_start = name_end;
+        8:  501:        while (name_start > start &&
+        8:  502:               (*(name_start-1) == '_' ||
+        8:  503:                (*(name_start-1) >= 'a' && *(name_start-1) <= 'z') ||
+       4*:  504:                (*(name_start-1) >= 'A' && *(name_start-1) <= 'Z') ||
+       4*:  505:                (*(name_start-1) >= '0' && *(name_start-1) <= '9')))
+        4:  506:            name_start--;
+        -:  507:
+       4*:  508:        if (name_start == start) {
+        -:  509:            /* No separate name found — either "int" with no name, or parsing
+        -:  510:             * edge case.  Mark as invalid but still count the slot. */
+    #####:  511:            out[count].valid = false;
+    #####:  512:            out[count].type[0] = out[count].name[0] = '\0';
+    #####:  513:            count++;
+    #####:  514:            continue;
+        -:  515:        }
+        -:  516:
+        4:  517:        copy_trimmed(out[count].type, sizeof(out[count].type), start, name_start);
+        4:  518:        copy_trimmed(out[count].name, sizeof(out[count].name), name_start, name_end);
+       4*:  519:        out[count].valid = (out[count].type[0] != '\0' && out[count].name[0] != '\0');
+        4:  520:        count++;
+        -:  521:    }
+        4:  522:    return count;
+        -:  523:}
+        -:  524:
+        -:  525:/*
+        -:  526: * Parse the function signature from the C source text.
+        -:  527: *
+        -:  528: * Searches for:   <return_type> <func_name> ( <params> ) {
+        -:  529: * Extracts return type (ret_buf) and parameter list string (par_buf).
+        -:  530: *
+        -:  531: * Returns true on success.  False is returned (and buffers left empty) if:
+        -:  532: *   • func_name is not found in ir_source
+        -:  533: *   • the signature cannot be reliably parsed
+        -:  534: *   • func_name appears too many times (risk of -D substitution side effects)
+        -:  535: */
+        4:  536:static bool parse_func_sig(const char *ir, const char *func_name,
+        -:  537:                            char *ret_buf, size_t ret_sz,
+        -:  538:                            char *par_buf, size_t par_sz)
+        -:  539:{
+        4:  540:    ret_buf[0] = par_buf[0] = '\0';
+        -:  541:
+        -:  542:    /* Count occurrences of func_name as a whole identifier to detect
+        -:  543:     * ambiguous sources (e.g. multiple definitions, recursive helpers). */
+        4:  544:    size_t fn_len = strlen(func_name);
+        4:  545:    unsigned occurrences = 0;
+        4:  546:    const char *scan = ir;
+        8:  547:    while ((scan = strstr(scan, func_name)) != NULL) {
+        -:  548:        /* Check word boundaries to avoid matching substrings. */
+       8*:  549:        bool lbound = (scan == ir ||
+        4:  550:                       !(*(scan-1) == '_' ||
+       4*:  551:                         (*(scan-1) >= 'a' && *(scan-1) <= 'z') ||
+       4*:  552:                         (*(scan-1) >= 'A' && *(scan-1) <= 'Z') ||
+       4*:  553:                         (*(scan-1) >= '0' && *(scan-1) <= '9')));
+        4:  554:        const char *after = scan + fn_len;
+       8*:  555:        bool rbound = (!(*after == '_' ||
+       4*:  556:                         (*after >= 'a' && *after <= 'z') ||
+       4*:  557:                         (*after >= 'A' && *after <= 'Z') ||
+       4*:  558:                         (*after >= '0' && *after <= '9')));
+        4:  559:        if (lbound && rbound) occurrences++;
+        4:  560:        scan += fn_len;
+        -:  561:    }
+        4:  562:    if (occurrences == 0 || occurrences > CJIT_SPEC_MAX_NAME_OCCURRENCES)
+    #####:  563:        return false;
+        -:  564:
+        -:  565:    /* Find the function DEFINITION: func_name immediately followed by '('. */
+        4:  566:    const char *def = ir;
+        4:  567:    while ((def = strstr(def, func_name)) != NULL) {
+        -:  568:        /* Check left word boundary */
+       8*:  569:        bool lbound = (def == ir ||
+        4:  570:                       !(*(def-1) == '_' ||
+       4*:  571:                         (*(def-1) >= 'a' && *(def-1) <= 'z') ||
+       4*:  572:                         (*(def-1) >= 'A' && *(def-1) <= 'Z') ||
+       4*:  573:                         (*(def-1) >= '0' && *(def-1) <= '9')));
+        4:  574:        const char *after = def + fn_len;
+        -:  575:        /* Skip whitespace to find '(' */
+       4*:  576:        while (*after == ' ' || *after == '\t' || *after == '\n') after++;
+        4:  577:        if (lbound && *after == '(') break;
+    #####:  578:        def += fn_len;
+        -:  579:    }
+       4*:  580:    if (!def) return false;
+        -:  581:
+        -:  582:    /* Extract return type: text on the same line before func_name, going back
+        -:  583:     * past whitespace to the previous newline or start-of-file. */
+        4:  584:    const char *line_start = def;
+       20:  585:    while (line_start > ir && *(line_start-1) != '\n') line_start--;
+        -:  586:    /* Skip leading whitespace / storage class keywords we don't want to copy */
+       4*:  587:    while (*line_start == ' ' || *line_start == '\t') line_start++;
+        -:  588:    /* The return type is everything from line_start to def, trimmed. */
+        4:  589:    copy_trimmed(ret_buf, ret_sz, line_start, def);
+       4*:  590:    if (ret_buf[0] == '\0') return false;  /* couldn't find return type */
+        -:  591:
+        -:  592:    /* Extract parameter list between '(' and matching ')'. */
+        4:  593:    const char *after = def + fn_len;
+       4*:  594:    while (*after == ' ' || *after == '\t' || *after == '\n') after++;
+       4*:  595:    if (*after != '(') return false;
+        4:  596:    after++; /* skip '(' */
+        -:  597:
+        4:  598:    const char *par_start = after;
+        4:  599:    int depth = 1;
+       28:  600:    while (*after && depth > 0) {
+      24*:  601:        if (*after == '(') depth++;
+       24:  602:        else if (*after == ')') depth--;
+       24:  603:        after++;
+        -:  604:    }
+       4*:  605:    if (depth != 0) return false;
+        4:  606:    const char *par_end = after - 1; /* points just after ')' → back up one */
+        -:  607:
+        4:  608:    copy_trimmed(par_buf, par_sz, par_start, par_end);
+        -:  609:
+        -:  610:    /* Verify there is a '{' following (it's a definition, not a declaration). */
+        4:  611:    const char *body = after;
+        8:  612:    while (*body == ' ' || *body == '\t' || *body == '\n' || *body == '\r') body++;
+        4:  613:    return (*body == '{');
+        -:  614:}
+        -:  615:
+        -:  616:/*
+        -:  617: * Generate a specialisation wrapper for func_name.
+        -:  618: *
+        -:  619: * Writes the generated C source into out_buf.
+        -:  620: * Sets spec_define (e.g. "my_func=_cjit_i_my_func") if a -D flag is needed.
+        -:  621: *
+        -:  622: * Returns number of bytes written, 0 if no specialisation is possible.
+        -:  623: */
+        4:  624:static size_t generate_spec_wrapper(const char *func_name,
+        -:  625:                                     const char *ret_type,
+        -:  626:                                     const char *params_str,
+        -:  627:                                     const cjit_arg_profile_t *prof,
+        -:  628:                                     char *out_buf, size_t out_sz,
+        -:  629:                                     char *spec_define_buf, size_t define_sz)
+        -:  630:{
+        4:  631:    spec_define_buf[0] = '\0';
+        -:  632:
+        -:  633:    /* Parse the parameter list. */
+        -:  634:    param_info_t pinfo[SPEC_MAX_PARAMS];
+        4:  635:    memset(pinfo, 0, sizeof(pinfo));
+        4:  636:    int nparams = parse_param_list(params_str, pinfo, SPEC_MAX_PARAMS);
+       4*:  637:    if (nparams <= 0) return 0;
+        -:  638:
+        -:  639:    /* Identify which params have a confident dominant integer value. */
+        -:  640:    bool specialise[SPEC_MAX_PARAMS];
+        4:  641:    memset(specialise, 0, sizeof(specialise));
+        4:  642:    bool any = false;
+        4:  643:    int n_to_check = nparams < (int)prof->n_profiled ? nparams : (int)prof->n_profiled;
+        8:  644:    for (int i = 0; i < n_to_check; ++i) {
+       4*:  645:        if (!pinfo[i].valid) continue;
+       4*:  646:        if (!is_integer_type(pinfo[i].type)) continue;
+       4*:  647:        if (!cjit_arg_slot_confident(&prof->slots[i])) continue;
+        4:  648:        specialise[i] = true;
+        4:  649:        any = true;
+        -:  650:    }
+       4*:  651:    if (!any) return 0;
+        -:  652:
+        -:  653:    /* Build the internal symbol name: _cjit_i_<func_name> (max CJIT_NAME_MAX). */
+        -:  654:    char internal_name[CJIT_NAME_MAX + 10];
+        4:  655:    snprintf(internal_name, sizeof(internal_name), "_cjit_i_%s", func_name);
+        -:  656:
+        -:  657:    /*
+        -:  658:     * Build a preprocessor directive to inject BETWEEN the wrapper and the
+        -:  659:     * user's source.  This renames `func_name` to `internal_name` only for
+        -:  660:     * the text that follows (i.e. the user's implementation), leaving the
+        -:  661:     * wrapper above the directive completely unaffected.
+        -:  662:     *
+        -:  663:     * Using an inline `#define` rather than a `-D` command-line flag avoids
+        -:  664:     * the problem where the `-D` would rename occurrences of `func_name`
+        -:  665:     * inside the wrapper itself (causing a redefinition error).
+        -:  666:     */
+        4:  667:    snprintf(spec_define_buf, define_sz,
+        -:  668:             "#define %s %s\n", func_name, internal_name);
+        -:  669:
+        -:  670:    /*
+        -:  671:     * Build the parameter string for the forward declaration and call site
+        -:  672:     * using offset-tracked snprintf() writes — O(n), no repeated strlen().
+        -:  673:     */
+        -:  674:    char   forward_params[512];
+        -:  675:    char   call_args_generic[512];
+        -:  676:    char   call_args_const[512];
+        -:  677:    char   cond_expr[256];
+        4:  678:    size_t fp  = 0;  /* offset into forward_params   */
+        4:  679:    size_t cag = 0;  /* offset into call_args_generic */
+        4:  680:    size_t cac = 0;  /* offset into call_args_const   */
+        4:  681:    size_t ce  = 0;  /* offset into cond_expr         */
+        -:  682:
+        -:  683:#define APPEND(buf, pos, ...) \
+        -:  684:    do { \
+        -:  685:        int _n = snprintf((buf) + (pos), sizeof(buf) - (pos), __VA_ARGS__); \
+        -:  686:        if (_n > 0) (pos) += (size_t)_n; \
+        -:  687:        if ((pos) >= sizeof(buf)) (pos) = sizeof(buf) - 1; \
+        -:  688:    } while (0)
+        -:  689:
+        4:  690:    bool first_cond = true;
+        8:  691:    for (int i = 0; i < nparams; ++i) {
+        4:  692:        if (i > 0) {
+    #####:  693:            APPEND(forward_params,    fp,  ", ");
+    #####:  694:            APPEND(call_args_generic, cag, ", ");
+    #####:  695:            APPEND(call_args_const,   cac, ", ");
+        -:  696:        }
+        -:  697:        /* Forward declaration: "type name" */
+       4*:  698:        APPEND(forward_params, fp, "%s %s", pinfo[i].type, pinfo[i].name);
+        -:  699:        /* Generic call: just the name */
+       4*:  700:        APPEND(call_args_generic, cag, "%s", pinfo[i].name);
+        -:  701:        /* Specialised call: constant literal for hot slots, name otherwise */
+        4:  702:        if (specialise[i]) {
+       4*:  703:            APPEND(call_args_const, cac, "(%s)%lld",
+        -:  704:                   pinfo[i].type,
+        -:  705:                   (long long)(int64_t)prof->slots[i].dominant_val);
+       4*:  706:            APPEND(cond_expr, ce, "%s%s == (%s)%lld",
+        -:  707:                   first_cond ? "" : " && ",
+        -:  708:                   pinfo[i].name,
+        -:  709:                   pinfo[i].type,
+        -:  710:                   (long long)(int64_t)prof->slots[i].dominant_val);
+        4:  711:            first_cond = false;
+        -:  712:        } else {
+    #####:  713:            APPEND(call_args_const, cac, "%s", pinfo[i].name);
+        -:  714:        }
+        -:  715:    }
+        -:  716:#undef APPEND
+        -:  717:
+        -:  718:    /* bool is_void_return */
+       4*:  719:    bool is_void = (strncmp(ret_type, "void", 4) == 0 &&
+    #####:  720:                    (ret_type[4] == '\0' || ret_type[4] == ' '));
+        -:  721:
+        -:  722:    /* Emit the wrapper. */
+        -:  723:    int written;
+        4:  724:    if (is_void) {
+    #####:  725:        written = snprintf(out_buf, out_sz,
+        -:  726:            "/* [JIT arg-specialisation wrapper: %s] */\n"
+        -:  727:            "%s %s(%s);\n"  /* forward decl of internal name using parsed params */
+        -:  728:            "%s %s(%s) {\n"
+        -:  729:            "    if (__builtin_expect(%s, 1)) { %s(%s); return; }\n"
+        -:  730:            "    %s(%s);\n"
+        -:  731:            "}\n",
+        -:  732:            func_name,
+        -:  733:            ret_type, internal_name, forward_params,
+        -:  734:            ret_type, func_name,     params_str,
+        -:  735:            cond_expr, internal_name, call_args_const,
+        -:  736:            internal_name, call_args_generic);
+        -:  737:    } else {
+        4:  738:        written = snprintf(out_buf, out_sz,
+        -:  739:            "/* [JIT arg-specialisation wrapper: %s] */\n"
+        -:  740:            "%s %s(%s);\n"  /* forward decl of internal name using parsed params */
+        -:  741:            "%s %s(%s) {\n"
+        -:  742:            "    if (__builtin_expect(%s, 1)) return %s(%s);\n"
+        -:  743:            "    return %s(%s);\n"
+        -:  744:            "}\n",
+        -:  745:            func_name,
+        -:  746:            ret_type, internal_name, forward_params,
+        -:  747:            ret_type, func_name,     params_str,
+        -:  748:            cond_expr, internal_name, call_args_const,
+        -:  749:            internal_name, call_args_generic);
+        -:  750:    }
+       4*:  751:    return (written > 0 && (size_t)written < out_sz) ? (size_t)written : 0;
+        -:  752:}
+        -:  753:
+        -:  754:/* ─────────────────────────── unique temp-file naming ───────────────────────── */
+        -:  755:
+        -:  756:static atomic_uint_fast64_t codegen_serial = 0;
+        -:  757:
+        -:  758:/**
+        -:  759: * Generate a unique prefix for source temp files (src, err) of the form:
+        -:  760: *   /tmp/cjit_<pid>_<tid>_<serial>
+        -:  761: *
+        -:  762: * Using both pid and tid ensures uniqueness across processes AND threads.
+        -:  763: */
+      211:  764:static void make_temp_prefix(char *buf, size_t sz)
+        -:  765:{
+      211:  766:    uint64_t serial = atomic_fetch_add_explicit(&codegen_serial, 1,
+        -:  767:                                                memory_order_relaxed);
+      211:  768:    snprintf(buf, sz, "/tmp/cjit_%d_%"PRIxPTR"_%llu",
+      211:  769:             (int)getpid(),
+      211:  770:             (uintptr_t)pthread_self(),
+        -:  771:             (unsigned long long)serial);
+      211:  772:}
+        -:  773:
+        -:  774:/**
+        -:  775: * Generate a unique path for the compiled .so output file.
+        -:  776: *
+        -:  777: * Uses /dev/shm when available on Linux (RAM-backed tmpfs, zero disk I/O).
+        -:  778: * Falls back to /tmp on any other platform or when /dev/shm is unavailable.
+        -:  779: *
+        -:  780: * The serial counter is shared with make_temp_prefix() so each compilation
+        -:  781: * invocation produces a consistent pair of uniquely numbered temp paths.
+        -:  782: */
+      211:  783:static void make_so_path(char *buf, size_t sz)
+        -:  784:{
+      211:  785:    uint64_t serial = atomic_fetch_add_explicit(&codegen_serial, 1,
+        -:  786:                                                memory_order_relaxed);
+      211:  787:    snprintf(buf, sz, "%s/cjit_%d_%"PRIxPTR"_%llu.so",
+        -:  788:             cg_so_tmpdir(),
+      211:  789:             (int)getpid(),
+      211:  790:             (uintptr_t)pthread_self(),
+        -:  791:             (unsigned long long)serial);
+      211:  792:}
+        -:  793:
+        -:  794:/* ─────────────────────────── level-to-string helper ───────────────────────── */
+        -:  795:
+       16:  796:static const char *level_to_str(opt_level_t level)
+        -:  797:{
+       16:  798:    switch (level) {
+    #####:  799:    case OPT_NONE: return "O0";
+       16:  800:    case OPT_O1:   return "O1";
+    #####:  801:    case OPT_O2:   return "O2";
+    #####:  802:    case OPT_O3:   return "O3";
+    #####:  803:    default:       return "O2";
+        -:  804:    }
+        -:  805:}
+        -:  806:
+        -:  807:/* ─────────────────────────── compiler watchdog ─────────────────────────────── */
+        -:  808:
+        -:  809:/**
+        -:  810: * Wait for compiler subprocess `pid` to exit, with an optional timeout.
+        -:  811: *
+        -:  812: * @param pid         Compiler process PID.
+        -:  813: * @param timeout_ms  Maximum milliseconds to wait (0 = block indefinitely).
+        -:  814: * @param timed_out   Output: set to true iff the process was killed on timeout.
+        -:  815: * @return            true iff the process exited with status 0.
+        -:  816: *
+        -:  817: * When timeout_ms > 0 the function polls with waitpid(WNOHANG) every 10 ms.
+        -:  818: * On expiry: SIGTERM is sent (50 ms grace), then SIGKILL.  The process is
+        -:  819: * always reaped before returning so no zombie is left behind.
+        -:  820: */
+      210:  821:static bool cg_wait_compiler(pid_t pid, uint32_t timeout_ms, bool *timed_out)
+        -:  822:{
+      210:  823:    *timed_out = false;
+        -:  824:
+      210:  825:    if (timeout_ms == 0) {
+        -:  826:        /* Blocking wait — original behaviour. */
+      206:  827:        int status = 0;
+      206:  828:        waitpid(pid, &status, 0);
+      206:  829:        return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        -:  830:    }
+        -:  831:
+        -:  832:    /* Polling interval: 10 ms. */
+        4:  833:    const struct timespec poll_interval = { 0, 10 * 1000000L };
+        -:  834:
+        -:  835:    /* Deadline: current monotonic time + timeout. */
+        -:  836:    struct timespec now;
+        4:  837:    clock_gettime(CLOCK_MONOTONIC, &now);
+        4:  838:    uint64_t deadline_ns = (uint64_t)now.tv_sec * UINT64_C(1000000000)
+        4:  839:                         + (uint64_t)now.tv_nsec
+        4:  840:                         + (uint64_t)timeout_ms * UINT64_C(1000000);
+        -:  841:
+      120:  842:    for (;;) {
+      124:  843:        int status = 0;
+      124:  844:        pid_t ret = waitpid(pid, &status, WNOHANG);
+        -:  845:
+      124:  846:        if (ret == pid) {
+        -:  847:            /* Process exited normally. */
+       4*:  848:            return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        -:  849:        }
+      124:  850:        if (ret < 0) {
+        -:  851:            /* waitpid error (e.g. ECHILD) — treat as failure. */
+    #####:  852:            return false;
+        -:  853:        }
+        -:  854:
+        -:  855:        /* ret == 0: process still running; check deadline. */
+      124:  856:        clock_gettime(CLOCK_MONOTONIC, &now);
+      124:  857:        uint64_t now_ns = (uint64_t)now.tv_sec * UINT64_C(1000000000)
+      124:  858:                        + (uint64_t)now.tv_nsec;
+      124:  859:        if (now_ns >= deadline_ns) {
+        -:  860:            /* Timed out: send SIGTERM, wait 50 ms, then SIGKILL, then reap. */
+        4:  861:            kill(pid, SIGTERM);
+        4:  862:            const struct timespec grace = { 0, 50 * 1000000L };
+        4:  863:            nanosleep(&grace, NULL);
+        -:  864:
+        -:  865:            /* Quick non-blocking check in case SIGTERM was enough. */
+        4:  866:            ret = waitpid(pid, &status, WNOHANG);
+        4:  867:            if (ret != pid) {
+    #####:  868:                kill(pid, SIGKILL);
+    #####:  869:                waitpid(pid, &status, 0);  /* block to reap zombie */
+        -:  870:            }
+        4:  871:            *timed_out = true;
+        4:  872:            return false;
+        -:  873:        }
+        -:  874:
+      120:  875:        nanosleep(&poll_interval, NULL);
+        -:  876:    }
+        -:  877:}
+        -:  878:
+        -:  879:/* ─────────────────────────── main compilation ──────────────────────────────── */
+        -:  880:
+      219:  881:bool codegen_compile(const char          *func_name,
+        -:  882:                     const char          *c_source,
+        -:  883:                     opt_level_t          level,
+        -:  884:                     const codegen_opts_t *opts,
+        -:  885:                     codegen_result_t     *result)
+        -:  886:{
+      219:  887:    result->fn        = NULL;
+      219:  888:    result->handle    = NULL;
+      219:  889:    result->success   = false;
+      219:  890:    result->timed_out = false;
+      219:  891:    result->errmsg[0] = '\0';
+        -:  892:
+        -:  893:    /* ── 1. Optionally generate an argument-specialisation wrapper ─────── */
+        -:  894:    /*
+        -:  895:     * The wrapper must be generated BEFORE the cache check so that the cache
+        -:  896:     * key includes the wrapper text.  Specialised and unspecialised
+        -:  897:     * compilations for the same IR at the same level produce different
+        -:  898:     * binaries; they must have different cache entries.
+        -:  899:     *
+        -:  900:     * If opts->arg_profile is set and parse_func_sig() finds a confident
+        -:  901:     * dominant value on any integer-typed parameter, we:
+        -:  902:     *   (a) prepend a specialised wrapper that fast-paths the common value;
+        -:  903:     *   (b) inject a `#define func_name _cjit_i_func_name` directive between
+        -:  904:     *       the wrapper and the user's source, so only the user's implementation
+        -:  905:     *       is renamed.  Using an inline #define (rather than a -D command-line
+        -:  906:     *       flag) ensures the wrapper text above the directive is unaffected —
+        -:  907:     *       a -D flag would rename func_name everywhere in the file, including
+        -:  908:     *       in the wrapper itself, causing a redefinition error.
+        -:  909:     *
+        -:  910:     * With -finline-functions (O2+) the compiler inlines the renamed helper
+        -:  911:     * into the hot path, constant-folds through the dominant argument, and
+        -:  912:     * eliminates dead branches.
+        -:  913:     *
+        -:  914:     * On parse failure or when no confident slot is found, wrapper_src stays
+        -:  915:     * NULL and we fall through to the ordinary (unspecialised) path.
+        -:  916:     */
+      219:  917:    char *wrapper_src    = NULL;   /* heap-allocated on success */
+        -:  918:    /* spec_define holds the `#define name internal\n` text to inject. */
+        -:  919:    char  spec_define[CJIT_NAME_MAX * 2 + 16];
+      219:  920:    spec_define[0] = '\0';
+        -:  921:
+      219:  922:    if (opts->arg_profile && opts->arg_profile->n_profiled > 0 &&
+        -:  923:        level >= OPT_O2) {
+        -:  924:        char ret_type[128], params_str[512];
+        4:  925:        if (parse_func_sig(c_source, func_name,
+        -:  926:                           ret_type, sizeof(ret_type),
+        -:  927:                           params_str, sizeof(params_str))) {
+        -:  928:            /* Allocate a generous buffer; typical wrapper is < 512 bytes. */
+        4:  929:            size_t wsz = strlen(c_source) + 1024;
+        4:  930:            char  *wbuf = malloc(wsz);
+        4:  931:            if (wbuf) {
+        4:  932:                size_t wlen = generate_spec_wrapper(
+        -:  933:                    func_name, ret_type, params_str,
+        4:  934:                    opts->arg_profile, wbuf, wsz,
+        -:  935:                    spec_define, sizeof(spec_define));
+        4:  936:                if (wlen > 0) {
+        4:  937:                    wrapper_src = wbuf;
+        4:  938:                    if (opts->verbose)
+    #####:  939:                        fprintf(stderr,
+        -:  940:                                "[cjit/codegen] specialising '%s': %s\n",
+        -:  941:                                func_name, spec_define);
+        -:  942:                } else {
+    #####:  943:                    free(wbuf);
+        -:  944:                }
+        -:  945:            }
+        -:  946:        }
+        -:  947:    }
+        -:  948:
+        -:  949:    /* ── 2. Compiled-artifact cache lookup ────────────────────────────── */
+        -:  950:    /*
+        -:  951:     * Check whether this exact compilation (same IR, same preamble, same
+        -:  952:     * flags, same level) has been compiled before.  On a hit we dlopen the
+        -:  953:     * cached .so directly, skipping the compiler spawn entirely.
+        -:  954:     *
+        -:  955:     * The cache key is computed from all inputs that affect the compiled
+        -:  956:     * binary: preamble, specialisation wrapper + define, user IR, opt level,
+        -:  957:     * extra compiler flags, and compiler binary name.  Two compilations that
+        -:  958:     * differ in any of these fields produce different keys and never collide.
+        -:  959:     */
+        -:  960:    char     cache_path[512];
+      219:  961:    uint64_t cache_key = 0;
+      219:  962:    bool     have_cache = (opts && opts->cache != NULL);
+        -:  963:
+      219:  964:    if (have_cache) {
+    #####:  965:        const char *cc = (opts->cc_binary && opts->cc_binary[0])
+      16*:  966:                             ? opts->cc_binary : "cc";
+      32*:  967:        cache_key = codegen_cache_key(
+        -:  968:            CODEGEN_PREAMBLE,
+        -:  969:            wrapper_src,
+       16:  970:            spec_define[0] ? spec_define : NULL,
+        -:  971:            c_source,
+        -:  972:            level_to_str(level),
+      16*:  973:            (opts->extra_cflags && opts->extra_cflags[0]) ? opts->extra_cflags : NULL,
+        -:  974:            cc);
+        -:  975:
+       16:  976:        if (codegen_cache_lookup(opts->cache, cache_key,
+        -:  977:                                  cache_path, sizeof(cache_path))) {
+        -:  978:            /*
+        -:  979:             * Cache hit: try to dlopen directly from the cached path.
+        -:  980:             *
+        -:  981:             * If dlopen fails (stale entry, wrong architecture, file removed
+        -:  982:             * between access() and dlopen()), fall through to normal
+        -:  983:             * compilation.  The stale file will be overwritten by the next
+        -:  984:             * successful store of the same key.
+        -:  985:             */
+        8:  986:            dlerror();
+        8:  987:            void *handle = dlopen(cache_path, RTLD_NOW | RTLD_LOCAL);
+        8:  988:            if (handle) {
+        8:  989:                dlerror();
+        8:  990:                void *sym = dlsym(handle, func_name);
+        8:  991:                const char *err = dlerror();
+        8:  992:                if (!err && sym) {
+        8:  993:                    free(wrapper_src);
+        8:  994:                    result->fn        = (jit_func_t)(uintptr_t)sym;
+        8:  995:                    result->handle    = handle;
+        8:  996:                    result->success   = true;
+        8:  997:                    result->cache_hit = true;
+        8:  998:                    if (opts->verbose)
+    #####:  999:                        fprintf(stderr,
+        -: 1000:                                "[cjit/codegen] cache hit '%s' O%d → %p\n",
+        -: 1001:                                func_name, (int)level,
+    #####: 1002:                                (void *)(uintptr_t)result->fn);
+        8: 1003:                    return true;
+        -: 1004:                }
+        -: 1005:                /* Symbol not found in cached .so (unlikely). */
+    #####: 1006:                dlclose(handle);
+        -: 1007:            }
+        -: 1008:            /* dlopen failed: log and fall through to recompile. */
+    #####: 1009:            if (opts->verbose)
+    #####: 1010:                fprintf(stderr,
+        -: 1011:                        "[cjit/codegen] cache hit stale for '%s' O%d, recompiling\n",
+        -: 1012:                        func_name, (int)level);
+        -: 1013:        }
+        -: 1014:    }
+        -: 1015:
+        -: 1016:    /* ── 3. Choose temp-file paths ─────────────────────────────────────── */
+        -: 1017:    char prefix[256];
+      211: 1018:    make_temp_prefix(prefix, sizeof(prefix));
+        -: 1019:
+        -: 1020:    char so_path[300];
+      211: 1021:    make_so_path(so_path, sizeof(so_path));
+        -: 1022:
+        -: 1023:    /* ── 4. Write preamble [+ wrapper] + user source ─────────────────── */
+        -: 1024:    /*
+        -: 1025:     * On Linux, write the source into an anonymous in-memory file created
+        -: 1026:     * with memfd_create(2).  The file is exposed to the compiler via its
+        -: 1027:     * /proc/self/fd/<fd> symlink, eliminating all filesystem writes for the
+        -: 1028:     * source step (no inode creation, no unlink, no tmpfs I/O).
+        -: 1029:     *
+        -: 1030:     * memfd_create is a raw syscall (no glibc dependency) that has been
+        -: 1031:     * present since Linux 3.17 (2014).  On failure (very old kernel or
+        -: 1032:     * seccomp restriction) we fall back to the traditional /tmp tmpfile.
+        -: 1033:     *
+        -: 1034:     * On non-Linux systems the traditional tmpfile path is used directly.
+        -: 1035:     */
+        -: 1036:    char src_path[300];
+      211: 1037:    bool src_is_memfd = false;
+      211: 1038:    int  src_fd = -1;
+        -: 1039:
+        -: 1040:#ifdef __linux__
+      211: 1041:    src_fd = cg_memfd_create("cjit_src");
+      211: 1042:    if (src_fd >= 0) {
+        -: 1043:        /*
+        -: 1044:         * Use /proc/<parent_pid>/fd/<fd> rather than /proc/self/fd/<fd>.
+        -: 1045:         *
+        -: 1046:         * /proc/self resolves in the CALLING process's context.  When the
+        -: 1047:         * compiler subprocess opens the path, "self" refers to the compiler
+        -: 1048:         * process, which has no fd <src_fd>.  Using the parent's PID
+        -: 1049:         * (/proc/<ppid>/fd/<fd>) makes the path valid from any process that
+        -: 1050:         * has permission to inspect the parent — which the compiler child
+        -: 1051:         * always does (same UID, no seccomp restriction on /proc reads).
+        -: 1052:         */
+      211: 1053:        snprintf(src_path, sizeof(src_path), "/proc/%d/fd/%d",
+      211: 1054:                 (int)getpid(), src_fd);
+      211: 1055:        src_is_memfd = true;
+      211: 1056:        size_t plen = strlen(CODEGEN_PREAMBLE);
+      211: 1057:        size_t slen = strlen(c_source);
+      211: 1058:        bool write_ok =
+      211: 1059:            ((size_t)write(src_fd, CODEGEN_PREAMBLE, plen) == plen);
+      211: 1060:        if (write_ok && wrapper_src) {
+        4: 1061:            size_t wlen = strlen(wrapper_src);
+        4: 1062:            write_ok = ((size_t)write(src_fd, wrapper_src, wlen) == wlen);
+        -: 1063:        }
+        -: 1064:        /* Inject the `#define func_name _cjit_i_func_name` between wrapper
+        -: 1065:         * and user source so only the implementation is renamed. */
+      211: 1066:        if (write_ok && spec_define[0] != '\0') {
+        4: 1067:            size_t dlen = strlen(spec_define);
+        4: 1068:            write_ok = ((size_t)write(src_fd, spec_define, dlen) == dlen);
+        -: 1069:        }
+      211: 1070:        if (write_ok)
+     422*: 1071:            write_ok = ((size_t)write(src_fd, c_source, slen) == slen &&
+      211: 1072:                        write(src_fd, "\n", 1) == 1);
+      211: 1073:        if (!write_ok) {
+    #####: 1074:            snprintf(result->errmsg, sizeof(result->errmsg),
+        -: 1075:                     "codegen: write to in-memory source file failed");
+    #####: 1076:            close(src_fd);
+    #####: 1077:            free(wrapper_src);
+    #####: 1078:            return false;
+        -: 1079:        }
+        -: 1080:    }
+        -: 1081:#endif /* __linux__ */
+        -: 1082:
+      211: 1083:    if (!src_is_memfd) {
+        -: 1084:        /* Traditional /tmp tmpfile fallback. */
+    #####: 1085:        snprintf(src_path, sizeof(src_path), "%s.c", prefix);
+    #####: 1086:        FILE *f = fopen(src_path, "w");
+    #####: 1087:        if (!f) {
+    #####: 1088:            snprintf(result->errmsg, sizeof(result->errmsg),
+        -: 1089:                     "codegen: cannot create source file %s", src_path);
+    #####: 1090:            free(wrapper_src);
+    #####: 1091:            return false;
+        -: 1092:        }
+    #####: 1093:        fputs(CODEGEN_PREAMBLE, f);
+    #####: 1094:        if (wrapper_src) fputs(wrapper_src, f);
+        -: 1095:        /* Inject the `#define func_name _cjit_i_func_name` between wrapper
+        -: 1096:         * and user source so only the implementation is renamed. */
+    #####: 1097:        if (spec_define[0] != '\0') fputs(spec_define, f);
+    #####: 1098:        fputs(c_source, f);
+    #####: 1099:        fputc('\n', f);
+    #####: 1100:        fclose(f);
+        -: 1101:    }
+        -: 1102:
+        -: 1103:    /* ── 5. Build compiler argv ──────────────────────────────────────── */
+        -: 1104:    const char *cc_argv[MAX_CC_ARGS];
+        -: 1105:    char err_path[304];
+      211: 1106:    snprintf(err_path, sizeof(err_path), "%s.err", prefix);
+      211: 1107:    int n_argv = build_compiler_argv(cc_argv, so_path, src_path, level, opts);
+        -: 1108:
+        -: 1109:    /* Append extra_cflags tokens (e.g. -I/path, -DFOO, -lm).
+        -: 1110:     * strtok_r is used (not strtok) because codegen_compile() may be invoked
+        -: 1111:     * concurrently from multiple compiler threads; strtok's internal static
+        -: 1112:     * state is not thread-safe.
+        -: 1113:     * Tokens point into extra_flags_buf (stack) and are valid until after
+        -: 1114:     * waitpid completes. */
+        -: 1115:    char extra_flags_buf[CJIT_MAX_EXTRA_CFLAGS];
+      211: 1116:    extra_flags_buf[0] = '\0';
+      211: 1117:    if (opts && opts->extra_cflags && opts->extra_cflags[0]) {
+        4: 1118:        strncpy(extra_flags_buf, opts->extra_cflags, sizeof(extra_flags_buf) - 1);
+        4: 1119:        extra_flags_buf[sizeof(extra_flags_buf) - 1] = '\0';
+        4: 1120:        char *saveptr = NULL;
+        4: 1121:        char *tok = strtok_r(extra_flags_buf, " \t", &saveptr);
+        8: 1122:        while (tok && n_argv < MAX_CC_ARGS - 1) {
+        4: 1123:            cc_argv[n_argv++] = tok;
+        4: 1124:            tok = strtok_r(NULL, " \t", &saveptr);
+        -: 1125:        }
+        -: 1126:    }
+      211: 1127:    cc_argv[n_argv] = NULL;  /* always ensure NULL-terminator for posix_spawnp */
+        -: 1128:
+        -: 1129:    /* Determine which compiler binary to invoke. */
+      211: 1130:    const char *cc_bin = (opts && opts->cc_binary && opts->cc_binary[0])
+      422: 1131:                             ? opts->cc_binary : "cc";
+        -: 1132:
+      211: 1133:    if (opts && opts->verbose) {
+        1: 1134:        fprintf(stderr, "[cjit/codegen] compile:");
+       19: 1135:        for (int _i = 0; cc_argv[_i]; ++_i)
+       18: 1136:            fprintf(stderr, " %s", cc_argv[_i]);
+        1: 1137:        fprintf(stderr, " 2>%s\n", err_path);
+        -: 1138:    }
+        -: 1139:
+        -: 1140:    /* ── 6. Spawn the compiler (no shell intermediate) ────────────────── */
+        -: 1141:    /*
+        -: 1142:     * posix_spawnp avoids the /bin/sh intermediate step that system() requires
+        -: 1143:     * (fork → exec /bin/sh → exec cc → waitpid becomes fork → exec cc → waitpid).
+        -: 1144:     * stderr is redirected to err_path via posix_spawn_file_actions; stdout
+        -: 1145:     * is inherited from the engine process (same behaviour as system(cmd)).
+        -: 1146:     *
+        -: 1147:     * extern char **environ is declared in <unistd.h> when _GNU_SOURCE is set.
+        -: 1148:     */
+        -: 1149:    posix_spawn_file_actions_t fa;
+      211: 1150:    posix_spawn_file_actions_init(&fa);
+      211: 1151:    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, err_path,
+        -: 1152:                                     O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        -: 1153:
+        -: 1154:    pid_t cc_pid;
+      211: 1155:    int spawn_err = posix_spawnp(&cc_pid, cc_bin, &fa, NULL,
+        -: 1156:                                  (char *const *)cc_argv, environ);
+      210: 1157:    posix_spawn_file_actions_destroy(&fa);
+        -: 1158:
+        -: 1159:    int rc;
+      210: 1160:    if (spawn_err != 0) {
+    #####: 1161:        snprintf(result->errmsg, sizeof(result->errmsg),
+        -: 1162:                 "codegen: posix_spawnp(%s) failed: %s", cc_bin,
+        -: 1163:                 strerror(spawn_err));
+    #####: 1164:        if (src_is_memfd) close(src_fd); else unlink(src_path);
+    #####: 1165:        free(wrapper_src);
+    #####: 1166:        return false;
+        -: 1167:    }
+        -: 1168:    {
+      210: 1169:        bool timed_out = false;
+     210*: 1170:        uint32_t tmo = opts ? opts->compile_timeout_ms : 0;
+      210: 1171:        bool cc_ok = cg_wait_compiler(cc_pid, tmo, &timed_out);
+      210: 1172:        if (timed_out) {
+        4: 1173:            result->timed_out = true;
+        4: 1174:            snprintf(result->errmsg, sizeof(result->errmsg),
+        -: 1175:                     "codegen: compiler subprocess timed out after %u ms", tmo);
+       4*: 1176:            if (src_is_memfd) close(src_fd); else unlink(src_path);
+        4: 1177:            unlink(so_path);
+        4: 1178:            unlink(err_path);
+        4: 1179:            free(wrapper_src);
+        4: 1180:            return false;
+        -: 1181:        }
+      206: 1182:        rc = cc_ok ? 0 : 1;
+        -: 1183:    }
+        -: 1184:
+        -: 1185:    /* Source file is no longer needed. */
+     206*: 1186:    if (src_is_memfd) close(src_fd); else unlink(src_path);
+      206: 1187:    free(wrapper_src);
+      206: 1188:    wrapper_src = NULL;
+        -: 1189:
+      206: 1190:    if (rc != 0) {
+        -: 1191:        /*
+        -: 1192:         * Print the full compiler error output to stderr immediately so the
+        -: 1193:         * user sees the complete diagnostics.  Additionally store up to
+        -: 1194:         * sizeof(errmsg)-1 bytes in result->errmsg for the caller's log line.
+        -: 1195:         */
+        1: 1196:        FILE *ef = fopen(err_path, "r");
+        1: 1197:        if (ef) {
+        -: 1198:            /* Stream full output to stderr first. */
+        -: 1199:            char line[256];
+        6: 1200:            while (fgets(line, sizeof(line), ef))
+        5: 1201:                fputs(line, stderr);
+        -: 1202:            /* Rewind and store first chunk in errmsg for structured logging. */
+        1: 1203:            rewind(ef);
+        1: 1204:            size_t nr = fread(result->errmsg,
+        -: 1205:                              1, sizeof(result->errmsg) - 1, ef);
+        1: 1206:            result->errmsg[nr] = '\0';
+        1: 1207:            fclose(ef);
+        -: 1208:        } else {
+    #####: 1209:            snprintf(result->errmsg, sizeof(result->errmsg),
+        -: 1210:                     "codegen: %s exited with error %d", cc_bin, rc);
+        -: 1211:        }
+        1: 1212:        unlink(err_path);
+        1: 1213:        unlink(so_path);
+        1: 1214:        return false;
+        -: 1215:    }
+        -: 1216:
+      205: 1217:    unlink(err_path);  /* remove even on success (may not exist if cc was quiet) */
+        -: 1218:
+        -: 1219:    /* ── 7. dlopen the shared object ─────────────────────────────────── */
+      205: 1220:    void *handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+      205: 1221:    if (!handle) {
+    #####: 1222:        snprintf(result->errmsg, sizeof(result->errmsg),
+        -: 1223:                 "codegen: dlopen('%s'): %s", so_path, dlerror());
+    #####: 1224:        unlink(so_path);
+    #####: 1225:        return false;
+        -: 1226:    }
+        -: 1227:
+        -: 1228:    /*
+        -: 1229:     * Persist the compiled artifact to the cache (if enabled) BEFORE
+        -: 1230:     * unlinking so_path.
+        -: 1231:     *
+        -: 1232:     * codegen_cache_store() performs an atomic rename() of so_path into the
+        -: 1233:     * cache directory.  After the rename:
+        -: 1234:     *   • so_path no longer exists on the filesystem.
+        -: 1235:     *   • The cached entry at cache_path points to the same inode.
+        -: 1236:     *   • The dlopen handle (acquired above) is inode-based and remains valid
+        -: 1237:     *     regardless of the file's directory entry — the kernel keeps the
+        -: 1238:     *     mapping alive as long as any handle is open.
+        -: 1239:     *   • Future dlopen(cache_path) calls will use the persisted file.
+        -: 1240:     *
+        -: 1241:     * On failure (cross-device copy fails, or any other error), fall back to
+        -: 1242:     * the normal unlink so the inode is reclaimed on close.
+        -: 1243:     */
+      205: 1244:    bool so_disposed = false;
+      205: 1245:    if (have_cache) {
+        8: 1246:        if (codegen_cache_store(opts->cache, cache_key, so_path))
+        8: 1247:            so_disposed = true;  /* store consumed so_path (rename or copy+unlink) */
+        -: 1248:    }
+      205: 1249:    if (!so_disposed) {
+        -: 1250:        /*
+        -: 1251:         * Either caching is disabled, or the store failed.  Unlink the temp
+        -: 1252:         * file: the kernel keeps the inode alive through the dlopen handle,
+        -: 1253:         * and reclaims it automatically when the handle is closed (process
+        -: 1254:         * crash included).
+        -: 1255:         */
+      197: 1256:        unlink(so_path);
+        -: 1257:    }
+        -: 1258:
+        -: 1259:    /* ── 8. dlsym to find the function ───────────────────────────────── */
+      205: 1260:    dlerror(); /* clear any old error */
+      205: 1261:    void *sym = dlsym(handle, func_name);
+      205: 1262:    const char *err = dlerror();
+      205: 1263:    if (err) {
+    #####: 1264:        snprintf(result->errmsg, sizeof(result->errmsg),
+        -: 1265:                 "codegen: dlsym('%s'): %s", func_name, err);
+    #####: 1266:        dlclose(handle);
+    #####: 1267:        return false;
+        -: 1268:    }
+        -: 1269:
+        -: 1270:    /* ── 9. Success ──────────────────────────────────────────────────── */
+        -: 1271:    /*
+        -: 1272:     * C99 / POSIX: converting between function and data pointers via void*
+        -: 1273:     * is implementation-defined, but dlsym() returning a function pointer
+        -: 1274:     * through void* is standard POSIX and works on all Linux/macOS targets.
+        -: 1275:     */
+      205: 1276:    result->fn      = (jit_func_t)(uintptr_t)sym;
+      205: 1277:    result->handle  = handle;
+      205: 1278:    result->success = true;
+        -: 1279:
+      205: 1280:    if (opts->verbose) {
+        1: 1281:        fprintf(stderr, "[cjit/codegen] compiled '%s' at O%d → %p\n",
+        1: 1282:                func_name, (int)level, (void *)(uintptr_t)result->fn);
+        -: 1283:    }
+        -: 1284:
+      205: 1285:    return true;
+        -: 1286:}

@@ -1,0 +1,855 @@
+        -:    0:Source:/home/runner/work/cjit/cjit/src/ir_cache.c
+        -:    0:Graph:build_cov/CMakeFiles/cjit_lib.dir/src/ir_cache.c.gcno
+        -:    0:Data:build_cov/CMakeFiles/cjit_lib.dir/src/ir_cache.c.gcda
+        -:    0:Runs:5
+        -:    1:/**
+        -:    2: * ir_cache.c – Multi-generation LRU IR cache with memory-pressure awareness.
+        -:    3: *
+        -:    4: * See ir_cache.h for the full design description.
+        -:    5: *
+        -:    6: * Key implementation notes
+        -:    7: * ────────────────────────
+        -:    8: * • All LRU list mutations (list_remove, list_push_front, list_pop_back) are
+        -:    9: *   performed under cache->lock.  Disk I/O and malloc/free happen outside
+        -:   10: *   the lock.
+        -:   11: *
+        -:   12: * • The pressure-monitor thread atomically updates cache->pressure and the
+        -:   13: *   mem_available_kb / mem_total_kb snapshots.  It calls
+        -:   14: *   irc_trim_to_pressure() when pressure rises, which re-acquires the lock
+        -:   15: *   to evict entries.
+        -:   16: *
+        -:   17: * • make_room_in_hot() and make_room_in_warm() consult the current atomic
+        -:   18: *   pressure level to compute the effective capacity, so new insertions
+        -:   19: *   automatically respect tightened limits even between pressure-thread wakes.
+        -:   20: *
+        -:   21: * • The COLD→WARM promotion in ir_cache_get_ir() drops the lock during disk
+        -:   22: *   I/O to avoid blocking other threads.  It re-checks the generation after
+        -:   23: *   re-acquiring the lock to handle the (rare) race where two threads load
+        -:   24: *   the same COLD entry simultaneously.
+        -:   25: */
+        -:   26:
+        -:   27:#ifndef _GNU_SOURCE
+        -:   28:#define _GNU_SOURCE
+        -:   29:#endif
+        -:   30:
+        -:   31:#include "ir_cache.h"
+        -:   32:
+        -:   33:#include <stdlib.h>
+        -:   34:#include <string.h>
+        -:   35:#include <stdio.h>
+        -:   36:#include <time.h>
+        -:   37:#include <sys/stat.h>
+        -:   38:#include <unistd.h>
+        -:   39:#include <errno.h>
+        -:   40:
+        -:   41:/* IR generation tags (mirrored as macros for readability) */
+        -:   42:#define IR_GEN_HOT  ((uint8_t)0)
+        -:   43:#define IR_GEN_WARM ((uint8_t)1)
+        -:   44:#define IR_GEN_COLD ((uint8_t)2)
+        -:   45:
+        -:   46:/* ═══════════════════════════ small helpers ════════════════════════════════ */
+        -:   47:
+      461:   48:static uint64_t irc_now_ms(void)
+        -:   49:{
+        -:   50:    struct timespec ts;
+      461:   51:    clock_gettime(CLOCK_MONOTONIC, &ts);
+      461:   52:    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+        -:   53:}
+        -:   54:
+        -:   55:/** Replace any character that is not alphanumeric / '_' with '_'. */
+      226:   56:static void sanitise_name(char *dst, const char *src, size_t dstsz)
+        -:   57:{
+        -:   58:    size_t i;
+     1649:   59:    for (i = 0; i + 1 < dstsz && src[i]; ++i) {
+     1423:   60:        char c = src[i];
+    1609*:   61:        dst[i] = ((c >= 'a' && c <= 'z') ||
+      186:   62:                  (c >= 'A' && c <= 'Z') ||
+      186:   63:                  (c >= '0' && c <= '9') ||
+        -:   64:                   c == '_') ? c : '_';
+        -:   65:    }
+      226:   66:    dst[i] = '\0';
+      226:   67:}
+        -:   68:
+        -:   69:/**
+        -:   70: * Reconstruct the on-disk IR path for a node into out[sz].
+        -:   71: *
+        -:   72: * The path is not stored in ir_node_t (saving 512 bytes per node).
+        -:   73: * Instead it is computed on demand from the two stable, write-once fields:
+        -:   74: * node->func_id and node->name.  This function is only called during disk
+        -:   75: * I/O (registration write, COLD promotion read), so the snprintf overhead
+        -:   76: * is negligible.
+        -:   77: *
+        -:   78: * Format: "<cache->ir_dir>/<func_id>_<name>.ir"
+        -:   79: */
+      231:   80:static void node_disk_path(const ir_lru_cache_t *cache, const ir_node_t *node,
+        -:   81:                            char *out, size_t sz)
+        -:   82:{
+      231:   83:    snprintf(out, sz, "%s/%u_%s.ir", cache->ir_dir, node->func_id, node->name);
+      231:   84:}
+        -:   85:
+        -:   86:/*
+        -:   87: * Maximum length of a reconstructed on-disk IR path.
+        -:   88: *
+        -:   89: * Components:
+        -:   90: *   sizeof(ir_dir)  — base directory (up to 256 chars including NUL)
+        -:   91: *   + 1             — path separator '/'
+        -:   92: *   + 10            — decimal representation of func_id (uint32_t max = 10 digits)
+        -:   93: *   + 1             — '_' separator between func_id and name
+        -:   94: *   + CJIT_NAME_MAX — sanitised function name (NUL included)
+        -:   95: *   + 3             — ".ir" extension (no NUL; already covered by CJIT_NAME_MAX)
+        -:   96: *
+        -:   97: * Total = 256 + 1 + 10 + 1 + CJIT_NAME_MAX + 3 = 271 + CJIT_NAME_MAX.
+        -:   98: * A value of 400 is used to provide a comfortable margin and round up to a
+        -:   99: * convenient size.
+        -:  100: */
+        -:  101:#define IRC_PATH_MAX 400u
+        -:  102:
+        -:  103:/* ═══════════════════════════ /proc/meminfo reader ═════════════════════════ */
+        -:  104:
+        -:  105:/**
+        -:  106: * Read MemTotal and MemAvailable from /proc/meminfo.
+        -:  107: *
+        -:  108: * Returns true if both fields were parsed successfully.
+        -:  109: * Falls back gracefully when /proc/meminfo is absent (non-Linux platforms).
+        -:  110: */
+      236:  111:static bool irc_read_meminfo(uint64_t *total_kb, uint64_t *avail_kb)
+        -:  112:{
+      236:  113:    *total_kb = *avail_kb = 0;
+      236:  114:    FILE *f = fopen("/proc/meminfo", "r");
+     236*:  115:    if (!f) return false;
+        -:  116:
+        -:  117:    char line[128];
+      236:  118:    int  found = 0;
+      944:  119:    while (found < 2 && fgets(line, sizeof(line), f)) {
+        -:  120:        unsigned long long v;
+      708:  121:        if (sscanf(line, "MemTotal: %llu kB",     &v) == 1) { *total_kb = v; ++found; }
+      472:  122:        else if (sscanf(line, "MemAvailable: %llu kB", &v) == 1) { *avail_kb = v; ++found; }
+        -:  123:    }
+      236:  124:    fclose(f);
+     236*:  125:    return *total_kb > 0 && *avail_kb > 0;
+        -:  126:}
+        -:  127:
+        -:  128:/* ═══════════════════════════ pressure helpers ═════════════════════════════ */
+        -:  129:
+        -:  130:/**
+        -:  131: * Compute pressure level from a memory snapshot.
+        -:  132: * Returns MEM_PRESSURE_NORMAL if total_kb is 0 (i.e. /proc/meminfo unavailable).
+        -:  133: */
+      236:  134:static mem_pressure_t irc_calc_pressure(uint64_t avail_kb, uint64_t total_kb,
+        -:  135:                                         uint32_t low_pct,
+        -:  136:                                         uint32_t high_pct,
+        -:  137:                                         uint32_t critical_pct)
+        -:  138:{
+     236*:  139:    if (total_kb == 0) return MEM_PRESSURE_NORMAL;
+      236:  140:    uint32_t avail_pct = (uint32_t)((avail_kb * 100ULL) / total_kb);
+     236*:  141:    if (avail_pct < critical_pct) return MEM_PRESSURE_CRITICAL;
+     236*:  142:    if (avail_pct < high_pct)     return MEM_PRESSURE_HIGH;
+     236*:  143:    if (avail_pct < low_pct)      return MEM_PRESSURE_MEDIUM;
+      236:  144:    return MEM_PRESSURE_NORMAL;
+        -:  145:}
+        -:  146:
+        -:  147:/**
+        -:  148: * Compute the effective (pressure-adjusted) capacity for a given nominal cap.
+        -:  149: *
+        -:  150: * Scaling factors:
+        -:  151: *   NORMAL   → 100%   (no reduction)
+        -:  152: *   MEDIUM   →  75%
+        -:  153: *   HIGH     →  50%
+        -:  154: *   CRITICAL →  25%   (but never below 1)
+        -:  155: */
+      233:  156:static uint32_t irc_effective_cap(uint32_t base, mem_pressure_t p)
+        -:  157:{
+      233:  158:    switch (p) {
+      233:  159:    case MEM_PRESSURE_NORMAL:   return base;
+    #####:  160:    case MEM_PRESSURE_MEDIUM:   return base * 3 / 4;
+    #####:  161:    case MEM_PRESSURE_HIGH:     return base / 2;
+    #####:  162:    case MEM_PRESSURE_CRITICAL: return base / 4 + 1;
+        -:  163:    }
+    #####:  164:    return base;
+        -:  165:}
+        -:  166:
+        -:  167:/* Convenience: read current pressure from the atomic field. */
+      233:  168:static inline mem_pressure_t irc_current_pressure(const ir_lru_cache_t *cache)
+        -:  169:{
+      233:  170:    return (mem_pressure_t)atomic_load_explicit(&cache->pressure,
+        -:  171:                                                 memory_order_relaxed);
+        -:  172:}
+        -:  173:
+        -:  174:/* ═══════════════════════════ LRU list helpers (lock held) ═════════════════ */
+        -:  175:
+      241:  176:static void list_remove(ir_node_t **head, ir_node_t **tail, ir_node_t *node)
+        -:  177:{
+      241:  178:    if (node->prev) node->prev->next = node->next; else *head = node->next;
+      241:  179:    if (node->next) node->next->prev = node->prev; else *tail = node->prev;
+      241:  180:    node->prev = node->next = NULL;
+      241:  181:}
+        -:  182:
+      463:  183:static void list_push_front(ir_node_t **head, ir_node_t **tail, ir_node_t *node)
+        -:  184:{
+      463:  185:    node->next = *head;
+      463:  186:    node->prev = NULL;
+      463:  187:    if (*head) (*head)->prev = node; else *tail = node;
+      463:  188:    *head = node;
+      463:  189:}
+        -:  190:
+       11:  191:static ir_node_t *list_pop_back(ir_node_t **head, ir_node_t **tail)
+        -:  192:{
+       11:  193:    ir_node_t *node = *tail;
+      11*:  194:    if (!node) return NULL;
+       11:  195:    list_remove(head, tail, node);
+       11:  196:    return node;
+        -:  197:}
+        -:  198:
+        -:  199:/* ═══════════════════════════ eviction (lock held) ═════════════════════════ */
+        -:  200:
+        -:  201:/**
+        -:  202: * Demote the LRU-WARM entry to COLD: free its IR string, move it off the
+        -:  203: * WARM list.  Increments stat_evictions.  Called under cache->lock.
+        -:  204: */
+        5:  205:static void irc_evict_lru_warm(ir_lru_cache_t *cache)
+        -:  206:{
+        5:  207:    ir_node_t *lru = list_pop_back(&cache->warm_head, &cache->warm_tail);
+       5*:  208:    if (!lru) return;
+        5:  209:    --cache->warm_count;
+        5:  210:    free(lru->ir_source);
+        5:  211:    lru->ir_source = NULL;
+        5:  212:    lru->gen = IR_GEN_COLD;
+        5:  213:    ++cache->cold_count;
+        5:  214:    atomic_fetch_add_explicit(&cache->stat_evictions, 1, memory_order_relaxed);
+        -:  215:}
+        -:  216:
+        -:  217:/**
+        -:  218: * Ensure warm_count < effective warm capacity.
+        -:  219: * Called under cache->lock.
+        -:  220: */
+        7:  221:static void make_room_in_warm(ir_lru_cache_t *cache)
+        -:  222:{
+        7:  223:    uint32_t eff = irc_effective_cap(cache->warm_capacity,
+        -:  224:                                     irc_current_pressure(cache));
+       12:  225:    while (cache->warm_count >= eff)
+        5:  226:        irc_evict_lru_warm(cache);
+        7:  227:}
+        -:  228:
+        -:  229:/**
+        -:  230: * Ensure hot_count < effective hot capacity.
+        -:  231: * Demotes LRU-HOT to WARM (cascading into COLD if warm is also full).
+        -:  232: * Called under cache->lock.
+        -:  233: */
+      226:  234:static void make_room_in_hot(ir_lru_cache_t *cache)
+        -:  235:{
+      226:  236:    uint32_t eff_hot = irc_effective_cap(cache->hot_capacity,
+        -:  237:                                          irc_current_pressure(cache));
+      232:  238:    while (cache->hot_count >= eff_hot) {
+        6:  239:        ir_node_t *lru = list_pop_back(&cache->hot_head, &cache->hot_tail);
+       6*:  240:        if (!lru) break;
+        6:  241:        --cache->hot_count;
+        6:  242:        lru->gen = IR_GEN_WARM;
+        -:  243:
+        -:  244:        /* Make room in warm before inserting. */
+        6:  245:        make_room_in_warm(cache);
+        -:  246:
+        6:  247:        list_push_front(&cache->warm_head, &cache->warm_tail, lru);
+        6:  248:        ++cache->warm_count;
+        6:  249:        atomic_fetch_add_explicit(&cache->stat_evictions, 1, memory_order_relaxed);
+        -:  250:    }
+      226:  251:}
+        -:  252:
+        -:  253:/* ═══════════════════════════ pressure trim ════════════════════════════════ */
+        -:  254:
+        -:  255:/**
+        -:  256: * Proactively trim HOT and WARM lists to the effective capacities for the
+        -:  257: * given pressure level.  Called by the pressure thread when pressure rises.
+        -:  258: *
+        -:  259: * Strategy:
+        -:  260: *   1. Trim WARM→COLD first to make space for displaced HOT entries.
+        -:  261: *   2. Trim HOT→WARM (or directly→COLD if warm is still full).
+        -:  262: *
+        -:  263: * Each eviction increments both stat_evictions and stat_pressure_evictions.
+        -:  264: */
+    #####:  265:static void irc_trim_to_pressure(ir_lru_cache_t *cache, mem_pressure_t p)
+        -:  266:{
+    #####:  267:    uint32_t eff_hot  = irc_effective_cap(cache->hot_capacity,  p);
+    #####:  268:    uint32_t eff_warm = irc_effective_cap(cache->warm_capacity, p);
+        -:  269:
+    #####:  270:    pthread_mutex_lock(&cache->lock);
+        -:  271:
+        -:  272:    /* Step 1: shrink WARM → COLD */
+    #####:  273:    while (cache->warm_count > eff_warm) {
+    #####:  274:        ir_node_t *lru = list_pop_back(&cache->warm_head, &cache->warm_tail);
+    #####:  275:        if (!lru) break;
+    #####:  276:        --cache->warm_count;
+    #####:  277:        free(lru->ir_source);
+    #####:  278:        lru->ir_source = NULL;
+    #####:  279:        lru->gen = IR_GEN_COLD;
+    #####:  280:        ++cache->cold_count;
+    #####:  281:        atomic_fetch_add_explicit(&cache->stat_evictions,          1, memory_order_relaxed);
+    #####:  282:        atomic_fetch_add_explicit(&cache->stat_pressure_evictions, 1, memory_order_relaxed);
+        -:  283:    }
+        -:  284:
+        -:  285:    /* Step 2: shrink HOT → WARM (or directly → COLD when warm also full) */
+    #####:  286:    while (cache->hot_count > eff_hot) {
+    #####:  287:        ir_node_t *lru = list_pop_back(&cache->hot_head, &cache->hot_tail);
+    #####:  288:        if (!lru) break;
+    #####:  289:        --cache->hot_count;
+        -:  290:
+    #####:  291:        if (cache->warm_count < eff_warm) {
+    #####:  292:            lru->gen = IR_GEN_WARM;
+    #####:  293:            list_push_front(&cache->warm_head, &cache->warm_tail, lru);
+    #####:  294:            ++cache->warm_count;
+        -:  295:        } else {
+    #####:  296:            free(lru->ir_source);
+    #####:  297:            lru->ir_source = NULL;
+    #####:  298:            lru->gen = IR_GEN_COLD;
+    #####:  299:            ++cache->cold_count;
+        -:  300:        }
+    #####:  301:        atomic_fetch_add_explicit(&cache->stat_evictions,          1, memory_order_relaxed);
+    #####:  302:        atomic_fetch_add_explicit(&cache->stat_pressure_evictions, 1, memory_order_relaxed);
+        -:  303:    }
+        -:  304:
+    #####:  305:    pthread_mutex_unlock(&cache->lock);
+    #####:  306:}
+        -:  307:
+        -:  308:/* ═══════════════════════════ pressure-monitor thread ══════════════════════ */
+        -:  309:
+      141:  310:static void *pressure_monitor_fn(void *arg)
+        -:  311:{
+      141:  312:    ir_lru_cache_t *cache = (ir_lru_cache_t *)arg;
+        -:  313:
+        -:  314:    struct timespec sleep_ts;
+      141:  315:    sleep_ts.tv_sec  = cache->mem_check_interval_ms / 1000;
+      141:  316:    sleep_ts.tv_nsec = (long)(cache->mem_check_interval_ms % 1000) * 1000000L;
+        -:  317:
+      141:  318:    mem_pressure_t prev_pressure = MEM_PRESSURE_NORMAL;
+        -:  319:
+      377:  320:    while (!atomic_load_explicit(&cache->stop_pressure_flag, memory_order_acquire)) {
+      241:  321:        nanosleep(&sleep_ts, NULL);
+        -:  322:
+      236:  323:        uint64_t total_kb = 0, avail_kb = 0;
+     236*:  324:        if (!irc_read_meminfo(&total_kb, &avail_kb)) {
+        -:  325:            /* /proc/meminfo unreadable (non-Linux); nothing to do. */
+    #####:  326:            continue;
+        -:  327:        }
+        -:  328:
+        -:  329:        /* Update observable snapshots atomically. */
+      236:  330:        atomic_store_explicit(&cache->mem_total_kb,     total_kb, memory_order_relaxed);
+      236:  331:        atomic_store_explicit(&cache->mem_available_kb, avail_kb, memory_order_relaxed);
+        -:  332:
+      236:  333:        mem_pressure_t new_p = irc_calc_pressure(avail_kb, total_kb,
+        -:  334:                                                   cache->mem_low_pct,
+        -:  335:                                                   cache->mem_high_pct,
+        -:  336:                                                   cache->mem_critical_pct);
+        -:  337:
+      236:  338:        mem_pressure_t old_p = (mem_pressure_t)
+      236:  339:            atomic_exchange_explicit(&cache->pressure, (int)new_p,
+        -:  340:                                     memory_order_acq_rel);
+        -:  341:
+      236:  342:        if (new_p > old_p) {
+        -:  343:            /*
+        -:  344:             * Pressure increased: proactively evict entries to stay within
+        -:  345:             * the tighter effective capacities.  This happens in the
+        -:  346:             * background and does not block runtime threads.
+        -:  347:             */
+    #####:  348:            irc_trim_to_pressure(cache, new_p);
+        -:  349:        }
+        -:  350:
+      236:  351:        if (new_p != prev_pressure) {
+        -:  352:            static const char *const pnames[] =
+        -:  353:                { "NORMAL", "MEDIUM", "HIGH", "CRITICAL" };
+    #####:  354:            fprintf(stderr,
+        -:  355:                    "[ir_cache/pressure] %s → %s  "
+        -:  356:                    "(avail=%llu MB / total=%llu MB)\n",
+    #####:  357:                    pnames[prev_pressure], pnames[new_p],
+    #####:  358:                    (unsigned long long)(avail_kb / 1024),
+    #####:  359:                    (unsigned long long)(total_kb / 1024));
+    #####:  360:            prev_pressure = new_p;
+        -:  361:        }
+        -:  362:    }
+        -:  363:
+      136:  364:    return NULL;
+        -:  365:}
+        -:  366:
+        -:  367:/* ═══════════════════════════ disk helpers ═════════════════════════════════ */
+        -:  368:
+      230:  369:static bool irc_write_to_disk(const char *path, const char *ir)
+        -:  370:{
+      230:  371:    FILE *f = fopen(path, "w");
+     230*:  372:    if (!f) return false;
+      230:  373:    fputs(ir, f);
+      230:  374:    fclose(f);
+      230:  375:    return true;
+        -:  376:}
+        -:  377:
+        -:  378:/** Read entire file into a malloc'd NUL-terminated buffer. Caller frees. */
+        1:  379:static char *irc_read_from_disk(const char *path)
+        -:  380:{
+        1:  381:    FILE *f = fopen(path, "r");
+       1*:  382:    if (!f) return NULL;
+       1*:  383:    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+        1:  384:    long sz = ftell(f);
+       1*:  385:    if (sz <= 0)                      { fclose(f); return NULL; }
+        1:  386:    rewind(f);
+        1:  387:    char *buf = malloc((size_t)sz + 1);
+       1*:  388:    if (!buf)                         { fclose(f); return NULL; }
+        1:  389:    size_t nr = fread(buf, 1, (size_t)sz, f);
+        1:  390:    buf[nr] = '\0';
+        1:  391:    fclose(f);
+        1:  392:    return buf;
+        -:  393:}
+        -:  394:
+        -:  395:/* ═══════════════════════════ async I/O thread pool ════════════════════════ */
+        -:  396:
+        -:  397:/**
+        -:  398: * Main loop of an async I/O prefetch thread.
+        -:  399: *
+        -:  400: * Blocks on the prefetch condvar when the queue is empty.  On each wake,
+        -:  401: * dequeues one func_id and calls ir_cache_get_ir() which handles the
+        -:  402: * COLD→WARM promotion (disk read + LRU insertion) with all proper locking.
+        -:  403: * The returned IR copy is freed immediately — the goal is only to warm the
+        -:  404: * cache, not to use the IR ourselves.
+        -:  405: */
+      282:  406:static void *io_thread_fn(void *arg)
+        -:  407:{
+      282:  408:    ir_lru_cache_t *cache = (ir_lru_cache_t *)arg;
+        -:  409:
+        -:  410:    /*
+        -:  411:     * Keep the mutex held across the stop check and the wait so there is no
+        -:  412:     * window between "queue empty" and "pthread_cond_wait" where a broadcast
+        -:  413:     * from ir_cache_destroy() could be missed.
+        -:  414:     *
+        -:  415:     * Protocol:
+        -:  416:     *   1. Lock mutex.
+        -:  417:     *   2. While queue empty AND not stopping: wait on condvar (atomically
+        -:  418:     *      releases mutex and sleeps; re-acquires on wake).
+        -:  419:     *   3. If stopping: unlock and exit.
+        -:  420:     *   4. Dequeue one item, unlock, do I/O, lock again.
+        -:  421:     */
+      282:  422:    pthread_mutex_lock(&cache->pf_mutex);
+    #####:  423:    for (;;) {
+        -:  424:        /* Wait until there is work or we are asked to stop. */
+      554:  425:        while (cache->pf_count == 0 &&
+      554:  426:               !atomic_load_explicit(&cache->stop_io_flag, memory_order_relaxed))
+      282:  427:            pthread_cond_wait(&cache->pf_cond, &cache->pf_mutex);
+        -:  428:
+      272:  429:        if (atomic_load_explicit(&cache->stop_io_flag, memory_order_relaxed))
+      272:  430:            break;
+        -:  431:
+        -:  432:        /* Dequeue one request while still holding the mutex. */
+    #####:  433:        func_id_t id    = cache->pf_buf[cache->pf_head];
+    #####:  434:        cache->pf_head  = (cache->pf_head + 1) % IRC_PREFETCH_CAP;
+    #####:  435:        --cache->pf_count;
+    #####:  436:        pthread_mutex_unlock(&cache->pf_mutex);
+        -:  437:
+        -:  438:        /*
+        -:  439:         * ir_cache_get_ir handles COLD→WARM: drops cache->lock during disk I/O
+        -:  440:         * so other threads are not blocked.  For HOT/WARM entries the call is
+        -:  441:         * a cheap in-memory hit.  The returned copy is freed immediately; we
+        -:  442:         * only care about the side-effect of warming the cache entry.
+        -:  443:         */
+    #####:  444:        char *ir = ir_cache_get_ir(cache, id);
+    #####:  445:        free(ir);
+        -:  446:
+    #####:  447:        pthread_mutex_lock(&cache->pf_mutex);
+        -:  448:    }
+      272:  449:    pthread_mutex_unlock(&cache->pf_mutex);
+      272:  450:    return NULL;
+        -:  451:}
+        -:  452:
+    #####:  453:bool ir_cache_prefetch(ir_lru_cache_t *cache, func_id_t func_id)
+        -:  454:{
+    #####:  455:    if (!cache || !cache->num_io_threads) return false;
+    #####:  456:    if (func_id >= cache->max_funcs)       return false;
+        -:  457:
+    #####:  458:    pthread_mutex_lock(&cache->pf_mutex);
+        -:  459:
+    #####:  460:    if (cache->pf_count >= IRC_PREFETCH_CAP) {
+    #####:  461:        pthread_mutex_unlock(&cache->pf_mutex);
+    #####:  462:        return false;  /* queue full; caller falls back to synchronous load */
+        -:  463:    }
+        -:  464:
+    #####:  465:    uint32_t tail       = (cache->pf_head + cache->pf_count) % IRC_PREFETCH_CAP;
+    #####:  466:    cache->pf_buf[tail] = func_id;
+    #####:  467:    ++cache->pf_count;
+        -:  468:
+    #####:  469:    pthread_cond_signal(&cache->pf_cond);  /* wake one I/O thread */
+    #####:  470:    pthread_mutex_unlock(&cache->pf_mutex);
+    #####:  471:    return true;
+        -:  472:}
+        -:  473:
+        -:  474:
+        -:  475:
+      141:  476:ir_lru_cache_t *ir_cache_create(const ir_cache_config_t *cfg)
+        -:  477:{
+     141*:  478:    if (!cfg || !cfg->max_funcs) return NULL;
+        -:  479:
+      141:  480:    ir_lru_cache_t *cache = calloc(1, sizeof(*cache));
+     141*:  481:    if (!cache) return NULL;
+        -:  482:
+      141:  483:    cache->nodes = calloc(cfg->max_funcs, sizeof(ir_node_t));
+     141*:  484:    if (!cache->nodes) { free(cache); return NULL; }
+        -:  485:
+      141:  486:    cache->max_funcs     = cfg->max_funcs;
+     141*:  487:    cache->hot_capacity  = cfg->hot_cap  ? cfg->hot_cap  : 64;
+     141*:  488:    cache->warm_capacity = cfg->warm_cap ? cfg->warm_cap : 128;
+        -:  489:
+      141:  490:    pthread_mutex_init(&cache->lock, NULL);
+        -:  491:
+        -:  492:    /* Memory-pressure config (apply defaults for zero values). */
+      282:  493:    cache->mem_check_interval_ms = cfg->mem_check_interval_ms
+     141*:  494:                                   ? cfg->mem_check_interval_ms : 500;
+     141*:  495:    cache->mem_low_pct      = cfg->mem_low_pct      ? cfg->mem_low_pct      : 20;
+     141*:  496:    cache->mem_high_pct     = cfg->mem_high_pct     ? cfg->mem_high_pct     : 10;
+     141*:  497:    cache->mem_critical_pct = cfg->mem_critical_pct ? cfg->mem_critical_pct :  5;
+        -:  498:
+      141:  499:    atomic_init(&cache->pressure,             (int)MEM_PRESSURE_NORMAL);
+      141:  500:    atomic_init(&cache->mem_available_kb,     0);
+      141:  501:    atomic_init(&cache->mem_total_kb,         0);
+      141:  502:    atomic_init(&cache->stop_pressure_flag,   false);
+      141:  503:    atomic_init(&cache->stat_disk_writes,     0);
+      141:  504:    atomic_init(&cache->stat_disk_reads,      0);
+      141:  505:    atomic_init(&cache->stat_evictions,       0);
+      141:  506:    atomic_init(&cache->stat_promotions,      0);
+      141:  507:    atomic_init(&cache->stat_cache_hits,      0);
+      141:  508:    atomic_init(&cache->stat_cache_misses,    0);
+      141:  509:    atomic_init(&cache->stat_pressure_evictions, 0);
+        -:  510:
+      141:  511:    atomic_init(&cache->stop_io_flag,    false);
+        -:  512:
+        -:  513:    /* Build IR directory path. */
+      141:  514:    if (cfg->ir_dir && cfg->ir_dir[0]) {
+        1:  515:        snprintf(cache->ir_dir, sizeof(cache->ir_dir), "%s", cfg->ir_dir);
+        -:  516:    } else {
+      140:  517:        snprintf(cache->ir_dir, sizeof(cache->ir_dir),
+      140:  518:                 "/tmp/cjit_ir_%d", (int)getpid());
+        -:  519:    }
+        -:  520:
+      141:  521:    if (mkdir(cache->ir_dir, 0700) != 0 && errno != EEXIST) {
+    #####:  522:        fprintf(stderr, "[ir_cache] WARNING: cannot create IR dir '%s': %s\n",
+    #####:  523:                cache->ir_dir, strerror(errno));
+        -:  524:    }
+        -:  525:
+        -:  526:    /* I/O prefetch pool – initialise FIFO and start threads. */
+      141:  527:    pthread_mutex_init(&cache->pf_mutex, NULL);
+      141:  528:    pthread_cond_init(&cache->pf_cond, NULL);
+      141:  529:    cache->pf_head = cache->pf_count = 0;
+        -:  530:
+      141:  531:    cache->num_io_threads = cfg->num_io_threads ? cfg->num_io_threads : 2;
+      141:  532:    cache->io_threads = calloc(cache->num_io_threads, sizeof(pthread_t));
+      141:  533:    if (!cache->io_threads) {
+        -:  534:        /* Non-fatal: degrade gracefully to no async prefetch. */
+    #####:  535:        cache->num_io_threads = 0;
+    #####:  536:        fprintf(stderr, "[ir_cache] WARNING: cannot allocate I/O thread array\n");
+        -:  537:    } else {
+      423:  538:        for (uint32_t i = 0; i < cache->num_io_threads; ++i)
+      282:  539:            pthread_create(&cache->io_threads[i], NULL, io_thread_fn, cache);
+        -:  540:    }
+        -:  541:
+        -:  542:    /* Start the pressure-monitor thread immediately so the first
+        -:  543:     * compilation already benefits from an accurate pressure reading.   */
+      141:  544:    pthread_create(&cache->pressure_thread, NULL, pressure_monitor_fn, cache);
+        -:  545:
+      141:  546:    return cache;
+        -:  547:}
+        -:  548:
+      136:  549:void ir_cache_destroy(ir_lru_cache_t *cache)
+        -:  550:{
+     136*:  551:    if (!cache) return;
+        -:  552:
+        -:  553:    /* Stop I/O threads.
+        -:  554:     *
+        -:  555:     * Setting stop_io_flag must happen INSIDE the mutex so there is no window
+        -:  556:     * between an I/O thread's stop_io_flag check and its pthread_cond_wait
+        -:  557:     * call where the flag could be set and the broadcast missed.  If the flag
+        -:  558:     * were set outside the mutex, an I/O thread that evaluated "!stop_io_flag"
+        -:  559:     * as false, then yielded before calling pthread_cond_wait, would sleep
+        -:  560:     * indefinitely after missing the broadcast.
+        -:  561:     */
+      136:  562:    if (cache->num_io_threads > 0) {
+      136:  563:        pthread_mutex_lock(&cache->pf_mutex);
+      136:  564:        atomic_store_explicit(&cache->stop_io_flag, true, memory_order_relaxed);
+      136:  565:        pthread_cond_broadcast(&cache->pf_cond);
+      136:  566:        pthread_mutex_unlock(&cache->pf_mutex);
+      408:  567:        for (uint32_t i = 0; i < cache->num_io_threads; ++i)
+      272:  568:            pthread_join(cache->io_threads[i], NULL);
+      136:  569:        free(cache->io_threads);
+      136:  570:        cache->io_threads = NULL;
+        -:  571:    }
+      136:  572:    pthread_cond_destroy(&cache->pf_cond);
+      136:  573:    pthread_mutex_destroy(&cache->pf_mutex);
+        -:  574:
+        -:  575:    /* Stop pressure thread. */
+      136:  576:    atomic_store_explicit(&cache->stop_pressure_flag, true, memory_order_release);
+      136:  577:    pthread_join(cache->pressure_thread, NULL);
+        -:  578:
+        -:  579:    /* Free all heap IR strings. */
+      349:  580:    for (uint32_t i = 0; i < cache->total_registered; ++i)
+      213:  581:        free(cache->nodes[i].ir_source);
+        -:  582:
+      136:  583:    free(cache->nodes);
+      136:  584:    pthread_mutex_destroy(&cache->lock);
+      136:  585:    free(cache);
+        -:  586:}
+        -:  587:
+      226:  588:bool ir_cache_register(ir_lru_cache_t *cache,
+        -:  589:                        func_id_t       func_id,
+        -:  590:                        const char     *func_name,
+        -:  591:                        const char     *ir_source)
+        -:  592:{
+     226*:  593:    if (!cache || !func_name || !ir_source) return false;
+     226*:  594:    if (func_id >= cache->max_funcs)        return false;
+        -:  595:
+      226:  596:    ir_node_t *node = &cache->nodes[func_id];
+     226*:  597:    if (node->registered) return false;
+        -:  598:
+        -:  599:    /* Initialise fields outside the lock (node not yet visible to others). */
+      226:  600:    node->func_id = func_id;
+      226:  601:    sanitise_name(node->name, func_name, sizeof(node->name));
+        -:  602:
+      226:  603:    node->ir_source      = strdup(ir_source);
+     226*:  604:    if (!node->ir_source) return false;
+      226:  605:    node->last_access_ms = irc_now_ms();
+      226:  606:    node->access_cnt     = 0;
+      226:  607:    node->registered     = true;
+        -:  608:
+        -:  609:    /* Write permanent backup to disk (outside lock; I/O can be slow). */
+        -:  610:    char disk_path[IRC_PATH_MAX];
+      226:  611:    node_disk_path(cache, node, disk_path, sizeof(disk_path));
+      226:  612:    bool wrote = irc_write_to_disk(disk_path, ir_source);
+      226:  613:    if (wrote)
+      226:  614:        atomic_fetch_add_explicit(&cache->stat_disk_writes, 1, memory_order_relaxed);
+        -:  615:    else
+    #####:  616:        fprintf(stderr, "[ir_cache] WARNING: cannot write IR for '%s' to '%s'\n",
+        -:  617:                func_name, disk_path);
+        -:  618:
+        -:  619:    /* Insert into HOT generation under lock. */
+      226:  620:    pthread_mutex_lock(&cache->lock);
+      226:  621:    make_room_in_hot(cache);
+      226:  622:    node->gen = IR_GEN_HOT;
+      226:  623:    list_push_front(&cache->hot_head, &cache->hot_tail, node);
+      226:  624:    ++cache->hot_count;
+      226:  625:    ++cache->total_registered;
+      226:  626:    pthread_mutex_unlock(&cache->lock);
+        -:  627:
+      226:  628:    return true;
+        -:  629:}
+        -:  630:
+      231:  631:char *ir_cache_get_ir(ir_lru_cache_t *cache, func_id_t func_id)
+        -:  632:{
+     231*:  633:    if (!cache || func_id >= cache->max_funcs) return NULL;
+        -:  634:
+      231:  635:    ir_node_t *node = &cache->nodes[func_id];
+     231*:  636:    if (!node->registered) return NULL;
+        -:  637:
+      231:  638:    pthread_mutex_lock(&cache->lock);
+        -:  639:
+        -:  640:    /* ── HOT: just refresh MRU position ─────────────────────────────── */
+      231:  641:    if (node->gen == IR_GEN_HOT) {
+      230:  642:        list_remove(&cache->hot_head, &cache->hot_tail, node);
+      230:  643:        list_push_front(&cache->hot_head, &cache->hot_tail, node);
+      230:  644:        node->last_access_ms = irc_now_ms();
+      230:  645:        ++node->access_cnt;
+     230*:  646:        char *copy = node->ir_source ? strdup(node->ir_source) : NULL;
+      230:  647:        pthread_mutex_unlock(&cache->lock);
+      230:  648:        atomic_fetch_add_explicit(&cache->stat_cache_hits, 1, memory_order_relaxed);
+      230:  649:        return copy;
+        -:  650:    }
+        -:  651:
+        -:  652:    /* ── WARM: promote to HOT ────────────────────────────────────────── */
+        1:  653:    if (node->gen == IR_GEN_WARM) {
+    #####:  654:        list_remove(&cache->warm_head, &cache->warm_tail, node);
+    #####:  655:        --cache->warm_count;
+    #####:  656:        make_room_in_hot(cache);
+    #####:  657:        node->gen = IR_GEN_HOT;
+    #####:  658:        list_push_front(&cache->hot_head, &cache->hot_tail, node);
+    #####:  659:        ++cache->hot_count;
+    #####:  660:        node->last_access_ms = irc_now_ms();
+    #####:  661:        ++node->access_cnt;
+    #####:  662:        char *copy = node->ir_source ? strdup(node->ir_source) : NULL;
+    #####:  663:        pthread_mutex_unlock(&cache->lock);
+    #####:  664:        atomic_fetch_add_explicit(&cache->stat_cache_hits,  1, memory_order_relaxed);
+    #####:  665:        atomic_fetch_add_explicit(&cache->stat_promotions,  1, memory_order_relaxed);
+    #####:  666:        return copy;
+        -:  667:    }
+        -:  668:
+        -:  669:    /* ── COLD: load from disk (drop lock during I/O) ─────────────────── */
+        -:  670:    /*
+        -:  671:     * func_id and name are write-once at registration; they are stable and
+        -:  672:     * safe to read without the lock.  Reconstruct the path here so we avoid
+        -:  673:     * storing 512 bytes of disk_path per node.
+        -:  674:     */
+        -:  675:    char disk_path[IRC_PATH_MAX];
+        1:  676:    node_disk_path(cache, node, disk_path, sizeof(disk_path));
+        1:  677:    pthread_mutex_unlock(&cache->lock);
+        -:  678:
+        1:  679:    atomic_fetch_add_explicit(&cache->stat_cache_misses, 1, memory_order_relaxed);
+        1:  680:    atomic_fetch_add_explicit(&cache->stat_disk_reads,   1, memory_order_relaxed);
+        -:  681:
+        1:  682:    char *loaded = irc_read_from_disk(disk_path);
+        1:  683:    if (!loaded) {
+    #####:  684:        fprintf(stderr, "[ir_cache] ERROR: failed to read IR for func %u from '%s'\n",
+        -:  685:                func_id, disk_path);
+    #####:  686:        return NULL;
+        -:  687:    }
+        -:  688:
+        -:  689:    /* Re-acquire lock; re-check generation (another thread may have loaded). */
+        1:  690:    pthread_mutex_lock(&cache->lock);
+        -:  691:
+        1:  692:    if (node->gen != IR_GEN_COLD) {
+        -:  693:        /* Already promoted by a concurrent thread; return their in-memory copy. */
+    #####:  694:        char *copy = node->ir_source ? strdup(node->ir_source) : strdup(loaded);
+    #####:  695:        pthread_mutex_unlock(&cache->lock);
+    #####:  696:        free(loaded);
+    #####:  697:        atomic_fetch_add_explicit(&cache->stat_cache_hits, 1, memory_order_relaxed);
+    #####:  698:        return copy;
+        -:  699:    }
+        -:  700:
+        1:  701:    node->ir_source = loaded;   /* install loaded string */
+        1:  702:    make_room_in_warm(cache);
+        1:  703:    node->gen = IR_GEN_WARM;
+        1:  704:    list_push_front(&cache->warm_head, &cache->warm_tail, node);
+        1:  705:    ++cache->warm_count;
+        1:  706:    --cache->cold_count;
+        1:  707:    node->last_access_ms = irc_now_ms();
+        1:  708:    ++node->access_cnt;
+        -:  709:
+        1:  710:    char *copy = strdup(loaded);
+        1:  711:    pthread_mutex_unlock(&cache->lock);
+        -:  712:
+        1:  713:    atomic_fetch_add_explicit(&cache->stat_promotions, 1, memory_order_relaxed);
+        1:  714:    return copy;
+        -:  715:}
+        -:  716:
+     1785:  717:uint8_t ir_cache_get_generation(const ir_lru_cache_t *cache, func_id_t func_id)
+        -:  718:{
+    1785*:  719:    if (!cache || func_id >= cache->max_funcs)  return IR_GEN_COLD;
+    1785*:  720:    if (!cache->nodes[func_id].registered)       return IR_GEN_COLD;
+     1785:  721:    return cache->nodes[func_id].gen;
+        -:  722:}
+        -:  723:
+        4:  724:bool ir_cache_update_ir(ir_lru_cache_t *cache,
+        -:  725:                         func_id_t       func_id,
+        -:  726:                         const char     *func_name,
+        -:  727:                         const char     *new_ir)
+        -:  728:{
+        -:  729:    (void)func_name;   /* Reserved for future logging; name is in node->name */
+       4*:  730:    if (!cache || !new_ir || func_id >= cache->max_funcs) return false;
+        -:  731:
+        4:  732:    ir_node_t *node = &cache->nodes[func_id];
+       4*:  733:    if (!node->registered) return false;
+        -:  734:
+        -:  735:    /* Allocate the new heap copy outside the lock. */
+        4:  736:    char *new_copy = strdup(new_ir);
+       4*:  737:    if (!new_copy) return false;
+        -:  738:
+        -:  739:    /* Write the updated IR to the on-disk backup (outside lock; I/O is slow). */
+        -:  740:    char disk_path[IRC_PATH_MAX];
+        4:  741:    node_disk_path(cache, node, disk_path, sizeof(disk_path));
+        4:  742:    if (irc_write_to_disk(disk_path, new_ir))
+        4:  743:        atomic_fetch_add_explicit(&cache->stat_disk_writes, 1, memory_order_relaxed);
+        -:  744:    else
+    #####:  745:        fprintf(stderr, "[ir_cache] WARNING: cannot update IR on disk for func %u\n",
+        -:  746:                func_id);
+        -:  747:
+        4:  748:    pthread_mutex_lock(&cache->lock);
+        -:  749:
+        4:  750:    char *old_copy = node->ir_source;   /* may be NULL when COLD */
+        -:  751:
+        4:  752:    if (node->gen == IR_GEN_COLD) {
+        -:  753:        /*
+        -:  754:         * Promote the entry from COLD to WARM so the next compilation
+        -:  755:         * gets the new IR from memory rather than reading from disk.
+        -:  756:         */
+    #####:  757:        make_room_in_warm(cache);
+    #####:  758:        node->ir_source = new_copy;
+    #####:  759:        node->gen = IR_GEN_WARM;
+    #####:  760:        list_push_front(&cache->warm_head, &cache->warm_tail, node);
+    #####:  761:        ++cache->warm_count;
+    #####:  762:        --cache->cold_count;
+    #####:  763:        atomic_fetch_add_explicit(&cache->stat_promotions, 1, memory_order_relaxed);
+    #####:  764:        old_copy = NULL;   /* was NULL for COLD entries; nothing to free */
+        -:  765:    } else {
+        -:  766:        /* HOT or WARM: replace the in-memory IR string in-place. */
+        4:  767:        node->ir_source = new_copy;
+        -:  768:    }
+        -:  769:
+        4:  770:    node->access_cnt++;
+        4:  771:    node->last_access_ms = irc_now_ms();
+        -:  772:
+        4:  773:    pthread_mutex_unlock(&cache->lock);
+        -:  774:
+        4:  775:    free(old_copy);   /* free outside the lock; free(NULL) is safe */
+        4:  776:    return true;
+        -:  777:}
+        -:  778:
+    #####:  779:mem_pressure_t ir_cache_get_pressure(const ir_lru_cache_t *cache)
+        -:  780:{
+    #####:  781:    if (!cache) return MEM_PRESSURE_NORMAL;
+    #####:  782:    return (mem_pressure_t)atomic_load_explicit(&cache->pressure,
+        -:  783:                                                 memory_order_relaxed);
+        -:  784:}
+        -:  785:
+       96:  786:ir_cache_stats_t ir_cache_get_stats(const ir_lru_cache_t *cache)
+        -:  787:{
+        -:  788:    ir_cache_stats_t s;
+       96:  789:    memset(&s, 0, sizeof(s));
+      96*:  790:    if (!cache) return s;
+        -:  791:
+        -:  792:    /* hot/warm/cold counts: racy but acceptable for diagnostics */
+       96:  793:    s.hot_count        = cache->hot_count;
+       96:  794:    s.warm_count       = cache->warm_count;
+       96:  795:    s.cold_count       = cache->cold_count;
+       96:  796:    s.total_registered = cache->total_registered;
+        -:  797:
+       96:  798:    s.disk_writes          = atomic_load_explicit(&cache->stat_disk_writes,         memory_order_relaxed);
+       96:  799:    s.disk_reads           = atomic_load_explicit(&cache->stat_disk_reads,          memory_order_relaxed);
+       96:  800:    s.evictions            = atomic_load_explicit(&cache->stat_evictions,           memory_order_relaxed);
+       96:  801:    s.promotions           = atomic_load_explicit(&cache->stat_promotions,          memory_order_relaxed);
+       96:  802:    s.cache_hits           = atomic_load_explicit(&cache->stat_cache_hits,          memory_order_relaxed);
+       96:  803:    s.cache_misses         = atomic_load_explicit(&cache->stat_cache_misses,        memory_order_relaxed);
+       96:  804:    s.pressure_evictions   = atomic_load_explicit(&cache->stat_pressure_evictions,  memory_order_relaxed);
+       96:  805:    s.pressure             = (mem_pressure_t)atomic_load_explicit(&cache->pressure, memory_order_relaxed);
+        -:  806:
+       96:  807:    uint64_t avail_kb = atomic_load_explicit(&cache->mem_available_kb, memory_order_relaxed);
+       96:  808:    uint64_t total_kb = atomic_load_explicit(&cache->mem_total_kb,     memory_order_relaxed);
+       96:  809:    s.mem_available_mb = avail_kb / 1024;
+       96:  810:    s.mem_total_mb     = total_kb / 1024;
+       96:  811:    return s;
+        -:  812:}
+        -:  813:
+    #####:  814:void ir_cache_print_stats(const ir_lru_cache_t *cache)
+        -:  815:{
+    #####:  816:    ir_cache_stats_t s = ir_cache_get_stats(cache);
+        -:  817:    static const char *const pnames[] = { "NORMAL", "MEDIUM", "HIGH", "CRITICAL" };
+    #####:  818:    fprintf(stderr,
+        -:  819:            "╔══════════════════════════════════════════╗\n"
+        -:  820:            "║      IR LRU Cache + Memory Pressure       ║\n"
+        -:  821:            "╠══════════════════════════════════════════╣\n"
+        -:  822:            "║  Memory pressure  : %-8s              ║\n"
+        -:  823:            "║  Mem available    : %6llu MB              ║\n"
+        -:  824:            "║  Mem total        : %6llu MB              ║\n"
+        -:  825:            "╠══════════════════════════════════════════╣\n"
+        -:  826:            "║  Registered       : %6u                ║\n"
+        -:  827:            "║  HOT  (in memory) : %6u                ║\n"
+        -:  828:            "║  WARM (in memory) : %6u                ║\n"
+        -:  829:            "║  COLD (on disk)   : %6u                ║\n"
+        -:  830:            "╠══════════════════════════════════════════╣\n"
+        -:  831:            "║  Cache hits       : %6llu                ║\n"
+        -:  832:            "║  Cache misses     : %6llu                ║\n"
+        -:  833:            "║  Disk writes      : %6llu                ║\n"
+        -:  834:            "║  Disk reads       : %6llu                ║\n"
+        -:  835:            "║  LRU evictions    : %6llu                ║\n"
+        -:  836:            "║  Pressure evicts  : %6llu                ║\n"
+        -:  837:            "║  Promotions       : %6llu                ║\n"
+        -:  838:            "╚══════════════════════════════════════════╝\n",
+    #####:  839:            pnames[s.pressure],
+    #####:  840:            (unsigned long long)s.mem_available_mb,
+    #####:  841:            (unsigned long long)s.mem_total_mb,
+        -:  842:            s.total_registered,
+        -:  843:            s.hot_count, s.warm_count, s.cold_count,
+    #####:  844:            (unsigned long long)s.cache_hits,
+    #####:  845:            (unsigned long long)s.cache_misses,
+    #####:  846:            (unsigned long long)s.disk_writes,
+    #####:  847:            (unsigned long long)s.disk_reads,
+    #####:  848:            (unsigned long long)s.evictions,
+    #####:  849:            (unsigned long long)s.pressure_evictions,
+    #####:  850:            (unsigned long long)s.promotions);
+    #####:  851:}

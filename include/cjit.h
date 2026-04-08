@@ -1353,6 +1353,96 @@ bool cjit_is_pinned(const cjit_engine_t *engine, func_id_t id);
  */
 int cjit_snapshot_ir(cjit_engine_t *engine, const char *dir);
 
+/**
+ * Reset per-function performance counters and profiling state.
+ *
+ * Atomically zeroes the following for the specified function:
+ *   • call_cnt          – call counter (TLS-flushed)
+ *   • total_elapsed_ns  – cumulative execution time (TLS-flushed)
+ *   • hist_counts[]     – all CJIT_HIST_BUCKETS latency histogram buckets
+ *   • recompile_count   – JIT recompile count (resets monitor threshold scaling)
+ *
+ * Typical use-case: after a cjit_update_ir() hot-reload, reset counters so
+ * that the monitor evaluates the new code from a clean baseline, rather than
+ * inheriting the call-rate history of the old implementation.
+ *
+ * The current function pointer and optimisation level are NOT affected; the
+ * function continues to run at its existing tier.  The monitor will re-observe
+ * the call rate from scratch and may re-promote the function.
+ *
+ * Thread safety: each field is zeroed with a relaxed atomic store.  An
+ * in-flight TLS flush may race to increment call_cnt or total_elapsed_ns
+ * immediately after; that is benign — it is equivalent to a call happening
+ * just after the reset.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @return        true on success, false if engine is NULL or id is invalid.
+ */
+bool cjit_reset_function_stats(cjit_engine_t *engine, func_id_t id);
+
+/**
+ * Block until all pending compile tasks have been dequeued and executed.
+ *
+ * Polls the total compile-queue depth (sum of all normal and priority lanes
+ * across all compiler threads) until it reaches zero, then waits for any
+ * in-progress compilation to finish by checking whether `in_queue` is clear
+ * for every registered function.
+ *
+ * Use-case: test scaffolding, warmup phases where you want to guarantee all
+ * background compiles are complete before starting production traffic.
+ *
+ * The function does NOT require the engine to be started — it returns true
+ * immediately if called before cjit_start() or after cjit_stop().
+ *
+ * Thread safety: safe to call concurrently with cjit_start(), cjit_stop(),
+ * dispatch loops, and any other public API.
+ *
+ * @param engine      The engine.
+ * @param timeout_ms  Maximum time to wait in milliseconds.
+ *                    0 = single non-blocking check.
+ * @return            true if the queue drained (depth == 0) before the
+ *                    timeout expired; false on timeout or NULL engine.
+ */
+bool cjit_drain_queue(cjit_engine_t *engine, uint32_t timeout_ms);
+
+/**
+ * Compile a function synchronously in the calling thread.
+ *
+ * Performs the full compilation pipeline (IR fetch → codegen_compile →
+ * atomic pointer swap → deferred GC retire) in the calling thread, without
+ * going through the background compile queue.  The function pointer is
+ * updated before this call returns.
+ *
+ * This is the fastest path for "compile now" warmup scenarios:
+ *
+ *   cjit_register_function(e, "fast_path", IR, NULL);
+ *   cjit_compile_sync(e, id, OPT_O2);   // block until compiled
+ *   // ... serve production traffic
+ *
+ * Behaviour:
+ *   • Acquires entry->compile_lock (blocking, unlike the compiler thread
+ *     which uses trylock).  If another thread is compiling the same function
+ *     simultaneously, this call serialises behind it.
+ *   • Fires the compile-event callback (if registered) after the attempt,
+ *     exactly like the background compiler thread.
+ *   • Increments the same engine-level statistics (stat_compilations,
+ *     stat_failed, stat_swaps).
+ *   • The version_req check is skipped: `cjit_compile_sync` always compiles
+ *     with the current IR regardless of any pending queue tasks.
+ *   • Does NOT clear `in_queue`; a background task for the same function
+ *     may still be queued but will be discarded (version mismatch) once
+ *     this call completes and increments the version counter.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @param level   Desired optimisation level.
+ * @return        true if compilation succeeded and the pointer was swapped.
+ *                false if id is invalid, no IR is available, the engine is
+ *                NULL, or the compiler subprocess failed.
+ */
+bool cjit_compile_sync(cjit_engine_t *engine, func_id_t id, opt_level_t level);
+
 #ifdef __cplusplus
 }
 #endif
