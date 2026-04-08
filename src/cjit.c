@@ -1524,10 +1524,13 @@ void cjit_record_timed_call(cjit_engine_t *engine,
             if (acc > 0) {
                 atomic_fetch_add_explicit(&e->total_elapsed_ns, acc,
                                           memory_order_relaxed);
-                /* Update histogram: bucket for the average per-call ns. */
+                /* Update histogram: bucket = floor(log₂(avg_ns)).
+                 * 63 - clz(x) computes the position of the most-significant set
+                 * bit (0-indexed from LSB), which equals floor(log₂(x)) for
+                 * any x ≥ 1.  The result is clamped to [0, CJIT_HIST_BUCKETS). */
                 uint64_t avg_ns = acc / CJIT_TLS_FLUSH_THRESHOLD;
                 int bucket = (avg_ns == 0) ? 0
-                    : (int)(63 - __builtin_clzll(avg_ns));
+                    : (int)(63u - (unsigned)__builtin_clzll(avg_ns));
                 if (bucket >= CJIT_HIST_BUCKETS)
                     bucket = CJIT_HIST_BUCKETS - 1;
                 atomic_fetch_add_explicit(&e->hist_counts[bucket], 1u,

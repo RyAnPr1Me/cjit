@@ -101,6 +101,7 @@
 #include <limits.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>       /* open O_CREAT O_WRONLY O_TRUNC */
 #include <pthread.h>
 #include <dlfcn.h>   /* dladdr – verify JIT function is in a loaded shared object */
 #include <sys/stat.h> /* chmod */
@@ -2030,11 +2031,13 @@ TEST(t24_compile_watchdog)
     snprintf(script_path, sizeof(script_path),
              "/tmp/cjit_cc_%d.sh", (int)getpid());
     {
-        FILE *f = fopen(script_path, "w");
-        CHECK(f, "could not write fake compiler script");
+        /* Create with 0755 at open() time to avoid TOCTOU between write and chmod. */
+        int sfd = open(script_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+        CHECK(sfd >= 0, "could not create fake compiler script");
+        FILE *f = fdopen(sfd, "w");
+        if (!f) { close(sfd); CHECK(false, "fdopen failed for fake compiler script"); }
         fprintf(f, "#!/bin/sh\nsleep 30\n");
-        fclose(f);
-        chmod(script_path, 0755);
+        fclose(f);  /* also closes sfd */
     }
 
     cjit_config_t cfg = cjit_default_config();
