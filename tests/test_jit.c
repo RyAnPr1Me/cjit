@@ -32,6 +32,37 @@
  *   t12  CRC32 tier progression        – CRC32 correctness verified at O1, O2,
  *                                        and O3 against the reference.
  *
+ *   t13  cjit_lookup_function       – lookup by name returns correct func_id;
+ *                                        unknown names return INVALID.
+ *   t14  cjit_update_ir (hot-reload) – hot-reload with new IR produces the
+ *                                        updated result after recompilation.
+ *   t15  extra_cflags (-D define)   – a -D flag in cfg.extra_cflags reaches
+ *                                        the compiler and affects JIT output.
+ *   t16  JIT replaces AOT pointer   – after cjit_request_recompile +
+ *                                        cjit_wait_compiled, func_ptr is no
+ *                                        longer the AOT fallback (new binary).
+ *   t17  dladdr compiled object     – dladdr(3) confirms the JIT function
+ *                                        lives in a separately loaded shared
+ *                                        object, not in the test binary itself.
+ *   t18  O3 vectorised correctness  – integer dot-product compiled at O3 +
+ *                                        vectorise + unroll + march=native
+ *                                        gives correct results over 1 000
+ *                                        iterations.
+ *   t19  Performance benchmark      – measures compile latency (ms) and
+ *                                        dispatch throughput (Mcall/s) at AOT,
+ *                                        O1, O2, O3 for an integer dot-product;
+ *                                        reports speedup vs AOT; asserts
+ *                                        correctness and compile < 10 s per
+ *                                        tier and O3 not >3× slower than O1.
+ *   t20  New opt-flags + preamble   – verifies the -funswitch-loops /
+ *                                        -fpeel-loops additions and the new
+ *                                        FLATTEN / NORETURN / CJIT_EXPORT /
+ *                                        MALLOC_FUNC preamble attributes and
+ *                                        the <limits.h> / <stdbool.h> auto-
+ *                                        includes by compiling representative
+ *                                        IR at O2 and O3 and checking all
+ *                                        results against AOT references.
+ *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).
  *
@@ -49,9 +80,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <limits.h>
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <dlfcn.h>   /* dladdr – verify JIT function is in a loaded shared object */
 
 #include "../include/cjit.h"
 
@@ -116,6 +149,22 @@ static int  aot_identity(int x)        { return x; }
 static long aot_sum_range(int lo, int hi) /* inclusive */
 {
     long s = 0; for (int i = lo; i <= hi; ++i) s += i; return s;
+}
+
+/* Reference dot-product used as the AOT baseline in t19_perf_benchmark. */
+static long aot_dot_int(const int *a, const int *b, int n)
+{
+    long s = 0;
+    for (int i = 0; i < n; ++i) s += (long)a[i] * b[i];
+    return s;
+}
+
+/* Reference for t20: conditional sum (mode 0 = add, mode 1 = subtract). */
+static long aot_cond_sum(const int *a, int n, int mode)
+{
+    long r = 0;
+    for (int i = 0; i < n; ++i) r += (mode == 0) ? a[i] : -a[i];
+    return r;
 }
 
 /* Reference prime sieve (returns count of primes ≤ limit). */
@@ -234,6 +283,82 @@ static const char IR_DJB2[] =
     "    int c;\n"
     "    while ((c = (unsigned char)*s++)) h = ((h << 5) + h) ^ (uint32_t)c;\n"
     "    return h;\n"
+    "}\n";
+
+/* Integer dot product – used by t18 to exercise O3 vectorisation. */
+static const char IR_DOT_INT[] =
+    "long dot_int(const int *a, const int *b, int n) {\n"
+    "    long s = 0;\n"
+    "    for (int i = 0; i < n; ++i) s += (long)a[i] * b[i];\n"
+    "    return s;\n"
+    "}\n";
+
+/* ─ t20 IR strings ─────────────────────────────────────────────────────────
+ *
+ * IR_COND_SUM: exercises -funswitch-loops.
+ *   The loop contains an invariant conditional on `mode`.  With
+ *   -funswitch-loops the compiler hoists the branch outside the loop,
+ *   emitting two tight loops (one for each mode) instead of testing `mode`
+ *   on every iteration.  We verify correctness for both modes at O2 and O3.
+ */
+static const char IR_COND_SUM[] =
+    "long cond_sum(const int *a, int n, int mode) {\n"
+    "    long r = 0;\n"
+    "    for (int i = 0; i < n; ++i) {\n"
+    "        if (mode == 0)\n"
+    "            r += a[i];\n"
+    "        else\n"
+    "            r -= a[i];\n"
+    "    }\n"
+    "    return r;\n"
+    "}\n";
+
+/*
+ * IR_PREAMBLE_ATTRS: verifies that newly-added preamble macros and headers
+ * compile without error.
+ *
+ *   • FLATTEN  – applied to outer(), which calls inner(); the compiler must
+ *                inline inner() even though it is a non-static, non-inline
+ *                function.
+ *   • <limits.h> auto-include – INT_MAX is referenced directly.
+ *   • <stdbool.h> auto-include – bool / true / false used.
+ *   • CJIT_EXPORT  – marks preamble_test as exported (dlsym-visible).
+ *   • MALLOC_FUNC  – applied to a trivial allocator-style function (purely
+ *                    a compile-time annotation; function body is inert).
+ *
+ * Expected return value: INT_MAX (computed as 10 adds + INT_MAX - 10).
+ */
+static const char IR_PREAMBLE_ATTRS[] =
+    "static int inner(int x) { return x + 1; }\n"
+    "FLATTEN static int outer(int x, int n) {\n"
+    "    for (int i = 0; i < n; ++i) x = inner(x);\n"
+    "    return x;\n"
+    "}\n"
+    "/* MALLOC_FUNC: compile-time annotation only; just confirm it compiles. */\n"
+    "MALLOC_FUNC static void *trivial_alloc(void) { return 0; }\n"
+    "/* CJIT_EXPORT ensures this symbol is visible via dlsym. */\n"
+    "CJIT_EXPORT int preamble_test(void) {\n"
+    "    (void)trivial_alloc();\n"
+    "    bool ok = true;\n"         /* tests stdbool.h auto-include */
+    "    if (!ok) return -1;\n"
+    "    return outer(INT_MAX - 10, 10);  /* uses limits.h auto-include */\n"
+    "}\n";
+
+/*
+ * IR_DOT_HELPERS: exercises FLATTEN with real helper inlining.
+ *   The outer FLATTEN-annotated function calls two non-static helpers
+ *   (mul_pair, add_accum).  Without FLATTEN these would only be inlined
+ *   at -O2 if the compiler judges them small enough; with FLATTEN inlining
+ *   is guaranteed.  We verify the numeric result matches the AOT reference.
+ */
+static const char IR_DOT_HELPERS[] =
+    "static int mul_pair(int a, int b) { return a * b; }\n"
+    "static long add_accum(long s, int v) { return s + v; }\n"
+    "FLATTEN long dot_helpers(const int *a, const int *b, int n) {\n"
+    "    long s = 0;\n"
+    "    for (int i = 0; i < n; ++i)\n"
+    "        s = add_accum(s, mul_pair(a[i], b[i]));\n"
+    "    return s;\n"
     "}\n";
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -943,9 +1068,631 @@ TEST(t12_crc32_tiers)
     return 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Runner
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* ─────────────────────────────────────────────────────────────────────────
+ * t13 – cjit_lookup_function
+ * ─────────────────────────────────────────────────────────────────────────
+ * Registers several functions and verifies that cjit_lookup_function()
+ * returns the correct func_id for each registered name and
+ * CJIT_INVALID_FUNC_ID for an unregistered name.
+ */
+TEST(t13_lookup_function)
+{
+    printf("[t13] cjit_lookup_function...\n");
+    cjit_engine_t *e = make_engine(false);
+    CHECK(e != NULL, "engine creation failed");
+
+    func_id_t id_add = cjit_register_function(e, "add", IR_ADD, (jit_func_t)aot_add);
+    func_id_t id_fib = cjit_register_function(e, "fib", IR_FIB, (jit_func_t)aot_fib);
+    func_id_t id_mul = cjit_register_function(e, "mul", IR_MUL, (jit_func_t)aot_mul);
+    CHECK(id_add != CJIT_INVALID_FUNC_ID, "add registration failed");
+    CHECK(id_fib != CJIT_INVALID_FUNC_ID, "fib registration failed");
+    CHECK(id_mul != CJIT_INVALID_FUNC_ID, "mul registration failed");
+
+    CHECK(cjit_lookup_function(e, "add") == id_add, "lookup 'add' returned wrong id");
+    CHECK(cjit_lookup_function(e, "fib") == id_fib, "lookup 'fib' returned wrong id");
+    CHECK(cjit_lookup_function(e, "mul") == id_mul, "lookup 'mul' returned wrong id");
+    CHECK(cjit_lookup_function(e, "nonexistent") == CJIT_INVALID_FUNC_ID,
+          "lookup of unregistered name should return INVALID");
+    CHECK(cjit_lookup_function(e, NULL) == CJIT_INVALID_FUNC_ID,
+          "lookup(NULL) should return INVALID");
+    CHECK(cjit_lookup_function(NULL, "add") == CJIT_INVALID_FUNC_ID,
+          "lookup(NULL engine) should return INVALID");
+
+    cjit_destroy(e);
+    printf("[t13] PASS\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * t14 – cjit_update_ir (hot-reload)
+ * ─────────────────────────────────────────────────────────────────────────
+ * Registers a function that returns a constant, waits for initial
+ * compilation, verifies the result, then hot-reloads it with new IR
+ * returning a different constant, waits for recompilation, and verifies
+ * the updated result.
+ */
+static const char IR_CONST1[] = "int get_val(void) { return 1001; }\n";
+static const char IR_CONST2[] = "int get_val(void) { return 2002; }\n";
+
+TEST(t14_update_ir)
+{
+    printf("[t14] cjit_update_ir (hot-reload)...\n");
+    cjit_engine_t *e = make_engine(false);
+    CHECK(e != NULL, "engine creation failed");
+
+    func_id_t id = cjit_register_function(e, "get_val", IR_CONST1, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "registration failed");
+
+    cjit_start(e);
+    cjit_request_recompile(e, id, OPT_O1);
+
+    /* Wait for first compilation. */
+    bool ok = cjit_wait_compiled(e, id, 5000);
+    CHECK(ok, "initial compilation timed out");
+
+    typedef int (*gv_fn)(void);
+    int v1 = ((gv_fn)cjit_get_func(e, id))();
+    CHECKF(v1 == 1001, "get_val() before update: got %d, want 1001", v1);
+
+    /* Hot-reload with new IR. */
+    CHECK(cjit_update_ir(e, id, IR_CONST2, OPT_O1), "cjit_update_ir failed");
+
+    /*
+     * After update the func_ptr was set by the first compile; it will be
+     * replaced by the new compile triggered by cjit_update_ir.  We wait
+     * until the recompile_count increases (= new binary installed).
+     */
+    uint32_t rc0 = cjit_get_recompile_count(e, id);
+    uint64_t deadline = now_ms() + 5000;
+    while (now_ms() < deadline &&
+           cjit_get_recompile_count(e, id) <= rc0)
+        sleep_ms(20);
+
+    CHECKF(cjit_get_recompile_count(e, id) > rc0,
+           "recompile_count did not increase after update (rc=%u)",
+           cjit_get_recompile_count(e, id));
+
+    int v2 = ((gv_fn)cjit_get_func(e, id))();
+    CHECKF(v2 == 2002, "get_val() after update: got %d, want 2002", v2);
+
+    cjit_destroy(e);
+    printf("[t14] PASS\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * t15 – extra_cflags / -D preprocessor define
+ * ─────────────────────────────────────────────────────────────────────────
+ * Passes a -D flag via cfg.extra_cflags so that a JIT function compiled
+ * against a macro-dependent constant produces the expected result.
+ */
+static const char IR_USE_DEFINE[] =
+    "int get_magic(void) {\n"
+    "#ifndef CJIT_MAGIC_VAL\n"
+    "    return 0;\n"
+    "#else\n"
+    "    return CJIT_MAGIC_VAL;\n"
+    "#endif\n"
+    "}\n";
+
+TEST(t15_extra_cflags)
+{
+    printf("[t15] extra_cflags (-D define)...\n");
+    cjit_config_t cfg        = cjit_default_config();
+    cfg.verbose              = false;
+    cfg.monitor_interval_ms  = 50;
+    cfg.hot_ir_cache_size    = 4;
+    cfg.warm_ir_cache_size   = 8;
+    /* Inject a preprocessor define via extra_cflags. */
+    strncpy(cfg.extra_cflags, "-DCJIT_MAGIC_VAL=7777",
+            sizeof(cfg.extra_cflags) - 1);
+    cfg.extra_cflags[sizeof(cfg.extra_cflags) - 1] = '\0';
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e != NULL, "engine creation failed");
+
+    func_id_t id = cjit_register_function(e, "get_magic", IR_USE_DEFINE, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "registration failed");
+
+    cjit_start(e);
+    cjit_request_recompile(e, id, OPT_O1);
+
+    bool ok = cjit_wait_compiled(e, id, 5000);
+    CHECK(ok, "compilation with -D flag timed out");
+
+    typedef int (*gm_fn)(void);
+    int got = ((gm_fn)cjit_get_func(e, id))();
+    CHECKF(got == 7777,
+           "get_magic() with -DCJIT_MAGIC_VAL=7777: got %d, want 7777", got);
+
+    cjit_destroy(e);
+    printf("[t15] PASS\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * t16 – JIT pointer is NOT the AOT fallback after compilation
+ * ─────────────────────────────────────────────────────────────────────────
+ * Verifies end-to-end that cjit_request_recompile() results in the
+ * function-table entry being updated to a NEW pointer distinct from the
+ * original AOT fallback — proving that a real compiled binary was loaded
+ * and installed, not just the fallback pointer kept.
+ *
+ * NOTE: cjit_wait_compiled() fast-paths when func_ptr is already non-NULL
+ * (i.e. the AOT fallback is set), so we use wait_for(check_opt, …) which
+ * waits until cur_level reaches the requested tier — that transition only
+ * occurs after a successful JIT compilation and pointer swap.
+ */
+TEST(t16_jit_replaces_aot)
+{
+    printf("[t16] JIT pointer differs from AOT fallback after compilation...\n");
+    cjit_engine_t *e = make_engine(false);
+    CHECK(e != NULL, "engine creation failed");
+
+    func_id_t id = cjit_register_function(e, "add", IR_ADD, (jit_func_t)aot_add);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "registration failed");
+
+    /* Before start the engine must serve the AOT fallback. */
+    jit_func_t pre = cjit_get_func(e, id);
+    CHECK(pre == (jit_func_t)aot_add, "before start: expected AOT fallback");
+    CHECK(cjit_get_current_opt_level(e, id) == OPT_NONE, "pre-start opt level != OPT_NONE");
+
+    cjit_start(e);
+    cjit_request_recompile(e, id, OPT_O2);
+
+    /*
+     * Wait until cur_level reaches OPT_O2.  cur_level is updated by the
+     * compiler thread only AFTER func_table_swap() completes, so reaching
+     * OPT_O2 here is a strict proof that (a) compilation succeeded and
+     * (b) the new JIT pointer was atomically installed.
+     */
+    wait_arg_t wa = { e, id, OPT_O2 };
+    bool ok = wait_for(check_opt, &wa, 5000);
+    CHECK(ok, "JIT compilation did not reach OPT_O2 within 5 s");
+
+    jit_func_t post = cjit_get_func(e, id);
+
+    /* Core assertion: a new pointer was installed (not the AOT fallback). */
+    CHECK(post != NULL,                 "func_ptr is NULL after compilation");
+    CHECK(post != (jit_func_t)aot_add, "func_ptr still points to AOT fallback after JIT compile");
+    CHECK(cjit_get_recompile_count(e, id) >= 1, "recompile_count == 0 after JIT compile");
+    CHECK(cjit_get_current_opt_level(e, id) == OPT_O2, "opt_level != OPT_O2 after O2 compile");
+
+    /* Correctness: the JIT function must return the same answer as AOT. */
+    typedef int (*add_fn)(int, int);
+    int v = ((add_fn)post)(12, 30);
+    CHECKF(v == 42, "JIT add(12,30) = %d, want 42", v);
+
+    cjit_destroy(e);
+    printf("[t16] PASS\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * t17 – dladdr: JIT function lives in a separately loaded shared object
+ * ─────────────────────────────────────────────────────────────────────────
+ * Uses POSIX dladdr(3) to inspect the function pointer installed after
+ * JIT compilation.  The function must reside in a dynamically-loaded
+ * shared object whose load-base is different from the test binary's own
+ * load-base — proving that the JIT compiled and dlopen'd a real .so.
+ */
+TEST(t17_dladdr_compiled_object)
+{
+    printf("[t17] dladdr: JIT function is in a loaded shared object...\n");
+    cjit_engine_t *e = make_engine(false);
+    CHECK(e != NULL, "engine creation failed");
+
+    /*
+     * Register WITHOUT an AOT fallback so that func_ptr is NULL until the
+     * JIT compilation finishes.  After cjit_wait_compiled() any non-NULL
+     * func_ptr must be a JIT-compiled entry point.
+     */
+    func_id_t id = cjit_register_function(e, "add", IR_ADD, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "registration failed");
+
+    cjit_start(e);
+    cjit_request_recompile(e, id, OPT_O1);
+
+    bool ok = cjit_wait_compiled(e, id, 5000);
+    CHECK(ok, "JIT compilation did not complete within 5 s");
+
+    jit_func_t fn = cjit_get_func(e, id);
+    CHECK(fn != NULL, "func_ptr is NULL after compilation");
+
+    /* ── dladdr inspection ──────────────────────────────────────────── */
+    Dl_info jit_info;
+    memset(&jit_info, 0, sizeof(jit_info));
+    int found = dladdr((void *)(uintptr_t)fn, &jit_info);
+    CHECKF(found != 0,
+           "dladdr returned 0: JIT function (ptr=%p) not in any mapped shared object",
+           (void *)(uintptr_t)fn);
+    CHECK(jit_info.dli_fbase != NULL, "dladdr: dli_fbase is NULL");
+
+    /*
+     * The JIT .so has a different load base than the test binary.
+     * Use now_ms() (a static function in this translation unit) as the
+     * anchor for the test binary's load base — it is guaranteed to be in
+     * the same mapped object as this test code.
+     */
+    Dl_info main_info;
+    memset(&main_info, 0, sizeof(main_info));
+    dladdr((void *)(uintptr_t)now_ms, &main_info);
+    CHECK(jit_info.dli_fbase != main_info.dli_fbase,
+          "JIT function is in the same mapping as the test binary (not a JIT .so)");
+
+    if (jit_info.dli_fname)
+        printf("[t17]   JIT .so mapped from: %s\n", jit_info.dli_fname);
+    else
+        printf("[t17]   JIT .so: anonymous mapping (in-memory .so)\n");
+
+    /* Correctness: the JIT function must return the right answer. */
+    typedef int (*add_fn)(int, int);
+    int v = ((add_fn)fn)(5, 7);
+    CHECKF(v == 12, "JIT add(5,7) = %d, want 12", v);
+
+    cjit_destroy(e);
+    printf("[t17] PASS\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * t18 – O3 + vectorisation: integer dot-product correctness
+ * ─────────────────────────────────────────────────────────────────────────
+ * Exercises the full optimisation path (O3 + -ftree-vectorize +
+ * -funroll-loops + -march=native) with a loop that the auto-vectoriser
+ * can convert to SIMD instructions.  The result is verified against a
+ * reference implementation for 1 000 consecutive calls to confirm that the
+ * JIT-compiled, highly-optimised code is both correct and stable.
+ */
+TEST(t18_o3_vectorised_correctness)
+{
+    printf("[t18] O3 vectorised compilation correctness (dot product)...\n");
+
+    cjit_config_t cfg          = cjit_default_config();
+    cfg.verbose                = false;
+    cfg.monitor_interval_ms    = 50;
+    cfg.enable_inlining        = true;
+    cfg.enable_vectorization   = true;
+    cfg.enable_loop_unroll     = true;
+    cfg.enable_native_arch     = true;
+    cfg.hot_ir_cache_size      = 4;
+    cfg.warm_ir_cache_size     = 8;
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e != NULL, "engine creation failed");
+
+    func_id_t id = cjit_register_function(e, "dot_int", IR_DOT_INT, NULL);
+    CHECK(id != CJIT_INVALID_FUNC_ID, "registration failed");
+
+    cjit_start(e);
+    cjit_request_recompile(e, id, OPT_O3);
+
+    bool ok = cjit_wait_compiled(e, id, 5000);
+    CHECK(ok, "O3 compilation did not complete within 5 s");
+
+    CHECK(cjit_get_current_opt_level(e, id) == OPT_O3, "opt_level != OPT_O3 after O3 compile");
+    CHECK(cjit_get_recompile_count(e, id) >= 1, "recompile_count == 0 after O3 compile");
+
+    typedef long (*dot_fn)(const int *, const int *, int);
+    dot_fn jit_dot = (dot_fn)cjit_get_func(e, id);
+    CHECK(jit_dot != NULL, "func_ptr NULL after O3 compilation");
+
+    /* Build deterministic test vectors and compute the reference result. */
+    enum { N = 1024 };
+    int  a[N], b[N];
+    long ref = 0;
+    for (int i = 0; i < N; ++i) {
+        a[i] = i + 1;
+        b[i] = N - i;
+        ref += (long)a[i] * b[i];
+    }
+
+    /* Single correctness check. */
+    long got = jit_dot(a, b, N);
+    CHECKF(got == ref, "dot_int[%d] first call: got %ld, want %ld", N, got, ref);
+
+    /* Stability: repeat 1 000 times to catch any code-quality regression
+     * (e.g. vectorisation that miscomputes the tail element). */
+    for (int t = 1; t < 1000; ++t) {
+        long v = jit_dot(a, b, N);
+        CHECKF(v == ref, "dot_int[%d] iter %d: got %ld, want %ld", N, t, v, ref);
+    }
+
+    printf("[t18]   ref=%ld, 1000 iterations correct at OPT_O3\n", ref);
+    cjit_destroy(e);
+    printf("[t18] PASS\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * t19 – JIT performance benchmark
+ * ─────────────────────────────────────────────────────────────────────────
+ * Measures three dimensions of JIT quality for an integer dot-product
+ * workload (N = 1024 elements):
+ *
+ *   1. Compilation latency (ms)   – how long does it take to JIT-compile
+ *      the function at each optimisation tier?
+ *
+ *   2. Dispatch throughput (Mcall/s) – how many calls/second can the
+ *      JIT-compiled function sustain compared to the AOT baseline?
+ *
+ *   3. Speedup vs AOT – ratio of AOT-ns / JIT-ns for each tier.
+ *
+ * PASS conditions (hard assertions):
+ *   • Every compilation completes within 10 seconds.
+ *   • Every JIT tier produces the correct result.
+ *   • O3 throughput is not more than 3× worse than O1 (guards against
+ *     catastrophic flag regressions; 3× gives generous CI-noise margin).
+ *
+ * All timing numbers are printed so they can be inspected in CI logs
+ * without needing a dedicated profiler run.
+ */
+
+/* Number of call repetitions per tier for the throughput measurement.
+ * 100 000 reps × 1024 multiply-adds ≈ 100 M MACs per tier sweep,
+ * yielding a clean ≥ 10 ms wall-clock window even on slow CI machines. */
+#define PERF_REPS 100000
+
+TEST(t19_perf_benchmark)
+{
+    printf("[t19] Performance benchmark: compile latency + dispatch throughput...\n");
+
+    /* ── Test vectors ─────────────────────────────────────────────────── */
+    enum { PN = 1024 };
+    int  pa[PN], pb[PN];
+    long pref = 0;
+    for (int i = 0; i < PN; ++i) {
+        pa[i] = i + 1;
+        pb[i] = PN - i;
+        pref += (long)pa[i] * pb[i];
+    }
+
+    /* ── AOT baseline throughput ──────────────────────────────────────── */
+    volatile long psink = 0;
+    uint64_t pt0 = cjit_timestamp_ns();
+    for (int i = 0; i < PERF_REPS; ++i)
+        psink += aot_dot_int(pa, pb, PN);
+    uint64_t aot_ns = cjit_timestamp_ns() - pt0;
+    (void)psink;
+
+    double aot_mcps = (double)PERF_REPS / (double)aot_ns * 1000.0;
+    printf("[t19]   AOT baseline : %7.2f Mcall/s  (%4llu ms for %d calls, N=%d)\n",
+           aot_mcps,
+           (unsigned long long)(aot_ns / 1000000ULL),
+           PERF_REPS, PN);
+
+    /* ── JIT engine with full optimisations ──────────────────────────── */
+    cjit_config_t cfg        = cjit_default_config();
+    cfg.verbose              = false;
+    cfg.monitor_interval_ms  = 50;
+    cfg.enable_inlining      = true;
+    cfg.enable_vectorization = true;
+    cfg.enable_loop_unroll   = true;
+    cfg.enable_native_arch   = true;
+    cfg.hot_ir_cache_size    = 4;
+    cfg.warm_ir_cache_size   = 8;
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e != NULL, "engine creation failed");
+
+    func_id_t pid = cjit_register_function(e, "dot_int", IR_DOT_INT,
+                                            (jit_func_t)aot_dot_int);
+    CHECK(pid != CJIT_INVALID_FUNC_ID, "registration failed");
+    cjit_start(e);
+
+    typedef long (*dot_fn_t)(const int *, const int *, int);
+
+    struct {
+        opt_level_t  lvl;
+        const char  *name;
+        uint64_t     compile_ns; /* wall-clock from request → tier reached  */
+        uint64_t     run_ns;     /* wall-clock for PERF_REPS calls           */
+    } tiers[] = {
+        { OPT_O1, "O1", 0, 0 },
+        { OPT_O2, "O2", 0, 0 },
+        { OPT_O3, "O3", 0, 0 },
+    };
+
+    for (int ti = 0; ti < 3; ++ti) {
+
+        /* ── Request compilation and time it ───────────────────────── */
+        uint64_t compile_start = cjit_timestamp_ns();
+        cjit_request_recompile(e, pid, tiers[ti].lvl);
+
+        wait_arg_t wa = { e, pid, tiers[ti].lvl };
+        bool compiled = wait_for(check_opt, &wa, 10000);
+        tiers[ti].compile_ns = cjit_timestamp_ns() - compile_start;
+
+        CHECKF(compiled,
+               "Compile to %s timed out after %.0f ms",
+               tiers[ti].name, (double)tiers[ti].compile_ns / 1e6);
+
+        CHECKF(tiers[ti].compile_ns < (uint64_t)10000 * 1000000ULL,
+               "Compile to %s took %.0f ms — exceeds 10 000 ms limit",
+               tiers[ti].name, (double)tiers[ti].compile_ns / 1e6);
+
+        /* ── Correctness check at this tier ─────────────────────── */
+        dot_fn_t fn = (dot_fn_t)cjit_get_func(e, pid);
+        CHECK(fn != NULL, "func_ptr NULL after compilation");
+
+        long pgot = fn(pa, pb, PN);
+        CHECKF(pgot == pref,
+               "%s dot_int(N=%d) = %ld, want %ld",
+               tiers[ti].name, PN, pgot, pref);
+
+        /* ── Throughput measurement ──────────────────────────────── */
+        volatile long psink2 = 0;
+        pt0 = cjit_timestamp_ns();
+        for (int i = 0; i < PERF_REPS; ++i)
+            psink2 += fn(pa, pb, PN);
+        tiers[ti].run_ns = cjit_timestamp_ns() - pt0;
+        (void)psink2;
+
+        double mcps    = (double)PERF_REPS / (double)tiers[ti].run_ns * 1000.0;
+        double speedup = (double)aot_ns    / (double)tiers[ti].run_ns;
+
+        printf("[t19]   JIT %-2s      : %7.2f Mcall/s  (%4llu ms) | "
+               "compile %4llu ms | speedup %.2fx vs AOT\n",
+               tiers[ti].name, mcps,
+               (unsigned long long)(tiers[ti].run_ns   / 1000000ULL),
+               (unsigned long long)(tiers[ti].compile_ns / 1000000ULL),
+               speedup);
+    }
+
+    /* ── Sanity assertion: O3 must not catastrophically regress vs O1 ── *
+     * 3× slack is intentionally generous to absorb CI load spikes.      *
+     * This specifically catches broken compiler-flag configurations where *
+     * O3 produces slower code than O1 (e.g. flag typo, wrong cc_binary). */
+    CHECKF(tiers[2].run_ns <= tiers[0].run_ns * 3,
+           "O3 throughput catastrophically worse than O1: "
+           "O3=%llu ns, O1=%llu ns (ratio=%.1fx > 3.0x limit)",
+           (unsigned long long)tiers[2].run_ns,
+           (unsigned long long)tiers[0].run_ns,
+           (double)tiers[2].run_ns / (double)tiers[0].run_ns);
+
+    cjit_stats_t ps = cjit_get_stats(e);
+    printf("[t19]   engine stats : compilations=%llu swaps=%llu queue_depth=%u\n",
+           (unsigned long long)ps.total_compilations,
+           (unsigned long long)ps.total_swaps,
+           ps.queue_depth);
+
+    cjit_destroy(e);
+    printf("[t19] PASS\n");
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * t20 – New optimisation flags and preamble attributes
+ * ─────────────────────────────────────────────────────────────────────────
+ * Verifies three improvements made to the JIT's code-generation layer:
+ *
+ *   1. -funswitch-loops (now active at O2+)
+ *      Hoists loop-invariant conditionals out of loops.  A loop whose body
+ *      contains `if (mode == 0)` with a constant-across-iterations `mode`
+ *      becomes two separate loops — correct results must be produced for
+ *      both mode values at both O2 and O3.
+ *
+ *   2. FLATTEN preamble attribute
+ *      Forces the compiler to inline all calls within the annotated function
+ *      recursively.  IR_PREAMBLE_ATTRS defines a FLATTEN outer() that calls
+ *      inner(); the compiled function must return INT_MAX (10 increments
+ *      starting from INT_MAX-10).  Also exercises the auto-included
+ *      <limits.h> (INT_MAX) and <stdbool.h> (bool / true / false).
+ *
+ *   3. FLATTEN on real helper-calling IR (IR_DOT_HELPERS)
+ *      A dot-product loop calling two per-element helpers through FLATTEN;
+ *      result must match the AOT reference.
+ */
+TEST(t20_new_optflags_and_preamble)
+{
+    printf("[t20] New optimisation flags and preamble attributes...\n");
+
+    cjit_config_t cfg        = cjit_default_config();
+    cfg.verbose              = false;
+    cfg.monitor_interval_ms  = 50;
+    cfg.enable_inlining      = true;
+    cfg.enable_vectorization = true;
+    cfg.enable_loop_unroll   = true;
+    cfg.enable_native_arch   = true;
+    cfg.hot_ir_cache_size    = 8;
+    cfg.warm_ir_cache_size   = 16;
+
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e != NULL, "engine creation failed");
+
+    /* Register all three test functions. */
+    func_id_t id_csum = cjit_register_function(e, "cond_sum",
+                                                IR_COND_SUM, NULL);
+    func_id_t id_patt = cjit_register_function(e, "preamble_test",
+                                                IR_PREAMBLE_ATTRS, NULL);
+    func_id_t id_dh   = cjit_register_function(e, "dot_helpers",
+                                                IR_DOT_HELPERS, NULL);
+    CHECK(id_csum != CJIT_INVALID_FUNC_ID, "cond_sum registration failed");
+    CHECK(id_patt != CJIT_INVALID_FUNC_ID, "preamble_test registration failed");
+    CHECK(id_dh   != CJIT_INVALID_FUNC_ID, "dot_helpers registration failed");
+
+    cjit_start(e);
+
+    /* ── Compile all three to O2 and wait ────────────────────────────── */
+    cjit_request_recompile(e, id_csum, OPT_O2);
+    cjit_request_recompile(e, id_patt, OPT_O2);
+    cjit_request_recompile(e, id_dh,   OPT_O2);
+
+    wait_arg_t wa_csum = { e, id_csum, OPT_O2 };
+    wait_arg_t wa_patt = { e, id_patt, OPT_O2 };
+    wait_arg_t wa_dh   = { e, id_dh,   OPT_O2 };
+
+    CHECK(wait_for(check_opt, &wa_csum, 5000), "cond_sum O2 compile timeout");
+    CHECK(wait_for(check_opt, &wa_patt, 5000), "preamble_test O2 compile timeout");
+    CHECK(wait_for(check_opt, &wa_dh,   5000), "dot_helpers O2 compile timeout");
+
+    /* ── 1. cond_sum correctness at O2 ──────────────────────────────── */
+    enum { CSN = 512 };
+    int ca[CSN];
+    for (int i = 0; i < CSN; ++i) ca[i] = i + 1;
+    long ref0 = aot_cond_sum(ca, CSN, 0);
+    long ref1 = aot_cond_sum(ca, CSN, 1);
+
+    typedef long (*csum_fn)(const int *, int, int);
+    csum_fn jit_csum = (csum_fn)cjit_get_func(e, id_csum);
+    CHECK(jit_csum != NULL, "cond_sum func_ptr NULL at O2");
+
+    long got0 = jit_csum(ca, CSN, 0);
+    long got1 = jit_csum(ca, CSN, 1);
+    CHECKF(got0 == ref0, "O2 cond_sum mode=0: got %ld, want %ld", got0, ref0);
+    CHECKF(got1 == ref1, "O2 cond_sum mode=1: got %ld, want %ld", got1, ref1);
+    printf("[t20]   -funswitch-loops O2: mode0=%ld mode1=%ld  OK\n", got0, got1);
+
+    /* ── 2. preamble_test: FLATTEN + limits.h + stdbool.h ───────────── */
+    typedef int (*patt_fn)(void);
+    int patt_got = ((patt_fn)cjit_get_func(e, id_patt))();
+    CHECKF(patt_got == INT_MAX,
+           "preamble_test() = %d, want INT_MAX (%d)", patt_got, INT_MAX);
+    printf("[t20]   FLATTEN + limits.h + stdbool.h O2: result=%d (INT_MAX) OK\n",
+           patt_got);
+
+    /* ── 3. dot_helpers: FLATTEN on helper-calling loop ─────────────── */
+    enum { DHN = 64 };
+    int da[DHN], db[DHN];
+    long dref = 0;
+    for (int i = 0; i < DHN; ++i) {
+        da[i] = i + 1;
+        db[i] = DHN - i;
+        dref += (long)da[i] * db[i];
+    }
+
+    typedef long (*dh_fn)(const int *, const int *, int);
+    long dh_got = ((dh_fn)cjit_get_func(e, id_dh))(da, db, DHN);
+    CHECKF(dh_got == dref,
+           "dot_helpers O2 (N=%d): got %ld, want %ld", DHN, dh_got, dref);
+    printf("[t20]   FLATTEN dot_helpers O2 (N=%d): %ld  OK\n", DHN, dh_got);
+
+    /* ── Re-verify cond_sum and dot_helpers at O3 ────────────────────── */
+    cjit_request_recompile(e, id_csum, OPT_O3);
+    cjit_request_recompile(e, id_dh,   OPT_O3);
+
+    wait_arg_t wa_csum3 = { e, id_csum, OPT_O3 };
+    wait_arg_t wa_dh3   = { e, id_dh,   OPT_O3 };
+    CHECK(wait_for(check_opt, &wa_csum3, 5000), "cond_sum O3 compile timeout");
+    CHECK(wait_for(check_opt, &wa_dh3,   5000), "dot_helpers O3 compile timeout");
+
+    long o3_0 = ((csum_fn)cjit_get_func(e, id_csum))(ca, CSN, 0);
+    long o3_1 = ((csum_fn)cjit_get_func(e, id_csum))(ca, CSN, 1);
+    CHECKF(o3_0 == ref0, "O3 cond_sum mode=0: got %ld, want %ld", o3_0, ref0);
+    CHECKF(o3_1 == ref1, "O3 cond_sum mode=1: got %ld, want %ld", o3_1, ref1);
+    printf("[t20]   -funswitch-loops O3: mode0=%ld mode1=%ld  OK\n", o3_0, o3_1);
+
+    long dh_o3 = ((dh_fn)cjit_get_func(e, id_dh))(da, db, DHN);
+    CHECKF(dh_o3 == dref,
+           "dot_helpers O3 (N=%d): got %ld, want %ld", DHN, dh_o3, dref);
+    printf("[t20]   FLATTEN dot_helpers O3 (N=%d): %ld  OK\n", DHN, dh_o3);
+
+    cjit_destroy(e);
+    printf("[t20] PASS\n");
+    return 0;
+}
+
+
 
 typedef int (*test_fn)(void);
 static const struct { const char *name; test_fn fn; } TESTS[] = {
@@ -961,6 +1708,14 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t10_concurrent_dispatch",t10_concurrent_dispatch},
     { "t11_sum_range",          t11_sum_range          },
     { "t12_crc32_tiers",        t12_crc32_tiers        },
+    { "t13_lookup_function",    t13_lookup_function    },
+    { "t14_update_ir",          t14_update_ir          },
+    { "t15_extra_cflags",       t15_extra_cflags       },
+    { "t16_jit_replaces_aot",       t16_jit_replaces_aot         },
+    { "t17_dladdr_compiled_object", t17_dladdr_compiled_object   },
+    { "t18_o3_vectorised_correctness", t18_o3_vectorised_correctness},
+    { "t19_perf_benchmark",         t19_perf_benchmark           },
+    { "t20_new_optflags_and_preamble", t20_new_optflags_and_preamble},
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 

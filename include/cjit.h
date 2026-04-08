@@ -75,6 +75,18 @@ extern "C" {
 #define CJIT_GRACE_PERIOD_MS    100
 
 /**
+ * Maximum length (including NUL) of the extra_cflags string in cjit_config_t.
+ * Used to size both the config field and CLI accumulation buffers so that all
+ * places that reference this limit stay in sync.
+ */
+#define CJIT_MAX_EXTRA_CFLAGS   512
+
+/**
+ * Maximum length (including NUL) of the cc_binary string in cjit_config_t.
+ */
+#define CJIT_MAX_CC_BINARY      64
+
+/**
  * Per-calling-thread TLS call-counter flush threshold.
  *
  * Each calling thread maintains a private per-function byte counter in
@@ -557,6 +569,27 @@ typedef struct {
      * 0 = disabled (default).  Units: nanoseconds/second.
      */
     uint64_t cpu_hot_ns_per_sec_t2;
+
+    /**
+     * Extra compiler flags (space-separated) passed verbatim to cc(1).
+     *
+     * Applied after all CJIT-generated flags so they can override defaults.
+     * Useful for -I include paths, -D preprocessor defines, -l libraries, etc.
+     * Example: "-I/usr/local/include -DNDEBUG -lm"
+     *
+     * Maximum length: CJIT_MAX_EXTRA_CFLAGS - 1 characters.
+     */
+    char extra_cflags[CJIT_MAX_EXTRA_CFLAGS];
+
+    /**
+     * Compiler binary override.
+     *
+     * Empty string (default) → "cc" found on PATH.
+     * Set to e.g. "gcc", "clang", or an absolute path like "/usr/bin/gcc-14".
+     *
+     * Maximum length: CJIT_MAX_CC_BINARY - 1 characters.
+     */
+    char cc_binary[CJIT_MAX_CC_BINARY];
 } cjit_config_t;
 
 /* ══════════════════════════════ runtime stats ═════════════════════════════ */
@@ -963,6 +996,66 @@ opt_level_t cjit_get_current_opt_level(const cjit_engine_t *engine,
  * @return        Recompile count, or 0 if id is invalid.
  */
 uint32_t cjit_get_recompile_count(const cjit_engine_t *engine, func_id_t id);
+
+/**
+ * Find a registered function by name.
+ *
+ * Performs a linear scan of the function table.  Not intended for hot-path
+ * use; suitable for setup-time lookups and diagnostics.
+ *
+ * @param engine  The engine.
+ * @param name    Exact function name as passed to cjit_register_function().
+ * @return        func_id_t of the matching function, or CJIT_INVALID_FUNC_ID
+ *                if not found or if name is NULL.
+ */
+func_id_t cjit_lookup_function(const cjit_engine_t *engine, const char *name);
+
+/**
+ * Replace the IR source for a registered function and trigger recompilation.
+ *
+ * The new IR is stored in the engine's IR cache and written to the on-disk
+ * backup so that a COLD-evicted entry is reloaded with the updated source.
+ * Any in-flight compile tasks queued against the old IR are invalidated via
+ * the per-entry version counter and silently discarded by compiler threads.
+ *
+ * Thread safety: safe to call while the engine is running.  Must NOT be
+ *                called concurrently with cjit_register_function() for the
+ *                same id.
+ *
+ * @param engine   The engine.
+ * @param id       ID of the function to update (from cjit_register_function).
+ * @param new_ir   New C source string to use as the function's IR.
+ * @param level    Optimisation level to request for the triggered recompile.
+ * @return         true on success, false if id is invalid or new_ir is NULL.
+ */
+bool cjit_update_ir(cjit_engine_t *engine,
+                    func_id_t      id,
+                    const char    *new_ir,
+                    opt_level_t    level);
+
+/**
+ * Block until the function at id has been JIT-compiled at least once
+ * (i.e. cjit_get_func() returns non-NULL), or until the timeout expires.
+ *
+ * Uses a condition variable — no busy-waiting.  Suitable for startup
+ * warm-up paths where you need the first compilation to complete before
+ * serving production traffic.
+ *
+ * When an AOT fallback was provided at registration time, cjit_get_func()
+ * returns the fallback pointer immediately and this function returns true
+ * immediately.  Use cjit_get_current_opt_level() to distinguish fallback
+ * (OPT_NONE) from JIT-compiled code (OPT_O1 / OPT_O2 / OPT_O3).
+ *
+ * @param engine      The engine.
+ * @param id          Function ID returned by cjit_register_function().
+ * @param timeout_ms  Maximum time to wait in milliseconds.
+ *                    0 = perform a single non-blocking check.
+ * @return            true if cjit_get_func(engine, id) is non-NULL within
+ *                    the timeout, false on timeout or invalid id.
+ */
+bool cjit_wait_compiled(cjit_engine_t *engine,
+                        func_id_t      id,
+                        uint32_t       timeout_ms);
 
 #ifdef __cplusplus
 }

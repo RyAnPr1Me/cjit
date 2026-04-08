@@ -143,6 +143,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <errno.h>
 #ifdef __linux__
 #include <sched.h>    /* sched_getaffinity, CPU_COUNT */
 #endif
@@ -271,6 +272,20 @@ struct cjit_engine {
     atomic_uint_fast64_t stat_compilations;
     atomic_uint_fast64_t stat_failed;
     atomic_uint_fast64_t stat_swaps;
+
+    /*
+     * Condition variable signaled after every compilation attempt (success or
+     * failure).  Used by cjit_wait_compiled() to block efficiently without
+     * busy-waiting until a function's func_ptr becomes non-NULL.
+     *
+     * Protocol:
+     *   Compiler thread: after func_table_swap (or on failed compile):
+     *     lock → broadcast → unlock
+     *   cjit_wait_compiled:
+     *     lock → while (func_ptr == NULL && !timedout) timedwait → unlock
+     */
+    pthread_mutex_t compile_done_mutex;
+    pthread_cond_t  compile_done_cond;
 };
 
 /* ══════════════════════════ internal helpers ══════════════════════════════ */
@@ -344,6 +359,8 @@ static void *compiler_thread_fn(void *raw_arg)
         .enable_native_arch   = engine->cfg.enable_native_arch,
         .enable_fast_math     = engine->cfg.enable_fast_math,
         .verbose              = engine->cfg.verbose,
+        .extra_cflags         = engine->cfg.extra_cflags[0] ? engine->cfg.extra_cflags : NULL,
+        .cc_binary            = engine->cfg.cc_binary[0]    ? engine->cfg.cc_binary    : NULL,
     };
 
     while (!atomic_load_explicit(&engine->stop_requested, memory_order_acquire)) {
@@ -501,6 +518,10 @@ static void *compiler_thread_fn(void *raw_arg)
             fprintf(stderr, "[cjit/compiler#%u] FAILED '%s': %s\n",
                     me, entry->name, cres.errmsg);
             pthread_mutex_unlock(&entry->compile_lock);
+            /* Wake any cjit_wait_compiled() caller so it can detect failure. */
+            pthread_mutex_lock(&engine->compile_done_mutex);
+            pthread_cond_broadcast(&engine->compile_done_cond);
+            pthread_mutex_unlock(&engine->compile_done_mutex);
             continue;
         }
 
@@ -517,6 +538,11 @@ static void *compiler_thread_fn(void *raw_arg)
 
         /* Retire old handle – GC thread dlclose's after the grace period. */
         dgc_retire(&engine->dgc, old_handle);
+
+        /* Wake any cjit_wait_compiled() caller now that func_ptr is live. */
+        pthread_mutex_lock(&engine->compile_done_mutex);
+        pthread_cond_broadcast(&engine->compile_done_cond);
+        pthread_mutex_unlock(&engine->compile_done_mutex);
 
         if (engine->cfg.verbose)
             fprintf(stderr,
@@ -1025,6 +1051,10 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
     pthread_mutex_init(&e->work_cond_mutex, NULL);
     pthread_cond_init(&e->work_cond, NULL);
 
+    /* Condition variable signaled after each compilation attempt. */
+    pthread_mutex_init(&e->compile_done_mutex, NULL);
+    pthread_cond_init(&e->compile_done_cond, NULL);
+
     /* Dynamic thread arrays. */
     e->compiler_threads = calloc(e->cfg.compiler_threads, sizeof(pthread_t));
     e->thread_args      = calloc(e->cfg.compiler_threads,
@@ -1113,6 +1143,9 @@ void cjit_destroy(cjit_engine_t *engine)
 
     pthread_cond_destroy(&engine->work_cond);
     pthread_mutex_destroy(&engine->work_cond_mutex);
+
+    pthread_cond_destroy(&engine->compile_done_cond);
+    pthread_mutex_destroy(&engine->compile_done_mutex);
 
     free(engine->work_queues);
     free(engine->compiler_threads);
@@ -1453,4 +1486,84 @@ uint32_t cjit_get_recompile_count(const cjit_engine_t *engine, func_id_t id)
     const func_table_entry_t *e = func_table_get(engine->ftable, id);
     if (!e) return 0;
     return atomic_load_explicit(&e->recompile_count, memory_order_relaxed);
+}
+
+func_id_t cjit_lookup_function(const cjit_engine_t *engine, const char *name)
+{
+    if (!engine || !name) return CJIT_INVALID_FUNC_ID;
+    uint32_t n = atomic_load_explicit(&engine->ftable->count,
+                                       memory_order_relaxed);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (strcmp(engine->ftable->entries[i].name, name) == 0)
+            return (func_id_t)i;
+    }
+    return CJIT_INVALID_FUNC_ID;
+}
+
+bool cjit_update_ir(cjit_engine_t *engine,
+                    func_id_t      id,
+                    const char    *new_ir,
+                    opt_level_t    level)
+{
+    if (!engine || !new_ir) return false;
+    func_table_entry_t *entry = func_table_get(engine->ftable, id);
+    if (!entry) return false;
+
+    /* Update the IR cache (updates both in-memory copy and on-disk backup). */
+    if (engine->ir_cache)
+        ir_cache_update_ir(engine->ir_cache, id, entry->name, new_ir);
+
+    /*
+     * Bump the version counter so any task already queued against the old IR
+     * is detected as stale by compiler threads and silently discarded.
+     *
+     * Reset cur_level to OPT_NONE so that the compiler thread's tier-skip
+     * check (cur_level >= task.target_level) never fires — we always want to
+     * recompile after an IR update regardless of the previous tier.
+     */
+    atomic_fetch_add_explicit(&entry->version, 1, memory_order_release);
+    atomic_store_explicit(&entry->cur_level, (int)OPT_NONE, memory_order_release);
+
+    /* Request recompilation at the specified level. */
+    cjit_request_recompile(engine, id, level);
+    return true;
+}
+
+bool cjit_wait_compiled(cjit_engine_t *engine,
+                        func_id_t      id,
+                        uint32_t       timeout_ms)
+{
+    if (!engine) return false;
+    func_table_entry_t *entry = func_table_get(engine->ftable, id);
+    if (!entry) return false;
+
+    /* Fast path: already compiled (or AOT fallback is set). */
+    if (atomic_load_explicit(&entry->func_ptr, memory_order_acquire) != NULL)
+        return true;
+
+    if (timeout_ms == 0)
+        return false;
+
+    /* Compute absolute deadline for pthread_cond_timedwait. */
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec  += (time_t)(timeout_ms / 1000);
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&engine->compile_done_mutex);
+    while (atomic_load_explicit(&entry->func_ptr, memory_order_acquire) == NULL) {
+        int rc = pthread_cond_timedwait(&engine->compile_done_cond,
+                                        &engine->compile_done_mutex,
+                                        &deadline);
+        if (rc == ETIMEDOUT)
+            break;
+    }
+    bool ready = (atomic_load_explicit(&entry->func_ptr, memory_order_acquire)
+                  != NULL);
+    pthread_mutex_unlock(&engine->compile_done_mutex);
+    return ready;
 }

@@ -248,6 +248,31 @@ bool ir_cache_register(ir_lru_cache_t *cache,
 char *ir_cache_get_ir(ir_lru_cache_t *cache, func_id_t func_id);
 
 /**
+ * Replace the IR source for a registered function.
+ *
+ * Updates both the in-memory copy (if the entry is currently HOT or WARM)
+ * and the on-disk backup.  If the entry is currently COLD it is promoted to
+ * WARM with the new IR so that the next compilation avoids a disk read.
+ *
+ * Called by cjit_update_ir() to support hot-reload of function IR at runtime.
+ *
+ * Thread safety: safe to call concurrently with compilations and dispatches.
+ *                Must NOT be called concurrently with ir_cache_register() for
+ *                the same func_id.
+ *
+ * @param cache      The IR cache.
+ * @param func_id    ID of the function to update.
+ * @param func_name  Function name (used to reconstruct the on-disk path).
+ * @param new_ir     New IR source string (a heap copy is made internally).
+ * @return           true on success, false on allocation failure or if
+ *                   func_id is not registered.
+ */
+bool ir_cache_update_ir(ir_lru_cache_t *cache,
+                         func_id_t       func_id,
+                         const char     *func_name,
+                         const char     *new_ir);
+
+/**
  * Submit a non-blocking async prefetch request for a function whose IR may
  * be COLD (on disk only).
  *

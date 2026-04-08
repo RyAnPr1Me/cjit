@@ -90,6 +90,40 @@ static const char CODEGEN_PREAMBLE[] =
     "#  define PREFETCH(addr, rw, loc)    __builtin_prefetch((addr), (rw), (loc))\n"
     /* Assume aligned: lets the compiler omit alignment-fixup code for SIMD. */
     "#  define ASSUME_ALIGNED(ptr, n)     __builtin_assume_aligned((ptr), (n))\n"
+    /*
+     * FLATTEN: forces the compiler to inline every function called from within
+     * the annotated function, recursively.  More powerful than ALWAYS_INLINE
+     * (which applies only to the immediate callee): a FLATTEN function becomes
+     * a single block of straight-line code with no internal call overhead at
+     * all.  Particularly useful for hot inner loops that call small helpers —
+     * apply it to the outer loop function to guarantee the helpers disappear.
+     */
+    "#  define FLATTEN                    __attribute__((flatten))\n"
+    /*
+     * NORETURN: annotates a function guaranteed never to return (e.g. one that
+     * calls exit() unconditionally or loops forever).  Allows the compiler to
+     * elide the return sequence at call sites and remove dead code after the
+     * call, reducing both binary size and branch overhead.
+     */
+    "#  define NORETURN                   __attribute__((noreturn))\n"
+    /*
+     * CJIT_EXPORT: explicitly marks a symbol as having default (exported)
+     * visibility so it remains accessible via dlsym() even when the
+     * translation unit is compiled with -fvisibility=hidden.  Without that
+     * flag all symbols have default visibility anyway, so CJIT_EXPORT is a
+     * no-op in normal builds.  It becomes useful when user IR passes
+     * -fvisibility=hidden via cfg.extra_cflags to hide internal helpers and
+     * only export the specific entry-point function the engine looks up.
+     */
+    "#  define CJIT_EXPORT                __attribute__((visibility(\"default\")))\n"
+    /*
+     * MALLOC_FUNC: asserts that the annotated function returns a freshly-
+     * allocated pointer that is not aliased by any other live pointer in the
+     * program.  Enables the alias analyser to eliminate many conservative
+     * load/store assumptions when the caller uses the returned pointer,
+     * allowing aggressive reordering and vectorisation of subsequent code.
+     */
+    "#  define MALLOC_FUNC                __attribute__((malloc))\n"
     "#else\n"
     "#  define LIKELY(x)                  (x)\n"
     "#  define UNLIKELY(x)                (x)\n"
@@ -103,10 +137,24 @@ static const char CODEGEN_PREAMBLE[] =
     "#  define RESTRICT\n"
     "#  define PREFETCH(addr, rw, loc)    ((void)(addr))\n"
     "#  define ASSUME_ALIGNED(ptr, n)     (ptr)\n"
+    "#  define FLATTEN\n"
+    "#  define NORETURN\n"
+    "#  define CJIT_EXPORT\n"
+    "#  define MALLOC_FUNC\n"
     "#endif\n"
     "#include <stdint.h>\n"
     "#include <string.h>\n"
     "#include <stdlib.h>\n"
+    /*
+     * <limits.h>: provides INT_MAX, INT_MIN, LONG_MAX, etc.  Commonly
+     * required for overflow guards and sentinel values in JIT functions.
+     */
+    "#include <limits.h>\n"
+    /*
+     * <stdbool.h>: provides bool, true, false in C99/C11.  In C23 these are
+     * built-in keywords and the header is a no-op; including it is always safe.
+     */
+    "#include <stdbool.h>\n"
     "#endif /* CJIT_PREAMBLE_H */\n";
 
 /* ─────────────────────────── optimisation flags ───────────────────────────── */
@@ -114,13 +162,15 @@ static const char CODEGEN_PREAMBLE[] =
 /**
  * Maximum number of arguments passed to the compiler subprocess.
  *
- * cc(1) + -shared + -fPIC + opt-level + up to 10 optional flags +
- * JIT-specific flags (-fno-stack-protector, -fno-asynchronous-unwind-tables) +
- * -w + -o + so_path + -x + c + src_path + NULL = at most 22 entries.
- * When argument specialisation is active, two more entries are added
- * (-D <func=_cjit_i_func>).  40 gives comfortable headroom.
+ * cc(1) + -shared + -fPIC + opt-level + up to 14 optional flags
+ * (including -funswitch-loops, -fpeel-loops) +
+ * JIT-specific flags (-fno-stack-protector, -fno-asynchronous-unwind-tables,
+ * -fno-ident) + -w + -o + so_path + -x + c + src_path + NULL = at most 26
+ * entries.  When argument specialisation is active, two more entries are
+ * added (-D <func=_cjit_i_func>).  Extra user flags (extra_cflags) may add
+ * up to ~50 more tokens.  96 gives comfortable headroom.
  */
-#define MAX_CC_ARGS 40
+#define MAX_CC_ARGS 96
 
 /**
  * Build the compiler argv array for posix_spawnp().
@@ -136,7 +186,8 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
                                 const codegen_opts_t *opts)
 {
     int n = 0;
-    argv[n++] = "cc";
+    argv[n++] = (opts && opts->cc_binary && opts->cc_binary[0])
+                    ? opts->cc_binary : "cc";
     argv[n++] = "-shared";
     argv[n++] = "-fPIC";
 
@@ -165,6 +216,40 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
     if (level >= OPT_O1) {
         argv[n++] = "-fomit-frame-pointer";
         argv[n++] = "-fno-semantic-interposition";
+
+        /*
+         * -mtune=native: schedule instructions for the CPU that is actually
+         * running this JIT engine.  Unlike -march=native, this does NOT change
+         * the instruction set (the binary is still baseline x86-64, ARM64,
+         * etc.), so it is always safe to emit.  It improves throughput for all
+         * JIT-compiled code by choosing pipeline-optimal instruction ordering,
+         * register allocation hints, and branch alignment for the host µarch.
+         */
+        argv[n++] = "-mtune=native";
+
+#ifdef __linux__
+        /*
+         * -fno-plt: replace PLT indirection stubs with direct GOT-relative
+         * calls for any external functions called from within JIT code (e.g.
+         * malloc, memcpy, libc helpers).
+         *
+         * Without this flag: call → PLT stub → GOT load → function  (2 hops)
+         * With this flag:    call *GOT_entry@GOTPCREL(%rip)           (1 hop)
+         *
+         * The saving is one indirect-branch instruction and one potential
+         * branch-target-buffer miss per unique external call site.  For
+         * JIT functions that call many libc routines this is a measurable
+         * win at zero correctness risk, because:
+         *   (a) We already dlopen() with RTLD_NOW so all GOT entries are
+         *       fully resolved before any JIT code executes.
+         *   (b) We use RTLD_LOCAL so there is no inter-.so PLT sharing.
+         *
+         * Linux/ELF only.  Mach-O (macOS) uses a different ABI and does
+         * not recognise this flag.  On non-Linux platforms the `#ifdef`
+         * simply skips it — no error, just the optimisation is omitted.
+         */
+        argv[n++] = "-fno-plt";
+#endif
     }
 
     if (opts->enable_inlining && level >= OPT_O2)
@@ -175,6 +260,36 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
 
     if (opts->enable_vectorization && level >= OPT_O2)
         argv[n++] = "-ftree-vectorize";
+
+    if (level >= OPT_O2) {
+        /*
+         * -funswitch-loops: hoist loop-invariant conditionals out of the loop
+         * body.  When a loop contains `if (mode == 0) { … } else { … }` and
+         * `mode` does not change across iterations, the compiler emits two
+         * separate loops (one per branch) rather than re-testing the condition
+         * on every iteration.  The result is fewer branch mispredictions, a
+         * tighter inner loop, and better vectorisation opportunities.
+         *
+         * GCC enables this only at -O3 by default; we apply it at O2 as well
+         * since JIT workloads very commonly contain dispatch-style inner loops
+         * with invariant flag or mode parameters.
+         */
+        argv[n++] = "-funswitch-loops";
+
+        /*
+         * -fpeel-loops: peel the first (and last) iterations from loops where
+         * the compiler has high confidence they execute very few times — either
+         * from profile feedback or when the trip count is statically known and
+         * small (e.g. a 3-iteration initialisation loop becomes straight-line
+         * code).  Peeling the first iteration also often achieves better
+         * alignment for the main loop body, reducing the cycle cost of the
+         * hot path.
+         *
+         * GCC enables this only at -O3 by default; we apply it at O2 for the
+         * same reasons as -funswitch-loops.
+         */
+        argv[n++] = "-fpeel-loops";
+    }
 
     if (opts->enable_native_arch && level >= OPT_O3)
         argv[n++] = "-march=native";
@@ -199,6 +314,15 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
      */
     argv[n++] = "-fno-stack-protector";
     argv[n++] = "-fno-asynchronous-unwind-tables";
+
+    /*
+     * -fno-ident: suppress the `.comment` ELF section that GCC and Clang
+     * normally emit into every compiled object.  This section contains the
+     * compiler version string (e.g. "GCC: (GNU) 13.2.0") and is never read
+     * at runtime.  Removing it makes each JIT .so a few hundred bytes smaller
+     * and reduces the amount of data that dlopen() must map and process.
+     */
+    argv[n++] = "-fno-ident";
 
     argv[n++] = "-w";   /* suppress warnings from user snippets */
     argv[n++] = "-o";
@@ -752,16 +876,36 @@ bool codegen_compile(const char          *func_name,
     const char *cc_argv[MAX_CC_ARGS];
     char err_path[304];
     snprintf(err_path, sizeof(err_path), "%s.err", prefix);
-    build_compiler_argv(cc_argv, so_path, src_path, level, opts);
+    int n_argv = build_compiler_argv(cc_argv, so_path, src_path, level, opts);
 
-    if (opts->verbose) {
+    /* Append extra_cflags tokens (e.g. -I/path, -DFOO, -lm).
+     * strtok needs a mutable buffer; we copy into a local array on the stack.
+     * Tokens point into this buffer so they are valid until after waitpid. */
+    char extra_flags_buf[CJIT_MAX_EXTRA_CFLAGS];
+    extra_flags_buf[0] = '\0';
+    if (opts && opts->extra_cflags && opts->extra_cflags[0]) {
+        strncpy(extra_flags_buf, opts->extra_cflags, sizeof(extra_flags_buf) - 1);
+        extra_flags_buf[sizeof(extra_flags_buf) - 1] = '\0';
+        char *tok = strtok(extra_flags_buf, " \t");
+        while (tok && n_argv < MAX_CC_ARGS - 1) {
+            cc_argv[n_argv++] = tok;
+            tok = strtok(NULL, " \t");
+        }
+    }
+    cc_argv[n_argv] = NULL;  /* always ensure NULL-terminator for posix_spawnp */
+
+    /* Determine which compiler binary to invoke. */
+    const char *cc_bin = (opts && opts->cc_binary && opts->cc_binary[0])
+                             ? opts->cc_binary : "cc";
+
+    if (opts && opts->verbose) {
         fprintf(stderr, "[cjit/codegen] compile:");
         for (int _i = 0; cc_argv[_i]; ++_i)
             fprintf(stderr, " %s", cc_argv[_i]);
         fprintf(stderr, " 2>%s\n", err_path);
     }
 
-    /* ── 4. Spawn the compiler (no shell intermediate) ────────────────── */
+    /* ── 5. Spawn the compiler (no shell intermediate) ────────────────── */
     /*
      * posix_spawnp avoids the /bin/sh intermediate step that system() requires
      * (fork → exec /bin/sh → exec cc → waitpid becomes fork → exec cc → waitpid).
@@ -776,14 +920,15 @@ bool codegen_compile(const char          *func_name,
                                      O_WRONLY | O_CREAT | O_TRUNC, 0600);
 
     pid_t cc_pid;
-    int spawn_err = posix_spawnp(&cc_pid, "cc", &fa, NULL,
+    int spawn_err = posix_spawnp(&cc_pid, cc_bin, &fa, NULL,
                                   (char *const *)cc_argv, environ);
     posix_spawn_file_actions_destroy(&fa);
 
     int rc;
     if (spawn_err != 0) {
         snprintf(result->errmsg, sizeof(result->errmsg),
-                 "codegen: posix_spawnp failed: %s", strerror(spawn_err));
+                 "codegen: posix_spawnp(%s) failed: %s", cc_bin,
+                 strerror(spawn_err));
         if (src_is_memfd) close(src_fd); else unlink(src_path);
         free(wrapper_src);
         return false;
@@ -800,16 +945,26 @@ bool codegen_compile(const char          *func_name,
     wrapper_src = NULL;
 
     if (rc != 0) {
-        /* Capture compiler error output from the per-invocation error file. */
+        /*
+         * Print the full compiler error output to stderr immediately so the
+         * user sees the complete diagnostics.  Additionally store up to
+         * sizeof(errmsg)-1 bytes in result->errmsg for the caller's log line.
+         */
         FILE *ef = fopen(err_path, "r");
         if (ef) {
+            /* Stream full output to stderr first. */
+            char line[256];
+            while (fgets(line, sizeof(line), ef))
+                fputs(line, stderr);
+            /* Rewind and store first chunk in errmsg for structured logging. */
+            rewind(ef);
             size_t nr = fread(result->errmsg,
                               1, sizeof(result->errmsg) - 1, ef);
             result->errmsg[nr] = '\0';
             fclose(ef);
         } else {
             snprintf(result->errmsg, sizeof(result->errmsg),
-                     "codegen: cc exited with code %d", rc);
+                     "codegen: %s exited with error %d", cc_bin, rc);
         }
         unlink(err_path);
         unlink(so_path);
