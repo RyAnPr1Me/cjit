@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #endif
 #include "codegen.h"
+#include "codegen_cache.h"
 #include "func_table.h"   /* CJIT_NAME_MAX */
 
 #include <stdio.h>       /* FILE, fopen, fclose, snprintf, fprintf */
@@ -18,6 +19,7 @@
 #include <pthread.h>     /* pthread_self                           */
 #include <dlfcn.h>       /* dlopen, dlsym, dlerror                */
 #include <sys/types.h>
+#include <sys/stat.h>     /* stat, S_ISDIR                         */
 #include <sys/wait.h>     /* waitpid           */
 #include <spawn.h>        /* posix_spawnp      */
 #include <fcntl.h>        /* O_WRONLY etc.     */
@@ -56,7 +58,41 @@ static int cg_memfd_create(const char *name) { (void)name; return -1; }
 #  endif /* __NR_memfd_create */
 #endif /* __linux__ */
 
-/* ─────────────────────────── preamble injected before user IR ─────────────── */
+/* ─────────────────────────── output tmpdir selection ───────────────────────── */
+
+/**
+ * Return the best available temporary directory for .so output files.
+ *
+ * On Linux, /dev/shm is a RAM-backed tmpfs that avoids any real-disk I/O for
+ * the compiled shared object.  On systems where /tmp is itself a tmpfs (most
+ * modern Linux distributions) the difference is negligible, but on systems
+ * with a disk-backed /tmp the saving is measurable: a typical 20-40 KB JIT
+ * .so file avoids an inode create, a write, a dlopen (read), and an unlink —
+ * all against a spinning disk instead of RAM.
+ *
+ * The probe is performed once and cached in an atomic flag to avoid repeated
+ * stat(2) calls.  The benign race (two threads computing the same result
+ * simultaneously) converges within one call.
+ *
+ * On non-Linux systems /tmp is always returned.
+ */
+static const char *cg_so_tmpdir(void)
+{
+#ifdef __linux__
+    /* -1 = unknown, 0 = /tmp, 1 = /dev/shm */
+    static _Atomic int shm_available = -1;
+    int av = atomic_load_explicit(&shm_available, memory_order_relaxed);
+    if (av < 0) {
+        struct stat st;
+        av = (stat("/dev/shm", &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+        atomic_store_explicit(&shm_available, av, memory_order_relaxed);
+    }
+    if (av) return "/dev/shm";
+#endif
+    return "/tmp";
+}
+
+
 
 /**
  * Helper macros injected at the top of every compiled translation unit.
@@ -323,6 +359,17 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
      * and reduces the amount of data that dlopen() must map and process.
      */
     argv[n++] = "-fno-ident";
+
+    /*
+     * -pipe: instruct the compiler to use pipes instead of temporary files for
+     * communication between compilation stages (preprocessor → compiler →
+     * assembler).  This eliminates multiple temporary-file round-trips through
+     * the filesystem for every JIT compilation and is particularly beneficial
+     * on systems where /tmp is disk-backed.  The flag is safe and well-supported
+     * by both GCC and Clang; it has no effect on the correctness or semantics
+     * of the compiled output.
+     */
+    argv[n++] = "-pipe";
 
     argv[n++] = "-w";   /* suppress warnings from user snippets */
     argv[n++] = "-o";
@@ -706,7 +753,7 @@ static size_t generate_spec_wrapper(const char *func_name,
 static atomic_uint_fast64_t codegen_serial = 0;
 
 /**
- * Generate a unique prefix for temp files of the form:
+ * Generate a unique prefix for source temp files (src, err) of the form:
  *   /tmp/cjit_<pid>_<tid>_<serial>
  *
  * Using both pid and tid ensures uniqueness across processes AND threads.
@@ -719,6 +766,39 @@ static void make_temp_prefix(char *buf, size_t sz)
              (int)getpid(),
              (unsigned long)pthread_self(),
              (unsigned long long)serial);
+}
+
+/**
+ * Generate a unique path for the compiled .so output file.
+ *
+ * Uses /dev/shm when available on Linux (RAM-backed tmpfs, zero disk I/O).
+ * Falls back to /tmp on any other platform or when /dev/shm is unavailable.
+ *
+ * The serial counter is shared with make_temp_prefix() so each compilation
+ * invocation produces a consistent pair of uniquely numbered temp paths.
+ */
+static void make_so_path(char *buf, size_t sz)
+{
+    uint64_t serial = atomic_fetch_add_explicit(&codegen_serial, 1,
+                                                memory_order_relaxed);
+    snprintf(buf, sz, "%s/cjit_%d_%lu_%llu.so",
+             cg_so_tmpdir(),
+             (int)getpid(),
+             (unsigned long)pthread_self(),
+             (unsigned long long)serial);
+}
+
+/* ─────────────────────────── level-to-string helper ───────────────────────── */
+
+static const char *level_to_str(opt_level_t level)
+{
+    switch (level) {
+    case OPT_NONE: return "O0";
+    case OPT_O1:   return "O1";
+    case OPT_O2:   return "O2";
+    case OPT_O3:   return "O3";
+    default:       return "O2";
+    }
 }
 
 /* ─────────────────────────── main compilation ──────────────────────────────── */
@@ -734,15 +814,13 @@ bool codegen_compile(const char          *func_name,
     result->success = false;
     result->errmsg[0] = '\0';
 
-    /* ── 1. Choose temp-file paths ─────────────────────────────────────── */
-    char prefix[256];
-    make_temp_prefix(prefix, sizeof(prefix));
-
-    char so_path[300];
-    snprintf(so_path, sizeof(so_path), "%s.so", prefix);
-
-    /* ── 2. Optionally generate an argument-specialisation wrapper ────── */
+    /* ── 1. Optionally generate an argument-specialisation wrapper ─────── */
     /*
+     * The wrapper must be generated BEFORE the cache check so that the cache
+     * key includes the wrapper text.  Specialised and unspecialised
+     * compilations for the same IR at the same level produce different
+     * binaries; they must have different cache entries.
+     *
      * If opts->arg_profile is set and parse_func_sig() finds a confident
      * dominant value on any integer-typed parameter, we:
      *   (a) prepend a specialised wrapper that fast-paths the common value;
@@ -792,7 +870,80 @@ bool codegen_compile(const char          *func_name,
         }
     }
 
-    /* ── 3. Write preamble [+ wrapper] + user source ─────────────────── */
+    /* ── 2. Compiled-artifact cache lookup ────────────────────────────── */
+    /*
+     * Check whether this exact compilation (same IR, same preamble, same
+     * flags, same level) has been compiled before.  On a hit we dlopen the
+     * cached .so directly, skipping the compiler spawn entirely.
+     *
+     * The cache key is computed from all inputs that affect the compiled
+     * binary: preamble, specialisation wrapper + define, user IR, opt level,
+     * extra compiler flags, and compiler binary name.  Two compilations that
+     * differ in any of these fields produce different keys and never collide.
+     */
+    char     cache_path[512];
+    uint64_t cache_key = 0;
+    bool     have_cache = (opts && opts->cache != NULL);
+
+    if (have_cache) {
+        const char *cc = (opts->cc_binary && opts->cc_binary[0])
+                             ? opts->cc_binary : "cc";
+        cache_key = codegen_cache_key(
+            CODEGEN_PREAMBLE,
+            wrapper_src,
+            spec_define[0] ? spec_define : NULL,
+            c_source,
+            level_to_str(level),
+            (opts->extra_cflags && opts->extra_cflags[0]) ? opts->extra_cflags : NULL,
+            cc);
+
+        if (codegen_cache_lookup(opts->cache, cache_key,
+                                  cache_path, sizeof(cache_path))) {
+            /*
+             * Cache hit: try to dlopen directly from the cached path.
+             *
+             * If dlopen fails (stale entry, wrong architecture, file removed
+             * between access() and dlopen()), fall through to normal
+             * compilation.  The stale file will be overwritten by the next
+             * successful store of the same key.
+             */
+            dlerror();
+            void *handle = dlopen(cache_path, RTLD_NOW | RTLD_LOCAL);
+            if (handle) {
+                dlerror();
+                void *sym = dlsym(handle, func_name);
+                const char *err = dlerror();
+                if (!err && sym) {
+                    free(wrapper_src);
+                    result->fn      = (jit_func_t)(uintptr_t)sym;
+                    result->handle  = handle;
+                    result->success = true;
+                    if (opts->verbose)
+                        fprintf(stderr,
+                                "[cjit/codegen] cache hit '%s' O%d → %p\n",
+                                func_name, (int)level,
+                                (void *)(uintptr_t)result->fn);
+                    return true;
+                }
+                /* Symbol not found in cached .so (unlikely). */
+                dlclose(handle);
+            }
+            /* dlopen failed: log and fall through to recompile. */
+            if (opts->verbose)
+                fprintf(stderr,
+                        "[cjit/codegen] cache hit stale for '%s' O%d, recompiling\n",
+                        func_name, (int)level);
+        }
+    }
+
+    /* ── 3. Choose temp-file paths ─────────────────────────────────────── */
+    char prefix[256];
+    make_temp_prefix(prefix, sizeof(prefix));
+
+    char so_path[300];
+    make_so_path(so_path, sizeof(so_path));
+
+    /* ── 4. Write preamble [+ wrapper] + user source ─────────────────── */
     /*
      * On Linux, write the source into an anonymous in-memory file created
      * with memfd_create(2).  The file is exposed to the compiler via its
@@ -872,24 +1023,28 @@ bool codegen_compile(const char          *func_name,
         fclose(f);
     }
 
-    /* ── 4. Build compiler argv ──────────────────────────────────────── */
+    /* ── 5. Build compiler argv ──────────────────────────────────────── */
     const char *cc_argv[MAX_CC_ARGS];
     char err_path[304];
     snprintf(err_path, sizeof(err_path), "%s.err", prefix);
     int n_argv = build_compiler_argv(cc_argv, so_path, src_path, level, opts);
 
     /* Append extra_cflags tokens (e.g. -I/path, -DFOO, -lm).
-     * strtok needs a mutable buffer; we copy into a local array on the stack.
-     * Tokens point into this buffer so they are valid until after waitpid. */
+     * strtok_r is used (not strtok) because codegen_compile() may be invoked
+     * concurrently from multiple compiler threads; strtok's internal static
+     * state is not thread-safe.
+     * Tokens point into extra_flags_buf (stack) and are valid until after
+     * waitpid completes. */
     char extra_flags_buf[CJIT_MAX_EXTRA_CFLAGS];
     extra_flags_buf[0] = '\0';
     if (opts && opts->extra_cflags && opts->extra_cflags[0]) {
         strncpy(extra_flags_buf, opts->extra_cflags, sizeof(extra_flags_buf) - 1);
         extra_flags_buf[sizeof(extra_flags_buf) - 1] = '\0';
-        char *tok = strtok(extra_flags_buf, " \t");
+        char *saveptr = NULL;
+        char *tok = strtok_r(extra_flags_buf, " \t", &saveptr);
         while (tok && n_argv < MAX_CC_ARGS - 1) {
             cc_argv[n_argv++] = tok;
-            tok = strtok(NULL, " \t");
+            tok = strtok_r(NULL, " \t", &saveptr);
         }
     }
     cc_argv[n_argv] = NULL;  /* always ensure NULL-terminator for posix_spawnp */
@@ -905,7 +1060,7 @@ bool codegen_compile(const char          *func_name,
         fprintf(stderr, " 2>%s\n", err_path);
     }
 
-    /* ── 5. Spawn the compiler (no shell intermediate) ────────────────── */
+    /* ── 6. Spawn the compiler (no shell intermediate) ────────────────── */
     /*
      * posix_spawnp avoids the /bin/sh intermediate step that system() requires
      * (fork → exec /bin/sh → exec cc → waitpid becomes fork → exec cc → waitpid).
@@ -973,7 +1128,7 @@ bool codegen_compile(const char          *func_name,
 
     unlink(err_path);  /* remove even on success (may not exist if cc was quiet) */
 
-    /* ── 5. dlopen the shared object ─────────────────────────────────── */
+    /* ── 7. dlopen the shared object ─────────────────────────────────── */
     void *handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
         snprintf(result->errmsg, sizeof(result->errmsg),
@@ -983,14 +1138,37 @@ bool codegen_compile(const char          *func_name,
     }
 
     /*
-     * Unlink immediately after dlopen.
-     * The kernel keeps the inode (and therefore the mapped pages) alive as
-     * long as the dlopen handle is open.  This prevents temp-file leaks if
-     * the process crashes.
+     * Persist the compiled artifact to the cache (if enabled) BEFORE
+     * unlinking so_path.
+     *
+     * codegen_cache_store() performs an atomic rename() of so_path into the
+     * cache directory.  After the rename:
+     *   • so_path no longer exists on the filesystem.
+     *   • The cached entry at cache_path points to the same inode.
+     *   • The dlopen handle (acquired above) is inode-based and remains valid
+     *     regardless of the file's directory entry — the kernel keeps the
+     *     mapping alive as long as any handle is open.
+     *   • Future dlopen(cache_path) calls will use the persisted file.
+     *
+     * On failure (cross-device copy fails, or any other error), fall back to
+     * the normal unlink so the inode is reclaimed on close.
      */
-    unlink(so_path);
+    bool so_disposed = false;
+    if (have_cache) {
+        if (codegen_cache_store(opts->cache, cache_key, so_path))
+            so_disposed = true;  /* store consumed so_path (rename or copy+unlink) */
+    }
+    if (!so_disposed) {
+        /*
+         * Either caching is disabled, or the store failed.  Unlink the temp
+         * file: the kernel keeps the inode alive through the dlopen handle,
+         * and reclaims it automatically when the handle is closed (process
+         * crash included).
+         */
+        unlink(so_path);
+    }
 
-    /* ── 6. dlsym to find the function ───────────────────────────────── */
+    /* ── 8. dlsym to find the function ───────────────────────────────── */
     dlerror(); /* clear any old error */
     void *sym = dlsym(handle, func_name);
     const char *err = dlerror();
@@ -1001,7 +1179,7 @@ bool codegen_compile(const char          *func_name,
         return false;
     }
 
-    /* ── 7. Success ──────────────────────────────────────────────────── */
+    /* ── 9. Success ──────────────────────────────────────────────────── */
     /*
      * C99 / POSIX: converting between function and data pointers via void*
      * is implementation-defined, but dlsym() returning a function pointer

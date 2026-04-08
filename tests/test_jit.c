@@ -62,6 +62,11 @@
  *                                        includes by compiling representative
  *                                        IR at O2 and O3 and checking all
  *                                        results against AOT references.
+ *   t21  Artifact cache            – compiles a function twice using the same
+ *                                        persistent cache directory; verifies
+ *                                        pass-1 is a cache miss (compiler ran),
+ *                                        pass-2 is a cache hit (compiler skipped),
+ *                                        and the function returns correct results.
  *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).
@@ -1694,6 +1699,131 @@ TEST(t20_new_optflags_and_preamble)
 
 
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * t21 – Artifact cache: second compilation of identical IR is a cache hit
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Strategy:
+ *   1. Create an engine with a temporary cache directory.
+ *   2. Register and compile a function (cold miss → compiler subprocess).
+ *   3. Destroy the engine (releases handles but leaves cache on disk).
+ *   4. Create a NEW engine pointing at the SAME cache directory.
+ *   5. Register and compile the same function again.
+ *   6. Verify: artifact_cache_hits == 1, total_compilations == 1 (cached hit
+ *      bypasses the compiler subprocess so no additional compilation counter
+ *      is incremented), and the function returns the correct result.
+ */
+TEST(t21_artifact_cache)
+{
+    printf("[t21] Artifact cache: warm-hit skips compiler subprocess...\n");
+
+    /* Use a unique temporary directory scoped to this test run. */
+    char cache_dir[256];
+    snprintf(cache_dir, sizeof(cache_dir), "/tmp/cjit_test_cache_%d", (int)getpid());
+
+    /* ── Pass 1: cold miss → compiler runs, result cached ────────────── */
+    {
+        cjit_config_t cfg = cjit_default_config();
+        cfg.compiler_threads = 1;
+        snprintf(cfg.cache_dir, sizeof(cfg.cache_dir), "%s", cache_dir);
+
+        cjit_engine_t *e = cjit_create(&cfg);
+        CHECK(e, "cjit_create (pass 1) returned NULL");
+        cjit_start(e);
+
+        /* Register WITHOUT an AOT fallback so cjit_wait_compiled() waits for
+         * the actual JIT compilation (not just the pre-set fallback pointer). */
+        func_id_t id = cjit_register_function(e, "add", IR_ADD, NULL);
+        CHECK(id != CJIT_INVALID_FUNC_ID, "register failed (pass 1)");
+
+        cjit_request_recompile(e, id, OPT_O1);
+        bool ok = cjit_wait_compiled(e, id, 5000);
+        CHECK(ok, "cjit_wait_compiled timed out (pass 1)");
+
+        cjit_stats_t s = cjit_get_stats(e);
+        CHECKF(s.artifact_cache_misses == 1,
+               "pass 1: expected 1 cache miss, got %llu",
+               (unsigned long long)s.artifact_cache_misses);
+        CHECKF(s.artifact_cache_hits == 0,
+               "pass 1: expected 0 cache hits, got %llu",
+               (unsigned long long)s.artifact_cache_hits);
+        printf("[t21]   pass 1 miss=1 hit=0  OK\n");
+
+        cjit_destroy(e);
+    }
+
+    /* ── Pass 2: warm hit → cached .so reused, no compiler spawn ─────── */
+    {
+        cjit_config_t cfg = cjit_default_config();
+        cfg.compiler_threads = 1;
+        snprintf(cfg.cache_dir, sizeof(cfg.cache_dir), "%s", cache_dir);
+
+        cjit_engine_t *e = cjit_create(&cfg);
+        CHECK(e, "cjit_create (pass 2) returned NULL");
+        cjit_start(e);
+
+        /* Register WITHOUT an AOT fallback — same as pass 1 — so that
+         * cjit_wait_compiled() blocks until the cache-hit dlopen completes. */
+        typedef int (*add_fn)(int, int);
+        func_id_t id = cjit_register_function(e, "add", IR_ADD, NULL);
+        CHECK(id != CJIT_INVALID_FUNC_ID, "register failed (pass 2)");
+
+        cjit_request_recompile(e, id, OPT_O1);
+        bool ok = cjit_wait_compiled(e, id, 5000);
+        CHECK(ok, "cjit_wait_compiled timed out (pass 2)");
+
+        /* Verify correctness: JIT function must return the right answer. */
+        add_fn fn = (add_fn)(uintptr_t)cjit_get_func_counted(e, id);
+        CHECK(fn, "add function pointer NULL after warm-hit");
+        CHECKF(fn(3, 4) == 7, "add(3,4) expected 7, got %d", fn(3, 4));
+        CHECKF(fn(-1, 1) == 0, "add(-1,1) expected 0, got %d", fn(-1, 1));
+
+        cjit_stats_t s = cjit_get_stats(e);
+        CHECKF(s.artifact_cache_hits == 1,
+               "pass 2: expected 1 cache hit, got %llu",
+               (unsigned long long)s.artifact_cache_hits);
+        CHECKF(s.artifact_cache_misses == 0,
+               "pass 2: expected 0 cache misses, got %llu",
+               (unsigned long long)s.artifact_cache_misses);
+        /*
+         * A cache hit means the compiler subprocess was NOT spawned, so
+         * total_compilations stays at 0 (the swap + compilation counter is
+         * not incremented on a cache-hit path because the result comes from
+         * dlopen, not from a posix_spawnp).
+         *
+         * Note: the stat_compilations counter in cjit.c is incremented by
+         * the compiler thread AFTER codegen_compile() succeeds.  A cache hit
+         * returns early from codegen_compile() and is still counted as a
+         * successful compilation by the compiler thread (it still performed
+         * a dlopen + dlsym and swapped the function pointer).  We therefore
+         * check that total_compilations == 1, and that the swap also happened.
+         */
+        CHECKF(s.total_compilations == 1,
+               "pass 2: expected 1 total_compilations, got %llu",
+               (unsigned long long)s.total_compilations);
+        CHECKF(s.total_swaps == 1,
+               "pass 2: expected 1 total_swaps, got %llu",
+               (unsigned long long)s.total_swaps);
+
+        printf("[t21]   pass 2 hit=1 miss=0 compilations=%llu swaps=%llu  OK\n",
+               (unsigned long long)s.total_compilations,
+               (unsigned long long)s.total_swaps);
+
+        cjit_destroy(e);
+    }
+
+    /* Clean up the temporary cache directory (best effort). */
+    {
+        char cmd[300];
+        snprintf(cmd, sizeof(cmd), "rm -rf %s", cache_dir);
+        int _r = system(cmd); (void)_r;
+    }
+
+    printf("[t21] PASS\n");
+    return 0;
+}
+
+
 typedef int (*test_fn)(void);
 static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t01_aot_correctness",    t01_aot_correctness    },
@@ -1716,6 +1846,7 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t18_o3_vectorised_correctness", t18_o3_vectorised_correctness},
     { "t19_perf_benchmark",         t19_perf_benchmark           },
     { "t20_new_optflags_and_preamble", t20_new_optflags_and_preamble},
+    { "t21_artifact_cache",         t21_artifact_cache           },
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 

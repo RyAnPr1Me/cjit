@@ -87,6 +87,11 @@ extern "C" {
 #define CJIT_MAX_CC_BINARY      64
 
 /**
+ * Maximum length (including NUL) of the cache_dir string in cjit_config_t.
+ */
+#define CJIT_MAX_CACHE_DIR      256
+
+/**
  * Per-calling-thread TLS call-counter flush threshold.
  *
  * Each calling thread maintains a private per-function byte counter in
@@ -590,6 +595,25 @@ typedef struct {
      * Maximum length: CJIT_MAX_CC_BINARY - 1 characters.
      */
     char cc_binary[CJIT_MAX_CC_BINARY];
+
+    /**
+     * Directory for the persistent compiled-artifact cache.
+     *
+     * When non-empty, the codegen backend caches every compiled .so file
+     * on disk, keyed by a content-address hash of the IR source, optimisation
+     * level, compiler flags, and compiler binary.  On a cache hit the compiler
+     * subprocess is bypassed entirely and the cached .so is dlopen()'d
+     * directly — the dominant speedup for warm restarts and repeated runs.
+     *
+     * The directory is created (mode 0700) automatically if it does not exist.
+     * Multiple processes sharing the same directory are safe: stores use an
+     * atomic rename(2) so there are no torn writes.
+     *
+     * Leave empty (default) to disable the artifact cache.
+     *
+     * Maximum length: CJIT_MAX_CACHE_DIR - 1 characters.
+     */
+    char cache_dir[CJIT_MAX_CACHE_DIR];
 } cjit_config_t;
 
 /* ══════════════════════════════ runtime stats ═════════════════════════════ */
@@ -612,6 +636,10 @@ typedef struct {
      * the scaled thresholds are having the desired effect.
      */
     uint32_t max_recompile_count;   /**< Highest per-function recompile count.  */
+
+    /* ── Compiled-artifact cache ──────────────────────────────────────── */
+    uint64_t artifact_cache_hits;   /**< Compilations skipped via cache hit.    */
+    uint64_t artifact_cache_misses; /**< Compilations where cache was cold.     */
 
     /* ── IR LRU cache ────────────────────────────────────────────────── */
     uint32_t ir_hot_count;          /**< Entries in HOT  generation (memory).  */

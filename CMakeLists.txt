@@ -23,6 +23,7 @@ set(CJIT_SOURCES
     src/work_queue.c
     src/deferred_gc.c
     src/func_table.c
+    src/codegen_cache.c
     src/codegen.c
     src/ir_cache.c
     src/cjit.c

@@ -104,6 +104,9 @@
 #include "../include/cjit.h"  /* opt_level_t, jit_func_t */
 #include "arg_profile.h"      /* cjit_arg_profile_t */
 
+/* Forward declaration – full definition in codegen_cache.h. */
+typedef struct codegen_cache codegen_cache_t;
+
 /* ─────────────────────────── result type ───────────────────────────────────── */
 
 /**
@@ -154,6 +157,18 @@ typedef struct {
      * NULL or empty string → "cc" found on PATH.
      */
     const char *cc_binary;
+
+    /**
+     * Optional compiled-artifact cache handle.
+     *
+     * When non-NULL, codegen_compile() checks the cache before spawning the
+     * compiler.  On a hit the cached .so is dlopen'd directly and the compiler
+     * subprocess is skipped entirely.  On a miss the compiled artifact is
+     * stored in the cache for future hits.
+     *
+     * NULL disables caching for this compilation.
+     */
+    codegen_cache_t *cache;
 } codegen_opts_t;
 
 /* ─────────────────────────── API ───────────────────────────────────────────── */

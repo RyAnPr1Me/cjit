@@ -133,6 +133,7 @@
 #include "deferred_gc.h"
 #include "func_table.h"
 #include "codegen.h"
+#include "codegen_cache.h"
 #include "ir_cache.h"
 
 #include <stdlib.h>
@@ -207,6 +208,15 @@ struct cjit_engine {
 
     /* IR LRU cache with memory-pressure awareness. */
     ir_lru_cache_t *ir_cache;
+
+    /**
+     * Persistent compiled-artifact cache.
+     *
+     * NULL when cfg.cache_dir is empty (cache disabled).
+     * When non-NULL, compiler threads check this cache before spawning the
+     * system C compiler, and store newly compiled artifacts for future hits.
+     */
+    codegen_cache_t *artifact_cache;
 
     /*
      * Per-compiler-thread work queues.
@@ -361,6 +371,7 @@ static void *compiler_thread_fn(void *raw_arg)
         .verbose              = engine->cfg.verbose,
         .extra_cflags         = engine->cfg.extra_cflags[0] ? engine->cfg.extra_cflags : NULL,
         .cc_binary            = engine->cfg.cc_binary[0]    ? engine->cfg.cc_binary    : NULL,
+        .cache                = engine->artifact_cache,   /* may be NULL */
     };
 
     while (!atomic_load_explicit(&engine->stop_requested, memory_order_acquire)) {
@@ -1036,6 +1047,17 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
     e->ir_cache = ir_cache_create(&icc);
     if (!e->ir_cache) { func_table_destroy(e->ftable); free(e); return NULL; }
 
+    /* Persistent compiled-artifact cache (optional – NULL if disabled). */
+    e->artifact_cache = NULL;
+    if (e->cfg.cache_dir[0]) {
+        e->artifact_cache = codegen_cache_create(e->cfg.cache_dir);
+        /*
+         * A failed cache_create (e.g. permission denied, disk full) is non-
+         * fatal: we continue without caching.  Each compilation falls back to
+         * the normal compile path; correctness is unaffected.
+         */
+    }
+
     /* Per-thread work queues. */
     e->work_queues = calloc(e->cfg.compiler_threads, sizeof(mpmc_queue_t));
     if (!e->work_queues) {
@@ -1140,6 +1162,7 @@ void cjit_destroy(cjit_engine_t *engine)
 
     func_table_destroy(engine->ftable);
     ir_cache_destroy(engine->ir_cache);
+    codegen_cache_destroy(engine->artifact_cache);   /* NULL-safe */
 
     pthread_cond_destroy(&engine->work_cond);
     pthread_mutex_destroy(&engine->work_cond_mutex);
@@ -1391,6 +1414,11 @@ cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
     s.max_recompile_count = max_rc;
     s.total_elapsed_ns    = total_elapsed;
 
+    if (engine->artifact_cache) {
+        s.artifact_cache_hits   = codegen_cache_hits(engine->artifact_cache);
+        s.artifact_cache_misses = codegen_cache_misses(engine->artifact_cache);
+    }
+
     if (engine->ir_cache) {
         ir_cache_stats_t cs = ir_cache_get_stats(engine->ir_cache);
         s.ir_hot_count          = cs.hot_count;
@@ -1428,6 +1456,9 @@ void cjit_print_stats(const cjit_engine_t *engine)
             "║  Work-queue depth now  : %6u            ║\n"
             "║  Max recompile count   : %6u            ║\n"
             "╠══════════════════════════════════════════╣\n"
+            "║  Artifact cache hits   : %6llu            ║\n"
+            "║  Artifact cache misses : %6llu            ║\n"
+            "╠══════════════════════════════════════════╣\n"
             "║  Memory pressure       : %-8s          ║\n"
             "║  Mem available         : %6llu MB         ║\n"
             "║  Mem total             : %6llu MB         ║\n"
@@ -1451,6 +1482,8 @@ void cjit_print_stats(const cjit_engine_t *engine)
             (unsigned long long)s.freed_handles,
             s.queue_depth,
             s.max_recompile_count,
+            (unsigned long long)s.artifact_cache_hits,
+            (unsigned long long)s.artifact_cache_misses,
             pnames[s.mem_pressure],
             (unsigned long long)s.mem_available_mb,
             (unsigned long long)s.mem_total_mb,
