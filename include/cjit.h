@@ -508,6 +508,27 @@ typedef struct {
      */
     char     pgo_base_dir[256];
 
+    /**
+     * Maximum acceptable profiling-window duration (milliseconds).
+     *
+     * Before starting a PGO_GENERATE cycle the monitor estimates the
+     * instrumented execution window:
+     *
+     *   estimated_window_ms = pgo_profile_calls * 1000 / ema_rate
+     *                         + 2 * last_compile_duration_ms
+     *
+     * The first term is how long the function will run with gcov counters
+     * enabled (overhead ~5-15%).  The second term is the cost of two extra
+     * compiler invocations (PGO_GENERATE + PGO_USE).
+     *
+     * If estimated_window_ms > pgo_max_overhead_ms, the engine falls back
+     * to a direct O3 compile so that the function is optimised without the
+     * added latency of a full PGO cycle.  Set to 0 to disable the check.
+     *
+     * Default: 2 000 ms.
+     */
+    uint32_t pgo_max_overhead_ms;
+
     /* ── IR LRU cache settings ──────────────────────────────────────────── */
     uint32_t hot_ir_cache_size;   /**< Max HOT-gen IR entries in memory (def 64). */
     uint32_t warm_ir_cache_size;  /**< Max WARM-gen IR entries in memory (def 128).*/

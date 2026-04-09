@@ -243,8 +243,9 @@ typedef struct {
      *   visibility without additional synchronisation.
      */
     atomic_int                  pgo_state;         /**< 0=NONE, 1=RUNNING, 2=DONE */
-    char                        pgo_dir[256];      /**< Profile data directory.    */
+    char                        pgo_dir[300];      /**< Profile data directory.    */
     uint64_t                    pgo_calls_at_start;/**< call_cnt when instr. installed.*/
+    uint64_t                    pgo_pre_instr_avg_ns; /**< avg ns/call before instr.*/
     void                       *pgo_instr_handle;  /**< dlopen handle for flush.   */
 } func_table_entry_t;
 
