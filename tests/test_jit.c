@@ -1,7 +1,7 @@
 /**
  * test_jit.c – Integration test suite for the CJIT engine.
  *
- * Each test function (t01 … t10) exercises a distinct aspect of the JIT:
+ * Each test function (t01 … t44) exercises a distinct aspect of the JIT:
  *
  *   t01  AOT fallback correctness      – functions return right answers before
  *                                        any JIT compilation has happened.
@@ -128,6 +128,9 @@
  *                                        distribute-patterns, -fgcse-after-
  *                                        reload, -fipa-cp-clone do not break
  *                                        compilation.
+ *   t44  Utility preamble macros    – MIN/MAX/CLAMP/COUNT/STATIC_ASSERT/
+ *                                        TOSTRING macros compile correctly
+ *                                        and return expected results.
  *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).
@@ -3874,6 +3877,124 @@ TEST(t43_new_macros_and_flags)
     return 0;
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+ * t44: Utility preamble macros (MIN / MAX / CLAMP / COUNT / STATIC_ASSERT /
+ *      TOSTRING)
+ *
+ * Verifies that the utility macros injected into every JIT translation unit
+ * compile and produce correct results.  Each macro is exercised with at
+ * least one non-trivial case:
+ *
+ *   MIN / MAX  – signed integer comparisons; checks that the expected value
+ *                is returned and that side-effect-free expressions are safe.
+ *   CLAMP      – clamps an out-of-range value and a mid-range value.
+ *   COUNT      – applied to a fixed-size local array (compile-time constant).
+ *   STATIC_ASSERT – compile-time assertion that 1 + 1 == 2 (always passes).
+ *   TOSTRING   – stringifies a numeric constant and returns its first digit.
+ * ────────────────────────────────────────────────────────────────────────── */
+TEST(t44_utility_macros)
+{
+    printf("[t44] Utility preamble macros (MIN/MAX/CLAMP/COUNT/STATIC_ASSERT/TOSTRING)...\n");
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads = 1;
+    cfg.verbose          = false;
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e, "cjit_create returned NULL");
+    cjit_start(e);
+
+    /* ── MIN ── */
+    static const char *IR_MIN =
+        "int fn_min(int a, int b) { return MIN(a, b); }";
+    func_id_t min_id = cjit_register_function(e, "fn_min", IR_MIN, NULL);
+    CHECK(min_id != CJIT_INVALID_FUNC_ID, "register fn_min failed");
+    CHECK(cjit_compile_sync(e, min_id, OPT_O2), "fn_min compile failed");
+    typedef int (*int2fn_t)(int, int);
+    int2fn_t min_fn = (int2fn_t)(uintptr_t)cjit_get_func(e, min_id);
+    CHECK(min_fn != NULL, "fn_min ptr NULL");
+    CHECKF(min_fn(3, 7)  == 3,  "MIN(3,7) expected 3 got %d",  min_fn(3, 7));
+    CHECKF(min_fn(-5, 2) == -5, "MIN(-5,2) expected -5 got %d", min_fn(-5, 2));
+    CHECKF(min_fn(4, 4)  == 4,  "MIN(4,4) expected 4 got %d",  min_fn(4, 4));
+    printf("[t44]   MIN: OK\n");
+
+    /* ── MAX ── */
+    static const char *IR_MAX =
+        "int fn_max(int a, int b) { return MAX(a, b); }";
+    func_id_t max_id = cjit_register_function(e, "fn_max", IR_MAX, NULL);
+    CHECK(max_id != CJIT_INVALID_FUNC_ID, "register fn_max failed");
+    CHECK(cjit_compile_sync(e, max_id, OPT_O2), "fn_max compile failed");
+    int2fn_t max_fn = (int2fn_t)(uintptr_t)cjit_get_func(e, max_id);
+    CHECK(max_fn != NULL, "fn_max ptr NULL");
+    CHECKF(max_fn(3, 7)  == 7,  "MAX(3,7) expected 7 got %d",  max_fn(3, 7));
+    CHECKF(max_fn(-5, 2) == 2,  "MAX(-5,2) expected 2 got %d", max_fn(-5, 2));
+    CHECKF(max_fn(4, 4)  == 4,  "MAX(4,4) expected 4 got %d",  max_fn(4, 4));
+    printf("[t44]   MAX: OK\n");
+
+    /* ── CLAMP ── */
+    static const char *IR_CLAMP =
+        "int fn_clamp(int x, int lo, int hi) { return CLAMP(x, lo, hi); }";
+    func_id_t clamp_id = cjit_register_function(e, "fn_clamp", IR_CLAMP, NULL);
+    CHECK(clamp_id != CJIT_INVALID_FUNC_ID, "register fn_clamp failed");
+    CHECK(cjit_compile_sync(e, clamp_id, OPT_O2), "fn_clamp compile failed");
+    typedef int (*int3fn_t)(int, int, int);
+    int3fn_t clamp_fn = (int3fn_t)(uintptr_t)cjit_get_func(e, clamp_id);
+    CHECK(clamp_fn != NULL, "fn_clamp ptr NULL");
+    CHECKF(clamp_fn(5,  1, 10) == 5,  "CLAMP(5,1,10) expected 5 got %d",  clamp_fn(5,  1, 10));
+    CHECKF(clamp_fn(-3, 1, 10) == 1,  "CLAMP(-3,1,10) expected 1 got %d", clamp_fn(-3, 1, 10));
+    CHECKF(clamp_fn(20, 1, 10) == 10, "CLAMP(20,1,10) expected 10 got %d",clamp_fn(20, 1, 10));
+    printf("[t44]   CLAMP: OK\n");
+
+    /* ── COUNT ── */
+    static const char *IR_COUNT =
+        "int fn_count(void) {\n"
+        "  int arr[7];\n"
+        "  return (int)COUNT(arr);\n"
+        "}\n";
+    func_id_t count_id = cjit_register_function(e, "fn_count", IR_COUNT, NULL);
+    CHECK(count_id != CJIT_INVALID_FUNC_ID, "register fn_count failed");
+    CHECK(cjit_compile_sync(e, count_id, OPT_O1), "fn_count compile failed");
+    typedef int (*voidfn_t)(void);
+    voidfn_t count_fn = (voidfn_t)(uintptr_t)cjit_get_func(e, count_id);
+    CHECK(count_fn != NULL, "fn_count ptr NULL");
+    CHECKF(count_fn() == 7, "COUNT([7]) expected 7 got %d", count_fn());
+    printf("[t44]   COUNT: OK\n");
+
+    /* ── STATIC_ASSERT ── */
+    static const char *IR_SA =
+        "int fn_sa(int x) {\n"
+        "  STATIC_ASSERT(sizeof(int) >= 4, int_must_be_at_least_4_bytes);\n"
+        "  return x * 2;\n"
+        "}\n";
+    func_id_t sa_id = cjit_register_function(e, "fn_sa", IR_SA, NULL);
+    CHECK(sa_id != CJIT_INVALID_FUNC_ID, "register fn_sa failed");
+    CHECK(cjit_compile_sync(e, sa_id, OPT_O1), "fn_sa compile failed");
+    typedef int (*intfn_t)(int);
+    intfn_t sa_fn = (intfn_t)(uintptr_t)cjit_get_func(e, sa_id);
+    CHECK(sa_fn != NULL, "fn_sa ptr NULL");
+    CHECKF(sa_fn(21) == 42, "fn_sa(21) expected 42 got %d", sa_fn(21));
+    printf("[t44]   STATIC_ASSERT: OK\n");
+
+    /* ── TOSTRING ── */
+    static const char *IR_TOSTR =
+        "#define MY_MAGIC 42\n"
+        "int fn_tostr(void) {\n"
+        "  const char *s = TOSTRING(MY_MAGIC);\n"
+        "  return (int)s[0];  /* '4' == 52 */\n"
+        "}\n";
+    func_id_t ts_id = cjit_register_function(e, "fn_tostr", IR_TOSTR, NULL);
+    CHECK(ts_id != CJIT_INVALID_FUNC_ID, "register fn_tostr failed");
+    CHECK(cjit_compile_sync(e, ts_id, OPT_O1), "fn_tostr compile failed");
+    voidfn_t ts_fn = (voidfn_t)(uintptr_t)cjit_get_func(e, ts_id);
+    CHECK(ts_fn != NULL, "fn_tostr ptr NULL");
+    int ts_r = ts_fn();
+    CHECKF(ts_r == '4', "TOSTRING(42)[0] expected '%c'(%d) got %d", '4', (int)'4', ts_r);
+    printf("[t44]   TOSTRING: OK\n");
+
+    cjit_destroy(e);
+    printf("[t44] PASS\n");
+    return 0;
+}
+
 typedef int (*test_fn)(void);
 static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t01_aot_correctness",    t01_aot_correctness    },
@@ -3919,6 +4040,7 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t41_verbose_bg_timeout",      t41_verbose_bg_timeout       },
     { "t42_diverse_param_types",     t42_diverse_param_types      },
     { "t43_new_macros_and_flags",    t43_new_macros_and_flags     },
+    { "t44_utility_macros",          t44_utility_macros           },
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 

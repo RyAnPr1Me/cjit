@@ -239,6 +239,16 @@ static const char CODEGEN_PREAMBLE[] =
      *   for (int i = 0; i < n; i++) dst[i] = src[i] * scale;
      */
     "#  define IVDEP PRAGMA_IMPL_(GCC ivdep)\n"
+    /*
+     * STRINGIFY / TOSTRING: convert a macro argument to a string literal.
+     *
+     * STRINGIFY(x) expands x before stringifying, so macro arguments are
+     * fully expanded (e.g. TOSTRING(MY_VER) → "1.2" if MY_VER is 1.2).
+     * STRINGIFY_IMPL_ is the inner helper that performs the actual stringification
+     * after expansion.
+     */
+    "#  define STRINGIFY_IMPL_(x) #x\n"
+    "#  define TOSTRING(x)       STRINGIFY_IMPL_(x)\n"
     "#else\n"
     "#  define LIKELY(x)                  (x)\n"
     "#  define UNLIKELY(x)                (x)\n"
@@ -260,6 +270,8 @@ static const char CODEGEN_PREAMBLE[] =
     "#  define PRAGMA_IMPL_(x)\n"
     "#  define UNROLL(n)\n"
     "#  define IVDEP\n"
+    "#  define STRINGIFY_IMPL_(x) #x\n"
+    "#  define TOSTRING(x)       STRINGIFY_IMPL_(x)\n"
     "#endif\n"
     "#include <stdint.h>\n"
     "#include <string.h>\n"
@@ -274,6 +286,52 @@ static const char CODEGEN_PREAMBLE[] =
      * built-in keywords and the header is a no-op; including it is always safe.
      */
     "#include <stdbool.h>\n"
+    /*
+     * Utility macros available in all JIT translation units.
+     *
+     * MIN(a, b) / MAX(a, b):
+     *   Classic min/max macros.  Each argument is evaluated at most once by
+     *   the statement-expression form (GCC/Clang) or twice in the fallback
+     *   ternary form.  Guarded by #ifndef so user code can override them.
+     *
+     * CLAMP(x, lo, hi):
+     *   Clamps x into [lo, hi].  Equivalent to MAX(lo, MIN(x, hi)).
+     *
+     * COUNT(arr):
+     *   Number of elements in a fixed-size array (compile-time constant).
+     *   Only safe when `arr` is an array type, NOT a pointer.
+     *
+     * STATIC_ASSERT(cond, msg):
+     *   Compile-time assertion.  Uses _Static_assert when available (C11+),
+     *   otherwise falls back to a typedef trick.
+     */
+    "#ifndef MIN\n"
+    "#  ifdef __GNUC__\n"
+    "#    define MIN(a, b) __extension__({ __typeof__(a) _a = (a); __typeof__(b) _b = (b); _a < _b ? _a : _b; })\n"
+    "#  else\n"
+    "#    define MIN(a, b) ((a) < (b) ? (a) : (b))\n"
+    "#  endif\n"
+    "#endif\n"
+    "#ifndef MAX\n"
+    "#  ifdef __GNUC__\n"
+    "#    define MAX(a, b) __extension__({ __typeof__(a) _a = (a); __typeof__(b) _b = (b); _a > _b ? _a : _b; })\n"
+    "#  else\n"
+    "#    define MAX(a, b) ((a) > (b) ? (a) : (b))\n"
+    "#  endif\n"
+    "#endif\n"
+    "#ifndef CLAMP\n"
+    "#  define CLAMP(x, lo, hi) (MIN(MAX((x), (lo)), (hi)))\n"
+    "#endif\n"
+    "#ifndef COUNT\n"
+    "#  define COUNT(arr) (sizeof(arr) / sizeof((arr)[0]))\n"
+    "#endif\n"
+    "#ifndef STATIC_ASSERT\n"
+    "#  if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L\n"
+    "#    define STATIC_ASSERT(cond, msg) _Static_assert(cond, #msg)\n"
+    "#  else\n"
+    "#    define STATIC_ASSERT(cond, msg) typedef char _cjit_sa_##msg[(cond) ? 1 : -1]\n"
+    "#  endif\n"
+    "#endif\n"
     "#endif /* CJIT_PREAMBLE_H */\n";
 
 /* ─────────────────────────── optimisation flags ───────────────────────────── */

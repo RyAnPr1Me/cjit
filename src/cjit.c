@@ -1597,6 +1597,7 @@ static void *monitor_thread_fn(void *arg)
                 atomic_store_explicit(&entry->in_queue, false,
                                       memory_order_relaxed);
             } else {
+                uint32_t logged_streak = hot_scan_streak[i]; /* save before reset */
                 cnt_at_compile[i]   = cur_cnt;
                 last_queued_ms[i]   = now;
                 hot_scan_streak[i]  = 0;  /* fresh evidence required for next tier */
@@ -1613,7 +1614,7 @@ static void *monitor_thread_fn(void *arg)
                             entry->name, (int)target,
                             (double)ema_rate[i],
                             (double)ema_ns_per_sec[i],
-                            hot_scan_streak[i], req_streak,
+                            logged_streak, req_streak,
                             rc, effective_cooloff,
                             (predicted_hot && !rate_hot) ? " [predictive]" : "");
             }
@@ -1892,6 +1893,7 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
 
     atomic_init(&e->running,               false);
     atomic_init(&e->stop_requested,        false);
+    atomic_init(&e->active_compilations,   0);
     atomic_init(&e->stat_compilations,      0);
     atomic_init(&e->stat_failed,            0);
     atomic_init(&e->stat_timeouts,          0);
