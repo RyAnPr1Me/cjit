@@ -163,6 +163,82 @@ static const char CODEGEN_PREAMBLE[] =
      * allowing aggressive reordering and vectorisation of subsequent code.
      */
     "#  define MALLOC_FUNC                __attribute__((malloc))\n"
+    /*
+     * ASSUME: assert-like compile-time hint.
+     *
+     * Informs the compiler that `cond` is always true at this point in the
+     * program.  The compiler may exploit this to eliminate dead code, narrow
+     * value ranges, remove bounds checks, etc.  Unlike assert(), ASSUME has
+     * ZERO runtime cost — no branch, no call — but if `cond` is false the
+     * behaviour is undefined.  Use only for invariants that are guaranteed
+     * by algorithm logic, not for user input validation.
+     *
+     * Clang: __builtin_assume(cond) is a no-op at runtime and exposes the
+     *   hint directly to the analyser and optimiser.
+     * GCC:   The idiomatic equivalent is:
+     *   if (__builtin_expect(!(cond), 0)) __builtin_unreachable();
+     *   which compiles to no instructions (the branch is predicted as never
+     *   taken and the compiler treats the false path as dead code).
+     * Both forms are standard practice in performance-critical C.
+     *
+     * Example:
+     *   void dot(float *RESTRICT a, float *RESTRICT b, int n) {
+     *     ASSUME(n % 8 == 0);  // hint: n is always a multiple of 8
+     *     // now the compiler can generate a tight AVX unrolled loop
+     *     ...
+     *   }
+     */
+    "#  ifdef __clang__\n"
+    "#    define ASSUME(cond) __builtin_assume(cond)\n"
+    "#  else\n"
+    "#    define ASSUME(cond) do { if (__builtin_expect(!(cond), 0)) __builtin_unreachable(); } while (0)\n"
+    "#  endif\n"
+    /*
+     * PRAGMA_IMPL_: internal helper that applies the C99 _Pragma operator to
+     * the stringified expansion of its argument.  This is the standard idiom
+     * for building parameterised pragmas from macros:
+     *
+     *   #define PRAGMA_IMPL_(x)  _Pragma(#x)
+     *   PRAGMA_IMPL_(GCC unroll 4)  →  _Pragma("GCC unroll 4")
+     *
+     * Macro arguments are fully expanded before being stringified with #, so
+     * numeric arguments (e.g. UNROLL(4)) are correctly folded into a single
+     * string literal before _Pragma sees them.
+     */
+    "#  define PRAGMA_IMPL_(x) _Pragma(#x)\n"
+    /*
+     * UNROLL(n): explicit loop-unroll factor hint.
+     *
+     * Prepend this before a for/while loop to request that the compiler
+     * unroll it by a factor of n.  n must be an integer constant expression.
+     *
+     * Both GCC (_Pragma("GCC unroll n")) and Clang (which also recognises the
+     * GCC form) honour this hint when it is profitable.  It is silently
+     * ignored when n is not a constant or when unrolling would be unsafe.
+     *
+     * Usage:
+     *   UNROLL(8)
+     *   for (int i = 0; i < 64; i++) sum += arr[i];
+     */
+    "#  define UNROLL(n) PRAGMA_IMPL_(GCC unroll n)\n"
+    /*
+     * IVDEP: assert no loop-carried data dependencies.
+     *
+     * Prepend before a loop to tell the compiler that consecutive iterations
+     * do not read/write the same memory locations through pointer aliasing.
+     * This enables auto-vectorisation of loops that would otherwise be
+     * conservatively treated as having potential aliasing hazards.
+     *
+     * The programmer is responsible for ensuring the assertion is correct;
+     * if it is false, the vectorised result is undefined.
+     *
+     * Both GCC ("GCC ivdep") and Clang accept this pragma.
+     *
+     * Usage:
+     *   IVDEP
+     *   for (int i = 0; i < n; i++) dst[i] = src[i] * scale;
+     */
+    "#  define IVDEP PRAGMA_IMPL_(GCC ivdep)\n"
     "#else\n"
     "#  define LIKELY(x)                  (x)\n"
     "#  define UNLIKELY(x)                (x)\n"
@@ -180,6 +256,10 @@ static const char CODEGEN_PREAMBLE[] =
     "#  define NORETURN\n"
     "#  define CJIT_EXPORT\n"
     "#  define MALLOC_FUNC\n"
+    "#  define ASSUME(cond)               ((void)(cond))\n"
+    "#  define PRAGMA_IMPL_(x)\n"
+    "#  define UNROLL(n)\n"
+    "#  define IVDEP\n"
     "#endif\n"
     "#include <stdint.h>\n"
     "#include <string.h>\n"
@@ -201,8 +281,8 @@ static const char CODEGEN_PREAMBLE[] =
 /**
  * Maximum number of arguments passed to the compiler subprocess.
  *
- * cc(1) + -shared + -fPIC + opt-level + up to 14 optional flags +
- * JIT-specific flags + -w + -o + so_path + -x + c + src_path + NULL = ~26.
+ * cc(1) + -shared + -fPIC + opt-level + up to 18 optional flags +
+ * JIT-specific flags + -w + -o + so_path + -x + c + src_path + NULL = ~30.
  * When argument specialisation is active: two more (-D <func=_cjit_i_func>).
  * Extra user flags (extra_cflags) may add up to ~50 more tokens.
  * Runtime-profile defines (CJIT_OPT_TIER, CJIT_CALL_RATE, CJIT_AVG_ELAPSED_NS,
@@ -328,7 +408,60 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
          * same reasons as -funswitch-loops.
          */
         argv[n++] = "-fpeel-loops";
+
+        /*
+         * -ftree-loop-distribute-patterns: recognise common loop patterns
+         * (such as manual memset, memcpy, or memcmp loops) and replace them
+         * with optimised library calls or vectorised intrinsics.  For example,
+         * a loop that zeroes an array is replaced by a call to memset(), which
+         * the backend can then lower to AVX-512 vmovdqu or equivalent.
+         *
+         * GCC enables this only at -O3 by default.  At O2 it is safe and
+         * typically provides a measurable win for JIT functions that include
+         * manual memory operations in loops.  Clang does not implement this
+         * flag (it uses a different optimiser architecture) but accepts and
+         * ignores it — the -w flag we always pass suppresses the resulting
+         * -Wunknown-argument warning.
+         */
+        argv[n++] = "-ftree-loop-distribute-patterns";
+
+        /*
+         * -fgcse-after-reload: perform global common-subexpression elimination
+         * after register allocation.  This catches redundant load/store pairs
+         * that only become visible once the register allocator has committed
+         * to specific registers, allowing the compiler to hoist or eliminate
+         * repeated memory accesses that it could not safely remove earlier.
+         *
+         * GCC enables this only at -O3 by default.  At O2 it is safe: it only
+         * adds optimisation, never changes semantics.  For JIT-compiled hot
+         * functions this can eliminate several load instructions per call.
+         * Clang does not implement this flag; the -w flag suppresses the
+         * resulting -Wunknown-argument warning.
+         */
+        argv[n++] = "-fgcse-after-reload";
     }
+
+    /*
+     * -fipa-cp-clone: enable interprocedural constant propagation with
+     * function cloning.
+     *
+     * When a function is called with the same constant argument repeatedly,
+     * GCC creates a specialised clone of that function with the constant
+     * substituted into the body, then applies constant folding, dead-branch
+     * elimination, and loop simplification to the clone.  The original
+     * function remains for calls with varying arguments.
+     *
+     * This is the compiler-side analogue of the JIT engine's own argument-
+     * specialisation wrapper: while the wrapper specialises the outermost
+     * function at the hot dominant value, -fipa-cp-clone propagates constant
+     * arguments into helper functions called from within the JIT function.
+     *
+     * GCC enables this only at -O3 by default.  Applying it from O2 means
+     * tier-1-compiled functions also benefit.  Clang ignores the flag (with
+     * the warning suppressed by -w); no correctness risk.
+     */
+    if (opts->enable_const_fold && level >= OPT_O2)
+        argv[n++] = "-fipa-cp-clone";
 
     /*
      * -march=native: generate code tuned for the exact CPU the engine is
@@ -362,9 +495,18 @@ static int build_compiler_argv(const char *argv[MAX_CC_ARGS],
      *   and debugger backtraces through JIT frames, neither of which applies
      *   here.  Removing it reduces .so binary size (often 20-30% for small
      *   functions), which lowers dlopen overhead and improves I-cache density.
+     *
+     * -fno-unwind-tables: complement to -fno-asynchronous-unwind-tables.
+     *   Omits the basic (non-DWARF) unwind tables: .ARM.exidx / .ARM.extab on
+     *   AArch64/ARM, the .eh_frame_hdr lookup structure on x86-64/ELF, and
+     *   equivalent on RISC-V / POWER.  Together the two flags suppress ALL
+     *   unwind metadata from the compiled .so, reducing its size and the
+     *   amount of data the dynamic linker must map and process on load.
+     *   Recognised by both GCC and Clang.
      */
     argv[n++] = "-fno-stack-protector";
     argv[n++] = "-fno-asynchronous-unwind-tables";
+    argv[n++] = "-fno-unwind-tables";
 
     /*
      * -fno-ident: suppress the `.comment` ELF section that GCC and Clang
@@ -1211,7 +1353,7 @@ bool codegen_compile(const char          *func_name,
     /* CJIT_ARG<i>: dominant value for each confident argument slot */
     if (opts && opts->arg_profile) {
         int n_slots = (int)opts->arg_profile->n_profiled;
-        for (int _ai = 0; _ai < n_slots && _ai < SPEC_MAX_PARAMS; ++_ai) {
+        for (int _ai = 0; _ai < n_slots && _ai < (int)SPEC_MAX_PARAMS; ++_ai) {
             const cjit_arg_slot_t *_sl = &opts->arg_profile->slots[_ai];
             if (!cjit_arg_slot_confident(_sl)) continue;
             if (n_prf >= CJIT_PRF_DEFS_MAX || n_argv >= MAX_CC_ARGS - 1) break;

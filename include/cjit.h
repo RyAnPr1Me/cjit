@@ -399,7 +399,19 @@ typedef struct {
     bool     enable_inlining;     /**< Pass -finline-functions to compiler.       */
     bool     enable_vectorization;/**< Pass -ftree-vectorize to compiler.         */
     bool     enable_loop_unroll;  /**< Pass -funroll-loops to compiler.           */
-    bool     enable_const_fold;   /**< Constant folding (enabled at -O1+).       */
+    bool     enable_const_fold;   /**< Enables -fipa-cp-clone at O2+: GCC creates
+                                        specialised clones of functions called
+                                        with constant-value arguments, allowing
+                                        the compiler to constant-fold through
+                                        function boundaries and eliminate dead
+                                        branches in the clones.  GCC applies
+                                        this only at -O3 by default; enabling
+                                        it at O2 is safe and can significantly
+                                        improve throughput for JIT functions
+                                        that call helper routines with fixed
+                                        parameters.  Silently accepted (and
+                                        then ignored) by Clang, so enabling
+                                        it is always safe.                     */
     bool     enable_native_arch;  /**< Pass -march=native from OPT_O2 upwards.   */
     bool     enable_fast_math;    /**< Pass -ffast-math at OPT_O3 (may change
                                        floating-point semantics).                 */

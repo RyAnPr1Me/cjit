@@ -122,6 +122,12 @@
  *                                        IR source; compiler thread skips silently.
  *   t42  Diverse parameter types    – functions with long/char/short/uint32_t
  *                                        params exercising codegen type checks.
+ *   t43  New preamble macros +      – ASSUME/UNROLL/IVDEP macros compile and
+ *        extra opt flags               return correct results at O2 and O3;
+ *                                        -fno-unwind-tables, -ftree-loop-
+ *                                        distribute-patterns, -fgcse-after-
+ *                                        reload, -fipa-cp-clone do not break
+ *                                        compilation.
  *
  * Each test prints PASS or FAIL and returns 0 / 1.  The main() aggregates the
  * results and exits with the failure count (0 = all passed).
@@ -3772,6 +3778,102 @@ TEST(t42_diverse_param_types)
     return 0;
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+ * t43: New preamble macros + extra optimization flags
+ *
+ * Verifies that the three new optimization hint macros injected into every
+ * JIT translation unit (ASSUME, UNROLL, IVDEP) compile correctly and that
+ * the resulting function returns the correct answer.
+ *
+ * Also verifies that the new compiler flags (-fno-unwind-tables,
+ * -ftree-loop-distribute-patterns, -fgcse-after-reload, -fipa-cp-clone)
+ * do not break compilation at O2 or O3.
+ * ────────────────────────────────────────────────────────────────────────── */
+TEST(t43_new_macros_and_flags)
+{
+    printf("[t43] New preamble macros (ASSUME/UNROLL/IVDEP) + extra opt flags...\n");
+
+    cjit_config_t cfg = cjit_default_config();
+    cfg.compiler_threads   = 1;
+    cfg.enable_const_fold  = true;   /* exercises -fipa-cp-clone */
+    cfg.enable_native_arch = true;   /* exercises -march=native  */
+    cfg.verbose            = false;
+    cjit_engine_t *e = cjit_create(&cfg);
+    CHECK(e, "cjit_create returned NULL");
+    cjit_start(e);
+
+    /* ── ASSUME: compiler hint for array-size invariant ── */
+    /*
+     * The function sums an integer array.  ASSUME(n > 0) asserts that n is
+     * always positive; IVDEP asserts no loop-carried aliasing so the compiler
+     * can vectorise freely; UNROLL(4) requests an unroll factor of 4.
+     * Correctness is verified against a reference sum.
+     */
+    static const char *IR_ASSUME_UNROLL_IVDEP =
+        "int sum_hints(int *arr, int n) {\n"
+        "  ASSUME(n > 0);\n"
+        "  int s = 0;\n"
+        "  UNROLL(4)\n"
+        "  IVDEP\n"
+        "  for (int i = 0; i < n; i++) s += arr[i];\n"
+        "  return s;\n"
+        "}\n";
+
+    func_id_t sid = cjit_register_function(e, "sum_hints",
+                                            IR_ASSUME_UNROLL_IVDEP, NULL);
+    CHECK(sid != CJIT_INVALID_FUNC_ID, "register sum_hints failed");
+
+    /* Compile at O2 (exercises -ftree-loop-distribute-patterns,
+     * -fgcse-after-reload, -fipa-cp-clone, -fno-unwind-tables). */
+    CHECK(cjit_compile_sync(e, sid, OPT_O2), "sum_hints O2 compile failed");
+
+    typedef int (*sumfn_t)(int *, int);
+    sumfn_t fp = (sumfn_t)(uintptr_t)cjit_get_func(e, sid);
+    CHECK(fp != NULL, "sum_hints func ptr NULL after compile");
+
+    int data[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    int got = fp(data, 8);
+    CHECKF(got == 36, "sum_hints([1..8]) expected 36, got %d", got);
+    printf("[t43]   sum_hints([1..8])=%d  OK (O2 + ASSUME + UNROLL + IVDEP)\n", got);
+
+    /* Compile again at O3 (also exercises the same flags at tier-2). */
+    CHECK(cjit_compile_sync(e, sid, OPT_O3), "sum_hints O3 compile failed");
+    fp = (sumfn_t)(uintptr_t)cjit_get_func(e, sid);
+    CHECK(fp != NULL, "sum_hints func ptr NULL after O3 compile");
+    got = fp(data, 8);
+    CHECKF(got == 36, "sum_hints O3 expected 36, got %d", got);
+    printf("[t43]   sum_hints([1..8])=%d  OK (O3)\n", got);
+
+    /* ── ASSUME with a tight loop containing no data deps ── */
+    static const char *IR_SCALE =
+        "void scale_arr(int *arr, int n, int factor) {\n"
+        "  ASSUME(n % 4 == 0);\n"
+        "  IVDEP\n"
+        "  for (int i = 0; i < n; i++) arr[i] *= factor;\n"
+        "}\n";
+
+    func_id_t vid = cjit_register_function(e, "scale_arr", IR_SCALE, NULL);
+    CHECK(vid != CJIT_INVALID_FUNC_ID, "register scale_arr failed");
+    CHECK(cjit_compile_sync(e, vid, OPT_O2), "scale_arr O2 compile failed");
+
+    typedef void (*scalefn_t)(int *, int, int);
+    scalefn_t vfp = (scalefn_t)(uintptr_t)cjit_get_func(e, vid);
+    CHECK(vfp != NULL, "scale_arr func ptr NULL");
+
+    int arr[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    vfp(arr, 8, 3);
+    int expected_scale[] = { 3, 6, 9, 12, 15, 18, 21, 24 };
+    for (int i = 0; i < 8; i++)
+        CHECKF(arr[i] == expected_scale[i],
+               "scale_arr[%d]: expected %d got %d",
+               i, expected_scale[i], arr[i]);
+    printf("[t43]   scale_arr([1..8], 3) correct  OK (O2 + IVDEP + ASSUME)\n");
+
+    cjit_destroy(e);
+    printf("[t43] PASS\n");
+    return 0;
+}
+
 typedef int (*test_fn)(void);
 static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t01_aot_correctness",    t01_aot_correctness    },
@@ -3816,6 +3918,7 @@ static const struct { const char *name; test_fn fn; } TESTS[] = {
     { "t40_ir_cache_print_and_prefetch", t40_ir_cache_print_and_prefetch },
     { "t41_verbose_bg_timeout",      t41_verbose_bg_timeout       },
     { "t42_diverse_param_types",     t42_diverse_param_types      },
+    { "t43_new_macros_and_flags",    t43_new_macros_and_flags     },
 };
 #define N_TESTS ((int)(sizeof(TESTS)/sizeof(TESTS[0])))
 
