@@ -1,0 +1,313 @@
+        -:    0:Source:/home/runner/work/cjit/cjit/src/deferred_gc.c
+        -:    0:Graph:build_cov/CMakeFiles/cjit_lib.dir/src/deferred_gc.c.gcno
+        -:    0:Data:build_cov/CMakeFiles/cjit_lib.dir/src/deferred_gc.c.gcda
+        -:    0:Runs:9
+        -:    1:/**
+        -:    2: * deferred_gc.c – Grace-period deferred dlclose implementation.
+        -:    3: *
+        -:    4: * See deferred_gc.h for the design rationale.
+        -:    5: */
+        -:    6:
+        -:    7:#ifndef _GNU_SOURCE
+        -:    8:#define _GNU_SOURCE
+        -:    9:#endif
+        -:   10:#include "deferred_gc.h"
+        -:   11:
+        -:   12:#include <stdlib.h>   /* malloc / free */
+        -:   13:#include <string.h>   /* memset        */
+        -:   14:#include <time.h>     /* clock_gettime */
+        -:   15:#include <dlfcn.h>    /* dlclose       */
+        -:   16:#include <errno.h>
+        -:   17:
+        -:   18:/* ─────────────────────── pool helpers ──────────────────────────────────────── */
+        -:   19:
+        -:   20:/**
+        -:   21: * Push a node onto the pre-allocated freelist (lock-free LIFO, same CAS
+        -:   22: * pattern as the retire stack).
+        -:   23: */
+    17450:   24:static void pool_push(deferred_gc_t *dgc, retire_entry_t *entry)
+        -:   25:{
+        -:   26:    retire_entry_t *old_head;
+        -:   27:    do {
+    17450:   28:        old_head    = atomic_load_explicit(&dgc->pool_head, memory_order_relaxed);
+    17450:   29:        entry->next = old_head;
+    17450:   30:    } while (!atomic_compare_exchange_weak_explicit(
+        -:   31:                 &dgc->pool_head, &old_head, entry,
+        -:   32:                 memory_order_release, memory_order_relaxed));
+    17450:   33:}
+        -:   34:
+        -:   35:/**
+        -:   36: * Pop one node from the pre-allocated freelist.
+        -:   37: *
+        -:   38: * Returns NULL if the pool is exhausted (caller falls back to malloc).
+        -:   39: */
+      106:   40:static retire_entry_t *pool_pop(deferred_gc_t *dgc)
+        -:   41:{
+        -:   42:    retire_entry_t *head;
+      106:   43:    head = atomic_load_explicit(&dgc->pool_head, memory_order_acquire);
+        -:   44:    for (;;) {
+     106*:   45:        if (!head) return NULL;
+      106:   46:        if (atomic_compare_exchange_weak_explicit(
+        -:   47:                &dgc->pool_head, &head, head->next,
+        -:   48:                memory_order_acquire, memory_order_relaxed))
+      106:   49:            return head;
+        -:   50:    }
+        -:   51:}
+        -:   52:
+        -:   53:/**
+        -:   54: * Return true if entry is within the pre-allocated pool backing storage.
+        -:   55: *
+        -:   56: * Used by dgc_sweep() to decide whether to pool_push() or free() a node.
+        -:   57: */
+      106:   58:static bool pool_owns(const deferred_gc_t *dgc, const retire_entry_t *entry)
+        -:   59:{
+     106*:   60:    if (!dgc->pool_storage) return false;
+     212*:   61:    return entry >= dgc->pool_storage &&
+      106:   62:           entry <  dgc->pool_storage + DGC_POOL_SIZE;
+        -:   63:}
+        -:   64:
+        -:   65:
+        -:   66:
+        -:   67:/* ─────────────────────── internal helpers ──────────────────────────────────── */
+        -:   68:
+        -:   69:/**
+        -:   70: * Return the current monotonic time in milliseconds.
+        -:   71: *
+        -:   72: * Uses CLOCK_MONOTONIC so it is not affected by system-time adjustments.
+        -:   73: */
+     3028:   74:static uint64_t now_ms(void)
+        -:   75:{
+        -:   76:    struct timespec ts;
+     3028:   77:    clock_gettime(CLOCK_MONOTONIC, &ts);
+     3028:   78:    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+        -:   79:}
+        -:   80:
+        -:   81:/**
+        -:   82: * Push a retire_entry onto the lock-free LIFO stack.
+        -:   83: *
+        -:   84: * The CAS loop retries only when another concurrent push wins first.  In
+        -:   85: * practice this converges in one or two iterations.
+        -:   86: *
+        -:   87: * Memory ordering:
+        -:   88: *   - The store of entry->next uses relaxed because it is a freshly allocated
+        -:   89: *     object not yet visible to any other thread.
+        -:   90: *   - The CAS uses release so that any writes to *entry (retire_ms, handle)
+        -:   91: *     are visible to the GC thread once it reads the pointer.
+        -:   92: */
+      329:   93:static void stack_push(deferred_gc_t *dgc, retire_entry_t *entry)
+        -:   94:{
+        -:   95:    retire_entry_t *old_head;
+        -:   96:    do {
+      329:   97:        old_head   = atomic_load_explicit(&dgc->head, memory_order_relaxed);
+      329:   98:        entry->next = old_head;
+      329:   99:    } while (!atomic_compare_exchange_weak_explicit(
+        -:  100:                 &dgc->head, &old_head, entry,
+        -:  101:                 memory_order_release,
+        -:  102:                 memory_order_relaxed));
+      329:  103:}
+        -:  104:
+        -:  105:/**
+        -:  106: * Atomically drain the entire retire stack in one CAS.
+        -:  107: *
+        -:  108: * Returns the harvested list (singly-linked via ->next, NULL-terminated).
+        -:  109: * If the stack was empty, returns NULL.
+        -:  110: *
+        -:  111: * Memory ordering:
+        -:  112: *   - The CAS uses acquire so that all stores performed by producers before
+        -:  113: *     their release-CAS are visible to the GC thread after this acquire.
+        -:  114: */
+     2922:  115:static retire_entry_t *stack_drain(deferred_gc_t *dgc)
+        -:  116:{
+        -:  117:    retire_entry_t *head;
+     2922:  118:    head = atomic_load_explicit(&dgc->head, memory_order_relaxed);
+     2922:  119:    if (!head) return NULL;
+        -:  120:
+      279:  121:    while (!atomic_compare_exchange_weak_explicit(
+        -:  122:               &dgc->head, &head, NULL,
+        -:  123:               memory_order_acquire,
+        -:  124:               memory_order_relaxed)) {
+    #####:  125:        if (!head) return NULL;
+        -:  126:    }
+      279:  127:    return head;
+        -:  128:}
+        -:  129:
+        -:  130:/* ─────────────────────── GC thread ─────────────────────────────────────────── */
+        -:  131:
+      250:  132:static void *gc_thread_fn(void *arg)
+        -:  133:{
+      250:  134:    deferred_gc_t *dgc = (deferred_gc_t *)arg;
+        -:  135:
+        -:  136:    /*
+        -:  137:     * Adaptive sweep interval.
+        -:  138:     *
+        -:  139:     * The GC thread self-adjusts its sleep duration based on the retire stack
+        -:  140:     * state observed after each sweep, rather than using a fixed grace/4 value:
+        -:  141:     *
+        -:  142:     *   Pending entries remain  →  sleep exactly until the next one is freeable
+        -:  143:     *                               (dgc_sweep returns remaining_ms > 0).
+        -:  144:     *                               This is optimal: we wake up precisely when
+        -:  145:     *                               there is actionable work, never earlier.
+        -:  146:     *
+        -:  147:     *   Nothing left pending    →  exponential back-off (doubles each idle
+        -:  148:     *                               sweep) up to grace_period_ms/2.  At idle
+        -:  149:     *                               the GC thread barely consumes CPU.
+        -:  150:     *
+        -:  151:     *   On the very first sweep  →  start at grace_period_ms/4 (the legacy
+        -:  152:     *                               default) so the first batch of retired
+        -:  153:     *                               handles is freed promptly.
+        -:  154:     *
+        -:  155:     * No external inputs (queue depth, compile frequency) are needed: the
+        -:  156:     * retire stack itself is the sole signal.  A busy JIT engine retires
+        -:  157:     * handles frequently; those handles will have large remaining_ms on the
+        -:  158:     * first sweep after retirement, driving the sleep to exactly the right
+        -:  159:     * duration.
+        -:  160:     */
+      250:  161:    uint32_t grace   = dgc->grace_period_ms;
+     250*:  162:    uint32_t max_ms  = grace / 2 > 0 ? grace / 2 : 1;
+     250*:  163:    uint32_t next_ms = grace / 4 > 0 ? grace / 4 : 1;
+        -:  164:
+     2929:  165:    while (!atomic_load_explicit(&dgc->stop_flag, memory_order_acquire)) {
+     2686:  166:        struct timespec ts = {
+     2686:  167:            .tv_sec  = (time_t)(next_ms / 1000),
+     2686:  168:            .tv_nsec = (long)(next_ms % 1000) * 1000000L,
+        -:  169:        };
+     2686:  170:        nanosleep(&ts, NULL);
+        -:  171:
+     2679:  172:        uint32_t remaining = dgc_sweep(dgc, /*force=*/false);
+        -:  173:
+     2679:  174:        if (remaining > 0) {
+        -:  175:            /* Sleep until the next pending handle is ready to be freed.
+        -:  176:             * Add 1 ms so we don't wake a tiny bit too early. */
+      194:  177:            next_ms = remaining + 1;
+      194:  178:            if (next_ms > max_ms) next_ms = max_ms;
+        -:  179:        } else {
+        -:  180:            /* Nothing pending: back off to reduce idle CPU usage. */
+     2485:  181:            next_ms *= 2;
+     2485:  182:            if (next_ms > max_ms) next_ms = max_ms;
+        -:  183:        }
+        -:  184:    }
+        -:  185:
+        -:  186:    /* On shutdown: free everything unconditionally. */
+      243:  187:    dgc_sweep(dgc, /*force=*/true);
+      243:  188:    return NULL;
+        -:  189:}
+        -:  190:
+        -:  191:/* ─────────────────────── public API ─────────────────────────────────────────── */
+        -:  192:
+      271:  193:void dgc_init(deferred_gc_t *dgc, uint32_t grace_period_ms)
+        -:  194:{
+      271:  195:    memset(dgc, 0, sizeof(*dgc));
+      271:  196:    atomic_init(&dgc->head,          NULL);
+      271:  197:    atomic_init(&dgc->pool_head,     NULL);
+      271:  198:    atomic_init(&dgc->stop_flag,     false);
+      271:  199:    atomic_init(&dgc->total_retired,  0);
+      271:  200:    atomic_init(&dgc->total_freed,    0);
+        -:  201:
+      271:  202:    dgc->grace_period_ms = grace_period_ms;
+        -:  203:
+        -:  204:    /*
+        -:  205:     * Pre-allocate the node pool.  Push all DGC_POOL_SIZE nodes onto the
+        -:  206:     * freelist so dgc_retire() can pop them without calling malloc().
+        -:  207:     * If allocation fails we degrade gracefully to malloc-only mode.
+        -:  208:     */
+      271:  209:    dgc->pool_storage = malloc(DGC_POOL_SIZE * sizeof(retire_entry_t));
+      271:  210:    if (dgc->pool_storage) {
+    17615:  211:        for (uint32_t i = 0; i < DGC_POOL_SIZE; ++i)
+    17344:  212:            pool_push(dgc, &dgc->pool_storage[i]);
+        -:  213:    }
+      271:  214:}
+        -:  215:
+      250:  216:void dgc_start(deferred_gc_t *dgc)
+        -:  217:{
+      250:  218:    atomic_store_explicit(&dgc->stop_flag, false, memory_order_relaxed);
+      250:  219:    pthread_create(&dgc->thread, NULL, gc_thread_fn, dgc);
+      250:  220:}
+        -:  221:
+      243:  222:void dgc_stop(deferred_gc_t *dgc)
+        -:  223:{
+      243:  224:    atomic_store_explicit(&dgc->stop_flag, true, memory_order_release);
+      243:  225:    pthread_join(dgc->thread, NULL);
+        -:  226:    /* gc_thread_fn already called dgc_sweep(force=true) before exit. */
+        -:  227:
+        -:  228:    /* Free the pre-allocated node pool backing storage. */
+      243:  229:    free(dgc->pool_storage);
+      243:  230:    dgc->pool_storage = NULL;
+      243:  231:}
+        -:  232:
+      468:  233:void dgc_retire(deferred_gc_t *dgc, void *handle)
+        -:  234:{
+      468:  235:    if (!handle) return;
+        -:  236:
+        -:  237:    /*
+        -:  238:     * Obtain a retire_entry_t node from the pre-allocated pool if possible,
+        -:  239:     * falling back to malloc() only when the pool is exhausted (extremely
+        -:  240:     * rare: requires >DGC_POOL_SIZE concurrent in-flight retirements).
+        -:  241:     */
+      106:  242:    retire_entry_t *entry = pool_pop(dgc);
+      106:  243:    if (!entry) {
+    #####:  244:        entry = malloc(sizeof(*entry));
+    #####:  245:        if (!entry) {
+        -:  246:            /* Allocation failure is non-fatal; dlclose immediately rather
+        -:  247:             * than crash or leak.                                         */
+    #####:  248:            dlclose(handle);
+    #####:  249:            return;
+        -:  250:        }
+        -:  251:    }
+      106:  252:    entry->handle     = handle;
+      106:  253:    entry->retire_ms  = now_ms();
+      106:  254:    entry->next       = NULL;
+        -:  255:
+      106:  256:    stack_push(dgc, entry);
+      106:  257:    atomic_fetch_add_explicit(&dgc->total_retired, 1, memory_order_relaxed);
+        -:  258:}
+        -:  259:
+     2922:  260:uint32_t dgc_sweep(deferred_gc_t *dgc, bool force)
+        -:  261:{
+     2922:  262:    retire_entry_t *list  = stack_drain(dgc);
+     2922:  263:    retire_entry_t *keep  = NULL;
+        -:  264:    retire_entry_t *next;
+     2922:  265:    uint64_t        now   = now_ms();
+     2922:  266:    uint32_t        min_remaining = 0;  /* min ms until next pending entry is freeable */
+        -:  267:
+     3251:  268:    while (list) {
+      329:  269:        next = list->next;
+        -:  270:
+      329:  271:        if (force || (now - list->retire_ms) >= dgc->grace_period_ms) {
+        -:  272:            /* Safe to reclaim. */
+      106:  273:            if (list->handle) dlclose(list->handle);
+      106:  274:            atomic_fetch_add_explicit(&dgc->total_freed, 1, memory_order_relaxed);
+        -:  275:            /* Return the node to the pool if it came from there; otherwise
+        -:  276:             * free() it (it was malloc'd as a pool-exhaustion fallback).  */
+      212:  277:            if (pool_owns(dgc, list))
+      106:  278:                pool_push(dgc, list);
+        -:  279:            else
+    #####:  280:                free(list);
+        -:  281:        } else {
+        -:  282:            /*
+        -:  283:             * Not yet ready: compute remaining lifetime.
+        -:  284:             *
+        -:  285:             * We know: (now - list->retire_ms) < grace_period_ms (from the
+        -:  286:             * if-condition above that decided NOT to free).  With CLOCK_MONOTONIC
+        -:  287:             * the subtraction cannot wrap, so age < grace_period_ms is guaranteed
+        -:  288:             * and the cast is safe.
+        -:  289:             */
+      223:  290:            uint64_t age = now - list->retire_ms;
+      223:  291:            uint32_t remaining = (uint32_t)(dgc->grace_period_ms - age);
+      223:  292:            if (min_remaining == 0 || remaining < min_remaining)
+      223:  293:                min_remaining = remaining;
+        -:  294:
+      223:  295:            list->next = keep;
+      223:  296:            keep       = list;
+        -:  297:        }
+      329:  298:        list = next;
+        -:  299:    }
+        -:  300:
+        -:  301:    /* Re-push items that are not yet ready. */
+     3145:  302:    while (keep) {
+      223:  303:        next = keep->next;
+      223:  304:        stack_push(dgc, keep);
+      223:  305:        keep = next;
+        -:  306:    }
+        -:  307:
+     2922:  308:    return min_remaining;
+        -:  309:}

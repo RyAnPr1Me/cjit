@@ -133,6 +133,7 @@
 #include "deferred_gc.h"
 #include "func_table.h"
 #include "codegen.h"
+#include "codegen_cache.h"
 #include "ir_cache.h"
 
 #include <stdlib.h>
@@ -144,6 +145,7 @@
 #include <unistd.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <sys/stat.h>  /* mkdir */
 #ifdef __linux__
 #include <sched.h>    /* sched_getaffinity, CPU_COUNT */
 #endif
@@ -208,19 +210,33 @@ struct cjit_engine {
     /* IR LRU cache with memory-pressure awareness. */
     ir_lru_cache_t *ir_cache;
 
-    /*
-     * Per-compiler-thread work queues.
+    /**
+     * Persistent compiled-artifact cache.
      *
-     * Heap-allocated array of cfg.compiler_threads MPMC queues.  Tasks are
-     * routed by (func_id % num_threads) so the same function always lands on
-     * the same queue.  This gives each function compile_lock affinity to one
-     * thread, eliminating cross-thread trylock contention in the common case.
-     *
-     * Each queue has exactly ONE consumer (its owning thread).  A thread whose
-     * queue is empty steals from the next queue in round-robin order before
-     * sleeping on the shared condition variable.
+     * NULL when cfg.cache_dir is empty (cache disabled).
+     * When non-NULL, compiler threads check this cache before spawning the
+     * system C compiler, and store newly compiled artifacts for future hits.
      */
-    mpmc_queue_t   *work_queues;   /* [0 .. cfg.compiler_threads) */
+    codegen_cache_t *artifact_cache;
+
+    /*
+     * Per-compiler-thread work queues (2 per thread).
+     *
+     * Layout: work_queues[2 × thread_idx + lane]
+     *   lane 0 = normal queue   (priority 1 — background monitoring promotions)
+     *   lane 1 = priority queue (priority ≥ 2 — T2 upgrades, manual requests)
+     *
+     * A compiler thread always drains its own priority queue first, then its
+     * normal queue.  Work-stealing first targets priority queues of idle peers
+     * (to get urgent tasks done as fast as possible), then normal queues.
+     *
+     * Using two separate queues instead of a sorted queue preserves the O(1)
+     * lock-free MPMC properties of the underlying Vyukov ring-buffer: there is
+     * no reordering or search, just two FIFO queues with a fixed priority rule.
+     *
+     * Total memory: 2 × cfg.compiler_threads × sizeof(mpmc_queue_t).
+     */
+    mpmc_queue_t   *work_queues;   /* [2 × cfg.compiler_threads]: [0]=normal [1]=prio */
 
     /*
      * Shared condition variable.
@@ -271,7 +287,23 @@ struct cjit_engine {
     /* Global statistics (relaxed atomics; no strict ordering needed). */
     atomic_uint_fast64_t stat_compilations;
     atomic_uint_fast64_t stat_failed;
+    atomic_uint_fast64_t stat_timeouts;          /**< Compiler subprocess timeouts.  */
     atomic_uint_fast64_t stat_swaps;
+    atomic_uint_fast64_t stat_tier_skips;        /**< O0→O3 tier-skip promotions. */
+    atomic_uint_fast64_t stat_predictive_promos; /**< Slope-lookahead early promotions. */
+
+    /**
+     * Count of compiler threads that have acquired compile_lock and are
+     * actively compiling (between compile_lock acquire and release).
+     *
+     * Incremented by every compiler thread (or cjit_compile_sync) just
+     * before acquiring compile_lock; decremented immediately after
+     * releasing it.  Used by cjit_drain_queue() to detect the window
+     * between in_queue=false (cleared before the lock) and the actual
+     * end of compilation.  Written and read with relaxed ordering since
+     * cjit_drain_queue() polls with nanosleep pauses between reads.
+     */
+    atomic_uint_fast32_t active_compilations;
 
     /*
      * Condition variable signaled after every compilation attempt (success or
@@ -286,6 +318,21 @@ struct cjit_engine {
      */
     pthread_mutex_t compile_done_mutex;
     pthread_cond_t  compile_done_cond;
+
+    /*
+     * Compile-event callback (optional).
+     *
+     * Called by compiler threads after every compilation attempt (success,
+     * failure, or timeout) with a cjit_compile_event_t snapshot.
+     *
+     * Both fields are protected by a single mutex so that the callback + its
+     * userdata are always updated and read atomically.  The mutex is acquired
+     * once per compilation event — an infrequent operation, never on the hot
+     * dispatch path.
+     */
+    pthread_mutex_t         cb_mutex;
+    cjit_compile_callback_t compile_cb;
+    void                   *compile_cb_userdata;
 };
 
 /* ══════════════════════════ internal helpers ══════════════════════════════ */
@@ -306,6 +353,10 @@ static uint64_t engine_now_ms(void)
  * acquired by the same thread, eliminating cross-thread trylock contention
  * in the common case.
  *
+ * Two-level priority:
+ *   priority >= 2 → priority queue (lane 1): T2 upgrades, manual requests.
+ *   priority  < 2 → normal queue   (lane 0): background monitoring promotions.
+ *
  * The condvar signal is sent inside a brief mutex section so no wake-up can
  * be lost (see engine struct comment for the full protocol).
  *
@@ -316,7 +367,8 @@ static bool engine_enqueue_task(cjit_engine_t *engine,
 {
     uint32_t n      = engine->cfg.compiler_threads;
     uint32_t target = task->func_id % n;
-    bool ok = mpmc_enqueue(&engine->work_queues[target], task);
+    uint32_t lane   = (task->priority >= 2) ? 1u : 0u;
+    bool ok = mpmc_enqueue(&engine->work_queues[2 * target + lane], task);
     if (ok) {
         pthread_mutex_lock(&engine->work_cond_mutex);
         pthread_cond_signal(&engine->work_cond);
@@ -361,18 +413,48 @@ static void *compiler_thread_fn(void *raw_arg)
         .verbose              = engine->cfg.verbose,
         .extra_cflags         = engine->cfg.extra_cflags[0] ? engine->cfg.extra_cflags : NULL,
         .cc_binary            = engine->cfg.cc_binary[0]    ? engine->cfg.cc_binary    : NULL,
+        .cache                = engine->artifact_cache,   /* may be NULL */
+        .compile_timeout_ms   = engine->cfg.compile_timeout_ms,
     };
 
     while (!atomic_load_explicit(&engine->stop_requested, memory_order_acquire)) {
 
-        /* Step 1: own queue – no peer contention. */
+        /*
+         * Two-level dequeue: always drain the priority queue first.
+         *
+         * Step 1a: own priority queue (lane 1) — T2 upgrades, manual requests.
+         * Step 1b: own normal queue   (lane 0) — background monitoring.
+         * Step 2a: steal priority queues from neighbours (urgent tasks get
+         *          processed as fast as possible, across threads if needed).
+         * Step 2b: steal normal queues from neighbours (load balancing).
+         * Step 3:  all queues empty — block on condvar.
+         */
         compile_task_t task;
-        bool got = mpmc_dequeue(&engine->work_queues[me], &task);
+        bool got;
 
-        /* Step 2: work-steal from neighbours round-robin. */
+        /* Step 1a: own priority queue. */
+        got = mpmc_dequeue(&engine->work_queues[2 * me + 1], &task);
+
+        /* Step 1b: own normal queue. */
+        if (!got)
+            got = mpmc_dequeue(&engine->work_queues[2 * me + 0], &task);
+
+        /* Step 2a: work-steal priority queues round-robin. */
         if (!got) {
             for (uint32_t i = 1; i < n; ++i) {
-                if (mpmc_dequeue(&engine->work_queues[(me + i) % n], &task)) {
+                uint32_t peer = (me + i) % n;
+                if (mpmc_dequeue(&engine->work_queues[2 * peer + 1], &task)) {
+                    got = true;
+                    break;
+                }
+            }
+        }
+
+        /* Step 2b: work-steal normal queues round-robin. */
+        if (!got) {
+            for (uint32_t i = 1; i < n; ++i) {
+                uint32_t peer = (me + i) % n;
+                if (mpmc_dequeue(&engine->work_queues[2 * peer + 0], &task)) {
                     got = true;
                     break;
                 }
@@ -387,7 +469,7 @@ static void *compiler_thread_fn(void *raw_arg)
              * that arrived after the steal loop above but before the lock.
              */
             bool any = false;
-            for (uint32_t i = 0; i < n && !any; ++i)
+            for (uint32_t i = 0; i < 2 * n && !any; ++i)
                 any = (mpmc_size(&engine->work_queues[i]) > 0);
             if (!any && !atomic_load_explicit(&engine->stop_requested,
                                               memory_order_relaxed))
@@ -429,8 +511,14 @@ static void *compiler_thread_fn(void *raw_arg)
             continue;
         }
 
-        /* Acquire per-entry compile lock (non-blocking trylock). */
+        /* Acquire per-entry compile lock (non-blocking trylock).
+         * Increment active_compilations first so cjit_drain_queue() can
+         * observe in-flight work even after in_queue is cleared. */
+        atomic_fetch_add_explicit(&engine->active_compilations, 1,
+                                  memory_order_relaxed);
         if (pthread_mutex_trylock(&entry->compile_lock) != 0) {
+            atomic_fetch_sub_explicit(&engine->active_compilations, 1,
+                                      memory_order_relaxed);
             /*
              * Another thread is already compiling this function.
              *
@@ -451,9 +539,10 @@ static void *compiler_thread_fn(void *raw_arg)
                     &entry->in_queue, &exp, true,
                     memory_order_relaxed, memory_order_relaxed)) {
                 /* We reclaimed the slot; re-enqueue to the affinity queue.
-                 * Routing uses (func_id % n), identical to engine_enqueue_task,
-                 * so tasks for the same function always land on the same queue. */
-                if (!mpmc_enqueue(&engine->work_queues[task.func_id % n], &task)) {
+                 * Use the same priority-lane routing as engine_enqueue_task. */
+                uint32_t lane = (task.priority >= 2) ? 1u : 0u;
+                if (!mpmc_enqueue(&engine->work_queues[2 * (task.func_id % n) + lane],
+                                  &task)) {
                     /* Queue full: clear in_queue so future enqueues can proceed. */
                     atomic_store_explicit(&entry->in_queue, false,
                                           memory_order_relaxed);
@@ -485,6 +574,8 @@ static void *compiler_thread_fn(void *raw_arg)
             fprintf(stderr, "[cjit/compiler#%u] no IR for '%s'\n",
                     me, entry->name);
             pthread_mutex_unlock(&entry->compile_lock);
+            atomic_fetch_sub_explicit(&engine->active_compilations, 1,
+                                      memory_order_relaxed);
             free(ir_cache_copy);
             continue;
         }
@@ -499,11 +590,27 @@ static void *compiler_thread_fn(void *raw_arg)
          * coherence).  The arg_profile pointer is only valid until the end of
          * this codegen_compile() call (entry remains live throughout since we
          * hold compile_lock).
+         *
+         * Also pass the runtime call-rate and average elapsed-time-per-call
+         * observed at the time this task was enqueued.  These are injected by
+         * codegen_compile() as preprocessor defines (CJIT_CALL_RATE,
+         * CJIT_AVG_ELAPSED_NS) so user IR can make compile-time decisions
+         * based on the function's actual runtime profile.
          */
         copts.arg_profile = &entry->arg_profile;
+        copts.call_rate   = task.call_rate;
+        {
+            uint64_t cnt_snap = atomic_load_explicit(&entry->call_cnt,
+                                                      memory_order_relaxed);
+            uint64_t ns_snap  = atomic_load_explicit(&entry->total_elapsed_ns,
+                                                      memory_order_relaxed);
+            copts.avg_elapsed_ns = (cnt_snap > 0) ? (ns_snap / cnt_snap) : 0;
+        }
         bool ok = codegen_compile(entry->name, ir_to_use,
                                    task.target_level, &copts, &cres);
-        copts.arg_profile = NULL; /* clear for next task */
+        copts.arg_profile    = NULL; /* clear for next task */
+        copts.call_rate      = 0;
+        copts.avg_elapsed_ns = 0;
         free(ir_cache_copy);
 
         /* Record how long this compilation took (relaxed store, read by monitor
@@ -515,13 +622,41 @@ static void *compiler_thread_fn(void *raw_arg)
         if (!ok) {
             atomic_fetch_add_explicit(&engine->stat_failed, 1,
                                       memory_order_relaxed);
-            fprintf(stderr, "[cjit/compiler#%u] FAILED '%s': %s\n",
-                    me, entry->name, cres.errmsg);
+            if (cres.timed_out) {
+                atomic_fetch_add_explicit(&engine->stat_timeouts, 1,
+                                          memory_order_relaxed);
+                if (engine->cfg.verbose)
+                    fprintf(stderr, "[cjit/compiler#%u] TIMEOUT '%s' (>%u ms)\n",
+                            me, entry->name, engine->cfg.compile_timeout_ms);
+            } else {
+                fprintf(stderr, "[cjit/compiler#%u] FAILED '%s': %s\n",
+                        me, entry->name, cres.errmsg);
+            }
             pthread_mutex_unlock(&entry->compile_lock);
+            atomic_fetch_sub_explicit(&engine->active_compilations, 1,
+                                      memory_order_relaxed);
             /* Wake any cjit_wait_compiled() caller so it can detect failure. */
             pthread_mutex_lock(&engine->compile_done_mutex);
             pthread_cond_broadcast(&engine->compile_done_cond);
             pthread_mutex_unlock(&engine->compile_done_mutex);
+            /* Fire compile-event callback (failure path). */
+            pthread_mutex_lock(&engine->cb_mutex);
+            cjit_compile_callback_t cb = engine->compile_cb;
+            void *cb_ud = engine->compile_cb_userdata;
+            pthread_mutex_unlock(&engine->cb_mutex);
+            if (cb) {
+                cjit_compile_event_t ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.func_id    = task.func_id;
+                snprintf(ev.func_name, sizeof(ev.func_name), "%s", entry->name);
+                ev.level      = task.target_level;
+                ev.success    = false;
+                ev.timed_out  = cres.timed_out;
+                ev.cache_hit  = false;
+                ev.duration_ms = dur_ms;
+                snprintf(ev.errmsg, sizeof(ev.errmsg), "%.255s", cres.errmsg);
+                cb(&ev, cb_ud);
+            }
             continue;
         }
 
@@ -535,6 +670,8 @@ static void *compiler_thread_fn(void *raw_arg)
         atomic_fetch_add_explicit(&engine->stat_swaps, 1,
                                   memory_order_relaxed);
         pthread_mutex_unlock(&entry->compile_lock);
+        atomic_fetch_sub_explicit(&engine->active_compilations, 1,
+                                  memory_order_relaxed);
 
         /* Retire old handle – GC thread dlclose's after the grace period. */
         dgc_retire(&engine->dgc, old_handle);
@@ -543,6 +680,24 @@ static void *compiler_thread_fn(void *raw_arg)
         pthread_mutex_lock(&engine->compile_done_mutex);
         pthread_cond_broadcast(&engine->compile_done_cond);
         pthread_mutex_unlock(&engine->compile_done_mutex);
+
+        /* Fire compile-event callback (success path). */
+        pthread_mutex_lock(&engine->cb_mutex);
+        cjit_compile_callback_t cb2 = engine->compile_cb;
+        void *cb2_ud = engine->compile_cb_userdata;
+        pthread_mutex_unlock(&engine->cb_mutex);
+        if (cb2) {
+            cjit_compile_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.func_id    = task.func_id;
+            snprintf(ev.func_name, sizeof(ev.func_name), "%s", entry->name);
+            ev.level      = task.target_level;
+            ev.success    = true;
+            ev.timed_out  = false;
+            ev.cache_hit  = cres.cache_hit;
+            ev.duration_ms = dur_ms;
+            cb2(&ev, cb2_ud);
+        }
 
         if (engine->cfg.verbose)
             fprintf(stderr,
@@ -620,6 +775,7 @@ static void *monitor_thread_fn(void *arg)
      *   [uint64_t × max_funcs] last_queued_ms
      *   [uint64_t × max_funcs] prev_elapsed       ← nanosecond baseline
      *   [float    × max_funcs] ema_rate
+     *   [float    × max_funcs] prev_ema_rate       ← for slope extrapolation
      *   [float    × max_funcs] ema_ns_per_sec      ← CPU-time EMA (ns/s)
      *   [uint32_t × max_funcs] hot_scan_streak
      *   [bool     × max_funcs] prefetch_done
@@ -631,24 +787,30 @@ static void *monitor_thread_fn(void *arg)
      * This ensures each successive recompile requires a proportionally
      * longer observation window, preventing promotions based on
      * insufficient or transient data.
+     *
+     * prev_ema_rate[i] holds the EMA value from the previous scan cycle.
+     * The per-cycle delta (ema_rate[i] - prev_ema_rate[i]) is the "slope"
+     * used for predictive promotion lookahead.
      */
     size_t monitor_block_sz =
-        (size_t)max_funcs * (4 * sizeof(uint64_t) + 2 * sizeof(float)
-                             + sizeof(uint32_t) + sizeof(bool));
+        (size_t)max_funcs * (4 * sizeof(uint64_t) + 3 * sizeof(float)
+                             + sizeof(uint32_t) + 2 * sizeof(bool));
     void *monitor_block = calloc(1, monitor_block_sz);
     if (!monitor_block) {
         fprintf(stderr, "[cjit/monitor] FATAL: cannot allocate monitor state (%zu B)\n", monitor_block_sz);
         return NULL;
     }
 
-    uint64_t *prev_cnt        = (uint64_t *)monitor_block;
-    uint64_t *cnt_at_compile  = prev_cnt        + max_funcs;
-    uint64_t *last_queued_ms  = cnt_at_compile  + max_funcs;
-    uint64_t *prev_elapsed    = last_queued_ms  + max_funcs;
-    float    *ema_rate        = (float   *)(void *)(prev_elapsed    + max_funcs);
-    float    *ema_ns_per_sec  = (float   *)(void *)(ema_rate        + max_funcs);
-    uint32_t *hot_scan_streak = (uint32_t *)(void *)(ema_ns_per_sec + max_funcs);
-    bool     *prefetch_done   = (bool    *)(void *)(hot_scan_streak + max_funcs);
+    uint64_t *prev_cnt          = (uint64_t *)monitor_block;
+    uint64_t *cnt_at_compile    = prev_cnt          + max_funcs;
+    uint64_t *last_queued_ms    = cnt_at_compile    + max_funcs;
+    uint64_t *prev_elapsed      = last_queued_ms    + max_funcs;
+    float    *ema_rate          = (float   *)(void *)(prev_elapsed      + max_funcs);
+    float    *prev_ema_rate     = (float   *)(void *)(ema_rate          + max_funcs);
+    float    *ema_ns_per_sec    = (float   *)(void *)(prev_ema_rate     + max_funcs);
+    uint32_t *hot_scan_streak   = (uint32_t *)(void *)(ema_ns_per_sec   + max_funcs);
+    bool     *prefetch_done     = (bool    *)(void *)(hot_scan_streak   + max_funcs);
+    bool     *tier_skip_pending = (bool    *)(void *)(prefetch_done     + max_funcs);
 
     struct timespec interval;
     interval.tv_sec  = itvl_ms / 1000;
@@ -687,7 +849,25 @@ static void *monitor_thread_fn(void *arg)
             if (delta > (uint64_t)1000000000000ULL)
                 delta = (uint64_t)1000000000000ULL;
             uint64_t inst_rate = delta * 1000ULL / itvl_safe;  /* calls/sec */
-            ema_rate[i] = ema_rate[i] + alpha * ((float)inst_rate - ema_rate[i]);
+
+            /*
+             * Update EMA and track the per-scan slope for predictive promotion.
+             *
+             * slope = new_ema − old_ema  (calls/sec gained per scan cycle)
+             *
+             * A positive slope means the call rate is currently rising.  The
+             * predictive promotion feature extrapolates:
+             *
+             *   predicted_rate = ema_rate + slope × lookahead_cycles
+             *
+             * and uses predicted_rate for threshold comparisons instead of the
+             * raw EMA.  This fires promotions earlier when the rate is trending
+             * upward, reducing first-compile latency during fast-ramp workloads.
+             */
+            float old_ema   = ema_rate[i];
+            ema_rate[i]     = old_ema + alpha * ((float)inst_rate - old_ema);
+            float ema_slope = ema_rate[i] - prev_ema_rate[i];
+            prev_ema_rate[i] = ema_rate[i];
 
             /*
              * Update the CPU-time EMA (nanoseconds/second).
@@ -714,7 +894,15 @@ static void *monitor_thread_fn(void *arg)
                                                    memory_order_relaxed);
 
             /* Already at maximum tier. */
-            if (cur_level >= OPT_O3) continue;
+            if (cur_level >= OPT_O3) {
+                /* Clear pending flag once the skip target has been reached. */
+                tier_skip_pending[i] = false;
+                continue;
+            }
+
+            /* ── Pinned: skip auto-promotion ────────────────────────────── */
+            if (atomic_load_explicit(&entry->pinned, memory_order_relaxed))
+                continue;
 
             /* ── Warm-up prefetch (one-shot, non-blocking) ─────────────── */
             if (!prefetch_done[i] && engine->ir_cache &&
@@ -723,6 +911,153 @@ static void *monitor_thread_fn(void *arg)
                     == IRC_GEN_COLD) {
                 if (ir_cache_prefetch(engine->ir_cache, (func_id_t)i))
                     prefetch_done[i] = true;
+            }
+
+            /* ── O1 warm-up tier (optional, fires before tier-skip) ─────── */
+            /*
+             * When enable_o1_warmup is set, compile to OPT_O1 as soon as
+             * the EMA crosses warm_rate_t0 (default: hot_rate_t1 / 4).
+             * OPT_O1 is fast to compile (typically < 100 ms) and eliminates
+             * the window where the function runs as unoptimised baseline code
+             * while waiting for the hot_confirm_cycles streak required for
+             * OPT_O2.
+             *
+             * No streak gate: OPT_O1 is cheap enough that one false-positive
+             * is harmless.  The normal OPT_O2 and OPT_O3 gates are unaffected.
+             * hot_scan_streak is NOT reset here so O2's streak keeps building.
+             */
+            if (engine->cfg.enable_o1_warmup && cur_level < OPT_O1) {
+                uint64_t t0_wu = engine->cfg.warm_rate_t0;
+                if (t0_wu == 0) t0_wu = engine->cfg.hot_rate_t1 / 4;
+                if (t0_wu == 0) t0_wu = 1;
+
+                if ((uint64_t)ema_rate[i] >= t0_wu) {
+                    uint32_t last_dur_wu = atomic_load_explicit(
+                        &entry->last_compile_duration_ms, memory_order_relaxed);
+                    uint32_t eff_cooloff_wu = engine->cfg.compile_cooloff_ms;
+                    uint32_t last_dur_wu_x2 = (last_dur_wu <= UINT32_MAX / 2)
+                                                  ? last_dur_wu * 2 : UINT32_MAX;
+                    if (last_dur_wu_x2 > eff_cooloff_wu)
+                        eff_cooloff_wu = last_dur_wu_x2;
+
+                    if ((now - last_queued_ms[i]) >= eff_cooloff_wu) {
+                        bool exp_wu = false;
+                        if (atomic_compare_exchange_strong_explicit(
+                                &entry->in_queue, &exp_wu, true,
+                                memory_order_relaxed, memory_order_relaxed)) {
+                            uint32_t ver_wu = atomic_load_explicit(
+                                &entry->version, memory_order_relaxed);
+                            compile_task_t wu_task = {
+                                .func_id      = (func_id_t)i,
+                                .target_level = OPT_O1,
+                                .priority     = 1,
+                                .version_req  = ver_wu,
+                                .call_rate    = (uint64_t)ema_rate[i],
+                            };
+                            if (engine_enqueue_task(engine, &wu_task)) {
+                                last_queued_ms[i] = now;
+                                cnt_at_compile[i] = cur_cnt;
+                                if (engine->cfg.verbose)
+                                    fprintf(stderr,
+                                        "[cjit/monitor] O1-warmup '%s'"
+                                        " (rate=%.0f thresh=%llu)\n",
+                                        entry->name, (double)ema_rate[i],
+                                        (unsigned long long)t0_wu);
+                            } else {
+                                atomic_store_explicit(&entry->in_queue, false,
+                                                      memory_order_relaxed);
+                            }
+                        }
+                    }
+                    /* Fall through: normal T1/T2 gate runs this same cycle.
+                     * If rate also crosses hot_rate_t1 the CAS will fail
+                     * (in_queue already true) and the O2 task will be picked
+                     * up on the next scan cycle once O1 has been dequeued. */
+                }
+            }
+
+            /* ── Tier-skip optimization ─────────────────────────────────── */
+            /*
+             * When tier_skip_multiplier > 0 and the function has not yet
+             * been compiled, check whether the call rate already exceeds
+             * (hot_rate_t2 × multiplier).  If so, issue an OPT_O3 task
+             * directly (skip the intermediate OPT_O2 tier), saving one
+             * complete compiler invocation.
+             *
+             * The same hot_confirm_cycles gate applies, so the function must
+             * sustain the elevated rate for the full streak before the skip
+             * fires — transient spikes do not trigger this path.
+             *
+             * When this path fires the normal T1/T2 gate below is skipped.
+             */
+            if (engine->cfg.tier_skip_multiplier > 0.0f &&
+                cur_level < OPT_O2 &&
+                !tier_skip_pending[i]) {
+                float skip_thresh =
+                    (float)engine->cfg.hot_rate_t2 * engine->cfg.tier_skip_multiplier;
+                if (ema_rate[i] >= skip_thresh) {
+                    /* Reload streak and recompile cap. */
+                    uint32_t rc_skip = atomic_load_explicit(&entry->recompile_count,
+                                                             memory_order_relaxed);
+                    if (rc_skip < engine->cfg.max_recompiles_per_func) {
+                        uint32_t req_streak = engine->cfg.hot_confirm_cycles
+                            + rc_skip * engine->cfg.extra_streak_per_recompile;
+                        hot_scan_streak[i]++;
+                        if (hot_scan_streak[i] >= req_streak) {
+                            uint64_t now2 = engine_now_ms();
+                            uint32_t last_dur =
+                                atomic_load_explicit(&entry->last_compile_duration_ms,
+                                                     memory_order_relaxed);
+                            uint64_t eff_cooloff =
+                                engine->cfg.compile_cooloff_ms > 2 * last_dur
+                                    ? engine->cfg.compile_cooloff_ms
+                                    : 2 * (uint64_t)last_dur;
+                            if ((now2 - last_queued_ms[i]) >= eff_cooloff) {
+                                uint32_t ver =
+                                    atomic_load_explicit(&entry->version,
+                                                          memory_order_relaxed);
+                                bool already =
+                                    atomic_load_explicit(&entry->in_queue,
+                                                          memory_order_relaxed);
+                                if (!already) {
+                                    bool exp2 = false;
+                                    if (atomic_compare_exchange_strong_explicit(
+                                            &entry->in_queue, &exp2, true,
+                                            memory_order_relaxed,
+                                            memory_order_relaxed)) {
+                                        compile_task_t task = {
+                                            .func_id      = (func_id_t)i,
+                                            .target_level = OPT_O3,
+                                            .priority     = 2,
+                                            .version_req  = ver,
+                                            .call_rate    = (uint64_t)ema_rate[i],
+                                        };
+                                        if (engine_enqueue_task(engine, &task)) {
+                                            last_queued_ms[i]   = now2;
+                                            cnt_at_compile[i]   = cur_cnt;
+                                            hot_scan_streak[i]  = 0;
+                                            tier_skip_pending[i] = true;
+                                            atomic_fetch_add_explicit(
+                                                &engine->stat_tier_skips, 1,
+                                                memory_order_relaxed);
+                                            if (engine->cfg.verbose)
+                                                fprintf(stderr,
+                                                    "[cjit/monitor] tier-skip '%s' → O3"
+                                                    " (rate=%.0f skip_thresh=%.0f)\n",
+                                                    entry->name,
+                                                    (double)ema_rate[i],
+                                                    (double)skip_thresh);
+                                            continue;
+                                        }
+                                        atomic_store_explicit(&entry->in_queue, false,
+                                                              memory_order_relaxed);
+                                    }
+                                }
+                            }
+                        }
+                        continue; /* handled by tier-skip path; skip normal gate */
+                    }
+                }
             }
 
             /* ── Tier promotion gate ────────────────────────────────────── */
@@ -811,8 +1146,35 @@ static void *monitor_thread_fn(void *arg)
             bool ns_hot   = (scaled_ns_thresh > 0 &&
                              (uint64_t)ema_ns_per_sec[i] >= scaled_ns_thresh);
 
+            /*
+             * Predictive promotion: if the call-rate EMA has been rising
+             * (positive slope) and prediction_lookahead_cycles > 0, extrapolate
+             * the rate forward to see if it will cross the threshold within the
+             * lookahead window.  A positive prediction triggers a "predictive
+             * hot" condition that counts toward the streak even if the raw EMA
+             * has not yet reached the threshold.
+             *
+             * We clamp the slope contribution to the threshold value to prevent
+             * a single extreme spike from masking as a sustained trend.
+             *
+             * The counter stat_predictive_promos is incremented only when the
+             * predictive signal is the deciding factor (i.e., rate_hot was false
+             * but predicted_hot would be true) AND the streak gate is met.
+             */
+            bool predicted_hot = false;
+            if (!rate_hot && engine->cfg.prediction_lookahead_cycles > 0
+                          && ema_slope > 0.0f) {
+                float max_slope_contrib = (float)scaled_rate_thresh;
+                float slope_contrib = ema_slope
+                    * (float)engine->cfg.prediction_lookahead_cycles;
+                if (slope_contrib > max_slope_contrib)
+                    slope_contrib = max_slope_contrib;
+                predicted_hot = ((ema_rate[i] + slope_contrib) >=
+                                 (float)scaled_rate_thresh);
+            }
+
             /* Neither signal crosses its threshold → cold scan, reset streak. */
-            if (!rate_hot && !ns_hot) {
+            if (!rate_hot && !ns_hot && !predicted_hot) {
                 hot_scan_streak[i] = 0;
                 continue;
             }
@@ -916,15 +1278,21 @@ static void *monitor_thread_fn(void *arg)
                 last_queued_ms[i]   = now;
                 hot_scan_streak[i]  = 0;  /* fresh evidence required for next tier */
                 prefetch_done[i]    = false;
+                /* Bookkeeping: was this a predictive promotion? */
+                if (predicted_hot && !rate_hot && !ns_hot) {
+                    atomic_fetch_add_explicit(&engine->stat_predictive_promos, 1,
+                                              memory_order_relaxed);
+                }
                 if (engine->cfg.verbose)
                     fprintf(stderr,
                             "[cjit/monitor] enqueued '%s' for O%d "
-                            "(ema=%.0fcps ema_ns=%.0fns/s streak=%u/%u rc=%u cooloff=%ums)\n",
+                            "(ema=%.0fcps ema_ns=%.0fns/s streak=%u/%u rc=%u cooloff=%ums%s)\n",
                             entry->name, (int)target,
                             (double)ema_rate[i],
                             (double)ema_ns_per_sec[i],
                             hot_scan_streak[i], req_streak,
-                            rc, effective_cooloff);
+                            rc, effective_cooloff,
+                            (predicted_hot && !rate_hot) ? " [predictive]" : "");
             }
         }
     }
@@ -981,6 +1349,10 @@ cjit_config_t cjit_default_config(void)
     cfg.min_uptime_for_tier2_ms     = CJIT_DEFAULT_MIN_UPTIME_T2_MS;
     cfg.extra_streak_per_recompile  = CJIT_DEFAULT_EXTRA_STREAK_PER_RECOMPILE;
 
+    /* Tier-skip and predictive promotion (disabled by default; opt-in). */
+    cfg.tier_skip_multiplier          = 0.0f;
+    cfg.prediction_lookahead_cycles   = 0;
+
     /* CPU-time-based tier promotion (disabled by default; opt-in). */
     cfg.cpu_hot_ns_per_sec_t1 = CJIT_DEFAULT_CPU_HOT_NS_T1;
     cfg.cpu_hot_ns_per_sec_t2 = CJIT_DEFAULT_CPU_HOT_NS_T2;
@@ -992,6 +1364,13 @@ cjit_config_t cjit_default_config(void)
     cfg.enable_native_arch   = true;
     cfg.enable_fast_math     = false;
     cfg.verbose              = false;
+
+    /* O1 warm-up tier (disabled by default; opt-in). */
+    cfg.enable_o1_warmup = false;
+    cfg.warm_rate_t0     = 0;  /* auto: hot_rate_t1 / 4 */
+
+    /* Compiler thread CPU affinity (disabled by default; opt-in). */
+    cfg.pin_compiler_threads = false;
 
     cfg.hot_ir_cache_size         = 64;
     cfg.warm_ir_cache_size        = 128;
@@ -1036,15 +1415,27 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
     e->ir_cache = ir_cache_create(&icc);
     if (!e->ir_cache) { func_table_destroy(e->ftable); free(e); return NULL; }
 
-    /* Per-thread work queues. */
-    e->work_queues = calloc(e->cfg.compiler_threads, sizeof(mpmc_queue_t));
+    /* Persistent compiled-artifact cache (optional – NULL if disabled). */
+    e->artifact_cache = NULL;
+    if (e->cfg.cache_dir[0]) {
+        e->artifact_cache = codegen_cache_create(e->cfg.cache_dir);
+        /*
+         * A failed cache_create (e.g. permission denied, disk full) is non-
+         * fatal: we continue without caching.  Each compilation falls back to
+         * the normal compile path; correctness is unaffected.
+         */
+    }
+
+    /* Per-thread work queues: 2 per thread (normal lane + priority lane). */
+    e->work_queues = calloc(2 * (size_t)e->cfg.compiler_threads, sizeof(mpmc_queue_t));
     if (!e->work_queues) {
+        codegen_cache_destroy(e->artifact_cache);
         ir_cache_destroy(e->ir_cache);
         func_table_destroy(e->ftable);
         free(e);
         return NULL;
     }
-    for (uint32_t i = 0; i < e->cfg.compiler_threads; ++i)
+    for (uint32_t i = 0; i < 2 * e->cfg.compiler_threads; ++i)
         mpmc_init(&e->work_queues[i]);
 
     /* Condition variable for instant compiler wake-up. */
@@ -1054,6 +1445,11 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
     /* Condition variable signaled after each compilation attempt. */
     pthread_mutex_init(&e->compile_done_mutex, NULL);
     pthread_cond_init(&e->compile_done_cond, NULL);
+
+    /* Compile-event callback (starts with no callback registered). */
+    pthread_mutex_init(&e->cb_mutex, NULL);
+    e->compile_cb          = NULL;
+    e->compile_cb_userdata = NULL;
 
     /* Dynamic thread arrays. */
     e->compiler_threads = calloc(e->cfg.compiler_threads, sizeof(pthread_t));
@@ -1072,11 +1468,14 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
 
     dgc_init(&e->dgc, e->cfg.grace_period_ms);
 
-    atomic_init(&e->running,           false);
-    atomic_init(&e->stop_requested,    false);
-    atomic_init(&e->stat_compilations,  0);
-    atomic_init(&e->stat_failed,        0);
-    atomic_init(&e->stat_swaps,         0);
+    atomic_init(&e->running,               false);
+    atomic_init(&e->stop_requested,        false);
+    atomic_init(&e->stat_compilations,      0);
+    atomic_init(&e->stat_failed,            0);
+    atomic_init(&e->stat_timeouts,          0);
+    atomic_init(&e->stat_swaps,             0);
+    atomic_init(&e->stat_tier_skips,        0);
+    atomic_init(&e->stat_predictive_promos, 0);
 
     return e;
 }
@@ -1099,6 +1498,28 @@ void cjit_start(cjit_engine_t *engine)
         engine->thread_args[i].thread_idx = i;
         pthread_create(&engine->compiler_threads[i], NULL,
                        compiler_thread_fn, &engine->thread_args[i]);
+#ifdef __linux__
+        /*
+         * Optionally pin each compiler thread to a CPU core.
+         *
+         * Pinning prevents thread migration between cores, which would
+         * otherwise cause cold cache misses in the compiler thread's working
+         * set (IR text, argv arrays, temp-file paths).  Each compiler thread
+         * is assigned to core (i % ncpu) so threads spread across available
+         * CPUs when there are more CPUs than compiler threads.
+         */
+        if (engine->cfg.pin_compiler_threads) {
+            long ncpu_pin = sysconf(_SC_NPROCESSORS_ONLN);
+            if (ncpu_pin > 0) {
+                cpu_set_t cs_pin;
+                CPU_ZERO(&cs_pin);
+                CPU_SET((int)((unsigned long)i % (unsigned long)ncpu_pin),
+                        &cs_pin);
+                pthread_setaffinity_np(engine->compiler_threads[i],
+                                       sizeof(cs_pin), &cs_pin);
+            }
+        }
+#endif
     }
 }
 
@@ -1140,12 +1561,14 @@ void cjit_destroy(cjit_engine_t *engine)
 
     func_table_destroy(engine->ftable);
     ir_cache_destroy(engine->ir_cache);
+    codegen_cache_destroy(engine->artifact_cache);   /* NULL-safe */
 
     pthread_cond_destroy(&engine->work_cond);
     pthread_mutex_destroy(&engine->work_cond_mutex);
 
     pthread_cond_destroy(&engine->compile_done_cond);
     pthread_mutex_destroy(&engine->compile_done_mutex);
+    pthread_mutex_destroy(&engine->cb_mutex);
 
     free(engine->work_queues);
     free(engine->compiler_threads);
@@ -1168,6 +1591,41 @@ func_id_t cjit_register_function(cjit_engine_t *engine,
         ir_cache_register(engine->ir_cache, id, name, ir_source);
 
     return id;
+}
+
+size_t cjit_register_from_source(cjit_engine_t *engine,
+                                  const char    *source,
+                                  size_t         n,
+                                  const char *const names[],
+                                  func_id_t      ids_out[])
+{
+    if (!engine || !source || !names || n == 0) {
+        if (ids_out) {
+            for (size_t k = 0; k < n; ++k)
+                ids_out[k] = CJIT_INVALID_FUNC_ID;
+        }
+        return 0;
+    }
+
+    size_t registered = 0;
+    for (size_t k = 0; k < n; ++k) {
+        func_id_t id = CJIT_INVALID_FUNC_ID;
+        if (names[k])
+            id = cjit_register_function(engine, names[k], source, NULL);
+        if (ids_out)
+            ids_out[k] = id;
+        if (id != CJIT_INVALID_FUNC_ID)
+            registered++;
+    }
+    return registered;
+}
+
+jit_func_t cjit_get_func_by_name(cjit_engine_t *engine, const char *name)
+{
+    if (!engine || !name) return NULL;
+    func_id_t id = cjit_lookup_function(engine, name);
+    if (id == CJIT_INVALID_FUNC_ID) return NULL;
+    return cjit_get_func(engine, id);
 }
 
 /*
@@ -1279,6 +1737,10 @@ void cjit_record_timed_call(cjit_engine_t *engine,
      * to the shared atomics with one call_cnt fetch_add and one (conditional)
      * total_elapsed_ns fetch_add.  This adds at most one extra atomic operation
      * per THRESHOLD calls compared to the non-timed path.
+     *
+     * The histogram bucket for the average per-call latency of this batch is
+     * also updated at the flush boundary — one additional atomic per THRESHOLD
+     * calls, zero overhead on the common (non-flush) path.
      */
     cjit_tls_elapsed[id] += elapsed_ns;
     if (__builtin_expect(++cjit_tls_counts[id] >= CJIT_TLS_FLUSH_THRESHOLD, 0)) {
@@ -1289,11 +1751,64 @@ void cjit_record_timed_call(cjit_engine_t *engine,
         if (__builtin_expect(e != NULL, 1)) {
             atomic_fetch_add_explicit(&e->call_cnt, CJIT_TLS_FLUSH_THRESHOLD,
                                       memory_order_relaxed);
-            if (acc > 0)
+            if (acc > 0) {
                 atomic_fetch_add_explicit(&e->total_elapsed_ns, acc,
                                           memory_order_relaxed);
+                /* Update histogram: bucket = floor(log₂(avg_ns)).
+                 * 63 - clz(x) computes the position of the most-significant set
+                 * bit (0-indexed from LSB), which equals floor(log₂(x)) for
+                 * any x ≥ 1.  The result is clamped to [0, CJIT_HIST_BUCKETS). */
+                uint64_t avg_ns = acc / CJIT_TLS_FLUSH_THRESHOLD;
+                int bucket = (avg_ns == 0) ? 0
+                    : (int)(63u - (unsigned)__builtin_clzll(avg_ns));
+                if (bucket >= CJIT_HIST_BUCKETS)
+                    bucket = CJIT_HIST_BUCKETS - 1;
+                atomic_fetch_add_explicit(&e->hist_counts[bucket], 1u,
+                                          memory_order_relaxed);
+            }
         }
     }
+}
+
+void cjit_get_histogram(const cjit_engine_t *engine,
+                        func_id_t            id,
+                        uint64_t             out[CJIT_HIST_BUCKETS])
+{
+    for (int i = 0; i < CJIT_HIST_BUCKETS; i++) out[i] = 0;
+    if (!engine) return;
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (!e) return;
+    for (int i = 0; i < CJIT_HIST_BUCKETS; i++)
+        out[i] = (uint64_t)atomic_load_explicit(&e->hist_counts[i],
+                                                 memory_order_relaxed);
+}
+
+uint64_t cjit_percentile_ns(const cjit_engine_t *engine,
+                             func_id_t            id,
+                             unsigned             pct)
+{
+    uint64_t counts[CJIT_HIST_BUCKETS];
+    cjit_get_histogram(engine, id, counts);
+
+    uint64_t total = 0;
+    for (int i = 0; i < CJIT_HIST_BUCKETS; i++) total += counts[i];
+    if (total == 0 || pct > 100) return 0;
+
+    /* Target: ceil(total * pct / 100) to find the bucket that contains pct%. */
+    uint64_t target = (total * (uint64_t)pct + 99) / 100;
+    uint64_t cum = 0;
+    for (int i = 0; i < CJIT_HIST_BUCKETS; i++) {
+        cum += counts[i];
+        if (cum >= target) {
+            /*
+             * Return the upper bound of bucket i: 2^i nanoseconds.
+             * Bucket 0 covers [0,1) ns → return 1.
+             * Bucket k covers [2^(k-1), 2^k) ns → return 2^k.
+             */
+            return (i == 0) ? 1ULL : (UINT64_C(1) << i);
+        }
+    }
+    return UINT64_C(1) << (CJIT_HIST_BUCKETS - 1);
 }
 
 uint64_t cjit_get_elapsed_ns(const cjit_engine_t *engine, func_id_t id)
@@ -1366,6 +1881,8 @@ cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
                                                    memory_order_relaxed);
     s.failed_compilations  = atomic_load_explicit(&engine->stat_failed,
                                                    memory_order_relaxed);
+    s.compile_timeouts     = atomic_load_explicit(&engine->stat_timeouts,
+                                                   memory_order_relaxed);
     s.total_swaps          = atomic_load_explicit(&engine->stat_swaps,
                                                    memory_order_relaxed);
     s.retired_handles      = atomic_load_explicit(&engine->dgc.total_retired,
@@ -1373,13 +1890,16 @@ cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
     s.freed_handles        = atomic_load_explicit(&engine->dgc.total_freed,
                                                    memory_order_relaxed);
 
-    /* Sum queue depths and find highest recompile count across all functions. */
-    uint32_t qd  = 0;
+    /* Sum queue depths across both lanes for all threads. */
+    uint32_t qd       = 0;
+    uint32_t qd_prio_depth = 0;
     uint32_t max_rc = 0;
     uint64_t total_elapsed = 0;
     uint32_t nf  = s.registered_functions;
-    for (uint32_t i = 0; i < engine->cfg.compiler_threads; ++i)
-        qd += mpmc_size(&engine->work_queues[i]);
+    for (uint32_t i = 0; i < engine->cfg.compiler_threads; ++i) {
+        qd           += mpmc_size(&engine->work_queues[2 * i + 0]);
+        qd_prio_depth += mpmc_size(&engine->work_queues[2 * i + 1]);
+    }
     for (uint32_t i = 0; i < nf; ++i) {
         uint32_t rc = atomic_load_explicit(
             &engine->ftable->entries[i].recompile_count, memory_order_relaxed);
@@ -1387,9 +1907,19 @@ cjit_stats_t cjit_get_stats(const cjit_engine_t *engine)
         total_elapsed += atomic_load_explicit(
             &engine->ftable->entries[i].total_elapsed_ns, memory_order_relaxed);
     }
-    s.queue_depth         = qd;
-    s.max_recompile_count = max_rc;
-    s.total_elapsed_ns    = total_elapsed;
+    s.queue_depth           = qd;
+    s.prio_queue_depth      = qd_prio_depth;
+    s.max_recompile_count   = max_rc;
+    s.total_elapsed_ns      = total_elapsed;
+    s.tier_skips            = atomic_load_explicit(&engine->stat_tier_skips,
+                                                    memory_order_relaxed);
+    s.predictive_promotions = atomic_load_explicit(&engine->stat_predictive_promos,
+                                                    memory_order_relaxed);
+
+    if (engine->artifact_cache) {
+        s.artifact_cache_hits   = codegen_cache_hits(engine->artifact_cache);
+        s.artifact_cache_misses = codegen_cache_misses(engine->artifact_cache);
+    }
 
     if (engine->ir_cache) {
         ir_cache_stats_t cs = ir_cache_get_stats(engine->ir_cache);
@@ -1422,11 +1952,19 @@ void cjit_print_stats(const cjit_engine_t *engine)
             "║  Registered functions  : %6u            ║\n"
             "║  Total compilations    : %6llu            ║\n"
             "║  Failed compilations   : %6llu            ║\n"
+            "║  Compile timeouts      : %6llu            ║\n"
             "║  Atomic pointer swaps  : %6llu            ║\n"
             "║  Handles retired (GC)  : %6llu            ║\n"
             "║  Handles freed   (GC)  : %6llu            ║\n"
-            "║  Work-queue depth now  : %6u            ║\n"
+            "║  Normal queue depth    : %6u            ║\n"
+            "║  Priority queue depth  : %6u            ║\n"
             "║  Max recompile count   : %6u            ║\n"
+            "╠══════════════════════════════════════════╣\n"
+            "║  Tier-skips (O0→O3)    : %6llu            ║\n"
+            "║  Predictive promotions : %6llu            ║\n"
+            "╠══════════════════════════════════════════╣\n"
+            "║  Artifact cache hits   : %6llu            ║\n"
+            "║  Artifact cache misses : %6llu            ║\n"
             "╠══════════════════════════════════════════╣\n"
             "║  Memory pressure       : %-8s          ║\n"
             "║  Mem available         : %6llu MB         ║\n"
@@ -1446,11 +1984,17 @@ void cjit_print_stats(const cjit_engine_t *engine)
             s.registered_functions,
             (unsigned long long)s.total_compilations,
             (unsigned long long)s.failed_compilations,
+            (unsigned long long)s.compile_timeouts,
             (unsigned long long)s.total_swaps,
             (unsigned long long)s.retired_handles,
             (unsigned long long)s.freed_handles,
             s.queue_depth,
+            s.prio_queue_depth,
             s.max_recompile_count,
+            (unsigned long long)s.tier_skips,
+            (unsigned long long)s.predictive_promotions,
+            (unsigned long long)s.artifact_cache_hits,
+            (unsigned long long)s.artifact_cache_misses,
             pnames[s.mem_pressure],
             (unsigned long long)s.mem_available_mb,
             (unsigned long long)s.mem_total_mb,
@@ -1566,4 +2110,341 @@ bool cjit_wait_compiled(cjit_engine_t *engine,
                   != NULL);
     pthread_mutex_unlock(&engine->compile_done_mutex);
     return ready;
+}
+
+/* ══════════════════════════ Feature D: compile-event callback ═════════════ */
+
+void cjit_set_compile_callback(cjit_engine_t           *engine,
+                                cjit_compile_callback_t  cb,
+                                void                    *userdata)
+{
+    if (!engine) return;
+    pthread_mutex_lock(&engine->cb_mutex);
+    engine->compile_cb          = cb;
+    engine->compile_cb_userdata = userdata;
+    pthread_mutex_unlock(&engine->cb_mutex);
+}
+
+/* ══════════════════════════ Feature E: function pinning ════════════════════ */
+
+bool cjit_pin_function(cjit_engine_t *engine, func_id_t id)
+{
+    if (!engine) return false;
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (!e) return false;
+    atomic_store_explicit(&e->pinned, true, memory_order_relaxed);
+    return true;
+}
+
+bool cjit_unpin_function(cjit_engine_t *engine, func_id_t id)
+{
+    if (!engine) return false;
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (!e) return false;
+    atomic_store_explicit(&e->pinned, false, memory_order_relaxed);
+    return true;
+}
+
+bool cjit_is_pinned(const cjit_engine_t *engine, func_id_t id)
+{
+    if (!engine) return false;
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (!e) return false;
+    return atomic_load_explicit(&e->pinned, memory_order_relaxed);
+}
+
+/* ══════════════════════════ Feature F: IR snapshot export ══════════════════ */
+
+int cjit_snapshot_ir(cjit_engine_t *engine, const char *dir)
+{
+    if (!engine || !dir) return -1;
+
+    /* Create the directory if it does not exist (mode 0700). */
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+        return -1;
+
+    uint32_t nf = atomic_load_explicit(&engine->ftable->count,
+                                        memory_order_acquire);
+    if (nf == 0) return 0;
+
+    /* Open the manifest file first; if this fails return error. */
+    char manifest_path[512];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.txt", dir);
+    FILE *mf = fopen(manifest_path, "w");
+    if (!mf) return -1;
+
+    static const char *gen_names[] = { "HOT", "WARM", "COLD" };
+
+    int written = 0;
+    for (uint32_t i = 0; i < nf; i++) {
+        func_table_entry_t *entry = &engine->ftable->entries[i];
+
+        /* Retrieve IR from the cache (promotes COLD → WARM as a side effect;
+         * returns a heap copy that we must free). */
+        char *ir = NULL;
+        if (engine->ir_cache)
+            ir = ir_cache_get_ir(engine->ir_cache, (func_id_t)i);
+
+        if (!ir) {
+            /* Fall back to the pointer in the function-table entry (may be
+             * the original registration pointer if not yet cached on disk). */
+            ir = engine->ftable->entries[i].ir_source
+                     ? strdup(engine->ftable->entries[i].ir_source)
+                     : NULL;
+        }
+
+        /* Write the .c file. */
+        if (ir) {
+            char fpath[512];
+            snprintf(fpath, sizeof(fpath), "%s/%s.c", dir, entry->name);
+            FILE *fp = fopen(fpath, "w");
+            if (fp) {
+                fputs(ir, fp);
+                fputc('\n', fp);
+                fclose(fp);
+                written++;
+            }
+            free(ir);
+        }
+
+        /* Manifest line: id  name  gen  call_cnt  opt_level */
+        uint8_t gen = engine->ir_cache
+            ? ir_cache_get_generation(engine->ir_cache, (func_id_t)i)
+            : (uint8_t)0;
+        if (gen > 2) gen = 2;
+        uint64_t calls = atomic_load_explicit(&entry->call_cnt,
+                                               memory_order_relaxed);
+        int lvl = atomic_load_explicit(&entry->cur_level,
+                                        memory_order_relaxed);
+        fprintf(mf, "%u\t%s\t%s\t%llu\t%d\n",
+                i, entry->name, gen_names[gen],
+                (unsigned long long)calls, lvl);
+    }
+
+    fclose(mf);
+    return written;
+}
+
+/* ══════════════════════════ Feature G: per-function stats reset ════════════ */
+
+bool cjit_reset_function_stats(cjit_engine_t *engine, func_id_t id)
+{
+    if (!engine) return false;
+    func_table_entry_t *e = func_table_get(engine->ftable, id);
+    if (!e) return false;
+
+    atomic_store_explicit(&e->call_cnt,          0, memory_order_relaxed);
+    atomic_store_explicit(&e->total_elapsed_ns,  0, memory_order_relaxed);
+    atomic_store_explicit(&e->recompile_count,   0, memory_order_relaxed);
+
+    for (int k = 0; k < CJIT_HIST_BUCKETS; k++)
+        atomic_store_explicit(&e->hist_counts[k], 0, memory_order_relaxed);
+
+    return true;
+}
+
+/* ══════════════════════════ Feature H: queue drain ════════════════════════ */
+
+bool cjit_drain_queue(cjit_engine_t *engine, uint32_t timeout_ms)
+{
+    if (!engine) return false;
+
+    uint64_t deadline = (timeout_ms == 0) ? 0 : (engine_now_ms() + timeout_ms);
+
+    do {
+        /* Sum all queue depths across both lanes for all compiler threads. */
+        uint32_t depth = 0;
+        for (uint32_t t = 0; t < engine->cfg.compiler_threads; t++) {
+            depth += mpmc_size(&engine->work_queues[2 * t + 0]);
+            depth += mpmc_size(&engine->work_queues[2 * t + 1]);
+        }
+
+        /* Also check active_compilations: a function may have been dequeued
+         * (in_queue cleared) but compilation is still in progress
+         * (compile_lock held inside the compiler thread). */
+        if (depth == 0 &&
+            atomic_load_explicit(&engine->active_compilations,
+                                 memory_order_relaxed) == 0)
+            return true;
+
+        if (timeout_ms == 0)
+            return false;
+
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 5000000L }; /* 5 ms */
+        nanosleep(&ts, NULL);
+
+    } while (engine_now_ms() < deadline);
+
+    /* Final re-check. */
+    uint32_t depth = 0;
+    for (uint32_t t = 0; t < engine->cfg.compiler_threads; t++) {
+        depth += mpmc_size(&engine->work_queues[2 * t + 0]);
+        depth += mpmc_size(&engine->work_queues[2 * t + 1]);
+    }
+    if (depth > 0) return false;
+    if (atomic_load_explicit(&engine->active_compilations,
+                             memory_order_relaxed) > 0)
+        return false;
+    return true;
+}
+
+/* ══════════════════════════ Feature I: synchronous compile ════════════════ */
+
+bool cjit_compile_sync(cjit_engine_t *engine, func_id_t id, opt_level_t level)
+{
+    if (!engine) return false;
+    func_table_entry_t *entry = func_table_get(engine->ftable, id);
+    if (!entry) return false;
+
+    /* Build codegen options identical to the compiler thread. */
+    codegen_opts_t copts = {
+        .enable_inlining      = engine->cfg.enable_inlining,
+        .enable_vectorization = engine->cfg.enable_vectorization,
+        .enable_loop_unroll   = engine->cfg.enable_loop_unroll,
+        .enable_native_arch   = engine->cfg.enable_native_arch,
+        .enable_fast_math     = engine->cfg.enable_fast_math,
+        .verbose              = engine->cfg.verbose,
+        .extra_cflags         = engine->cfg.extra_cflags[0] ? engine->cfg.extra_cflags : NULL,
+        .cc_binary            = engine->cfg.cc_binary[0]    ? engine->cfg.cc_binary    : NULL,
+        .cache                = engine->artifact_cache,
+        .compile_timeout_ms   = engine->cfg.compile_timeout_ms,
+        .arg_profile          = NULL,
+    };
+
+    /* Fetch IR (promotes COLD → WARM as a side effect). */
+    char       *ir_cache_copy = NULL;
+    const char *ir_to_use     = NULL;
+    if (engine->ir_cache)
+        ir_cache_copy = ir_cache_get_ir(engine->ir_cache, id);
+    ir_to_use = ir_cache_copy ? ir_cache_copy : entry->ir_source;
+
+    if (!ir_to_use) {
+        free(ir_cache_copy);
+        if (engine->cfg.verbose)
+            fprintf(stderr, "[cjit/sync] no IR for '%s'\n", entry->name);
+        return false;
+    }
+
+    /* Take the per-entry compile lock (blocking, unlike trylock in bg thread).
+     * This serialises against any concurrent background compilation.
+     * Count this as an active compilation so cjit_drain_queue() waits for us. */
+    atomic_fetch_add_explicit(&engine->active_compilations, 1,
+                              memory_order_relaxed);
+    pthread_mutex_lock(&entry->compile_lock);
+
+    /* Attach the current arg profile and zero runtime-profile hints
+     * (call_rate and avg_elapsed_ns are unavailable in the sync path). */
+    copts.arg_profile    = &entry->arg_profile;
+    copts.call_rate      = 0;
+    copts.avg_elapsed_ns = 0;
+
+    uint64_t t0 = engine_now_ms();
+    codegen_result_t cres;
+    bool ok = codegen_compile(entry->name, ir_to_use, level, &copts, &cres);
+    copts.arg_profile = NULL;
+    free(ir_cache_copy);
+
+    uint32_t dur_ms = (uint32_t)(engine_now_ms() - t0);
+    atomic_store_explicit(&entry->last_compile_duration_ms, dur_ms,
+                          memory_order_relaxed);
+
+    if (!ok) {
+        atomic_fetch_add_explicit(&engine->stat_failed, 1, memory_order_relaxed);
+        if (cres.timed_out)
+            atomic_fetch_add_explicit(&engine->stat_timeouts, 1,
+                                      memory_order_relaxed);
+        pthread_mutex_unlock(&entry->compile_lock);
+        atomic_fetch_sub_explicit(&engine->active_compilations, 1,
+                                  memory_order_relaxed);
+
+        /* Wake cjit_wait_compiled() callers so they can detect the failure. */
+        pthread_mutex_lock(&engine->compile_done_mutex);
+        pthread_cond_broadcast(&engine->compile_done_cond);
+        pthread_mutex_unlock(&engine->compile_done_mutex);
+
+        /* Fire compile-event callback. */
+        pthread_mutex_lock(&engine->cb_mutex);
+        cjit_compile_callback_t cb = engine->compile_cb;
+        void *cb_ud = engine->compile_cb_userdata;
+        pthread_mutex_unlock(&engine->cb_mutex);
+        if (cb) {
+            cjit_compile_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.func_id     = id;
+            snprintf(ev.func_name, sizeof(ev.func_name), "%s", entry->name);
+            ev.level       = level;
+            ev.success     = false;
+            ev.timed_out   = cres.timed_out;
+            ev.cache_hit   = false;
+            ev.duration_ms = dur_ms;
+            snprintf(ev.errmsg, sizeof(ev.errmsg), "%.255s", cres.errmsg);
+            cb(&ev, cb_ud);
+        }
+        return false;
+    }
+
+    atomic_fetch_add_explicit(&engine->stat_compilations, 1, memory_order_relaxed);
+
+    void *old_handle = func_table_swap(engine->ftable, id,
+                                        cres.fn, cres.handle, level);
+    atomic_fetch_add_explicit(&engine->stat_swaps, 1, memory_order_relaxed);
+    pthread_mutex_unlock(&entry->compile_lock);
+    atomic_fetch_sub_explicit(&engine->active_compilations, 1,
+                              memory_order_relaxed);
+
+    dgc_retire(&engine->dgc, old_handle);
+
+    /* Wake cjit_wait_compiled() callers. */
+    pthread_mutex_lock(&engine->compile_done_mutex);
+    pthread_cond_broadcast(&engine->compile_done_cond);
+    pthread_mutex_unlock(&engine->compile_done_mutex);
+
+    /* Fire compile-event callback (success). */
+    pthread_mutex_lock(&engine->cb_mutex);
+    cjit_compile_callback_t cb2 = engine->compile_cb;
+    void *cb2_ud = engine->compile_cb_userdata;
+    pthread_mutex_unlock(&engine->cb_mutex);
+    if (cb2) {
+        cjit_compile_event_t ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.func_id     = id;
+        snprintf(ev.func_name, sizeof(ev.func_name), "%s", entry->name);
+        ev.level       = level;
+        ev.success     = true;
+        ev.timed_out   = false;
+        ev.cache_hit   = cres.cache_hit;
+        ev.duration_ms = dur_ms;
+        cb2(&ev, cb2_ud);
+    }
+
+    if (engine->cfg.verbose)
+        fprintf(stderr,
+                "[cjit/sync] compiled '%s' O%d in %u ms\n",
+                entry->name, (int)level, dur_ms);
+
+    return true;
+}
+
+/* ══════════════════════════ IR cache stats / prefetch ═════════════════════ */
+
+void cjit_print_ir_cache_stats(const cjit_engine_t *engine)
+{
+    if (!engine || !engine->ir_cache) return;
+    ir_cache_print_stats(engine->ir_cache);
+}
+
+bool cjit_ir_cache_prefetch(cjit_engine_t *engine, func_id_t id)
+{
+    if (!engine || !engine->ir_cache) return false;
+    if (!func_table_get(engine->ftable, id)) return false;
+
+    /* Try the async path first (io_threads > 0 in the IR cache). */
+    if (ir_cache_prefetch(engine->ir_cache, id))
+        return true;
+
+    /* Fall back to synchronous: read IR into warm memory now. */
+    char *ir = ir_cache_get_ir(engine->ir_cache, id);
+    if (!ir) return false;
+    free(ir);
+    return true;
 }

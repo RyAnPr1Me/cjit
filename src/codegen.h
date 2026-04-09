@@ -47,6 +47,7 @@
  *              -funswitch-loops    (hoist invariant conditionals out of loops)
  *              -fpeel-loops        (peel first/last iterations; unroll small
  *                                  known-trip-count loops to straight-line)
+ *              -march=native        (if enable_native_arch)
  *   OPT_O3   : -O3 -fomit-frame-pointer -fno-semantic-interposition
  *              -mtune=native
  *              -fno-plt            (Linux/ELF only)
@@ -104,6 +105,9 @@
 #include "../include/cjit.h"  /* opt_level_t, jit_func_t */
 #include "arg_profile.h"      /* cjit_arg_profile_t */
 
+/* Forward declaration – full definition in codegen_cache.h. */
+typedef struct codegen_cache codegen_cache_t;
+
 /* ─────────────────────────── result type ───────────────────────────────────── */
 
 /**
@@ -113,6 +117,8 @@ typedef struct {
     jit_func_t  fn;        /**< Pointer to the compiled function (NULL on err). */
     void       *handle;    /**< dlopen handle; pass to dgc_retire() when done.  */
     bool        success;   /**< True iff compilation succeeded.                 */
+    bool        timed_out; /**< True iff the compiler subprocess timed out.     */
+    bool        cache_hit; /**< True iff the result came from the artifact cache.*/
     char        errmsg[4096]; /**< Human-readable error message on failure.     */
 } codegen_result_t;
 
@@ -154,6 +160,58 @@ typedef struct {
      * NULL or empty string → "cc" found on PATH.
      */
     const char *cc_binary;
+
+    /**
+     * Optional compiled-artifact cache handle.
+     *
+     * When non-NULL, codegen_compile() checks the cache before spawning the
+     * compiler.  On a hit the cached .so is dlopen'd directly and the compiler
+     * subprocess is skipped entirely.  On a miss the compiled artifact is
+     * stored in the cache for future hits.
+     *
+     * NULL disables caching for this compilation.
+     */
+    codegen_cache_t *cache;
+
+    /**
+     * Maximum wall-clock time (milliseconds) to wait for the compiler
+     * subprocess to complete.
+     *
+     * When non-zero, codegen_compile() polls waitpid(WNOHANG) in a loop with
+     * 10 ms sleeps.  If the process has not exited by the deadline, it is
+     * sent SIGTERM (with a 50 ms grace period) followed by SIGKILL, and the
+     * compilation is marked as timed out (result->timed_out = true).
+     *
+     * 0 = no timeout (default, backward-compatible).
+     */
+    uint32_t compile_timeout_ms;
+
+    /**
+     * EMA call rate at the time this compilation was enqueued (calls/second).
+     *
+     * When non-zero, injected into the translation unit as
+     *   -DCJIT_CALL_RATE=<n>
+     * User IR can use this at compile time:
+     *   #if defined(CJIT_CALL_RATE) && CJIT_CALL_RATE > 5000
+     *     // enable hot-path SIMD / loop-unrolling manually
+     *   #endif
+     *
+     * 0 = unknown (no define injected).
+     */
+    uint64_t call_rate;
+
+    /**
+     * Average observed nanoseconds per call at the time of compilation.
+     *
+     * Computed as total_elapsed_ns / call_cnt when timing data is available
+     * (requires CJIT_DISPATCH_TIMED or cjit_record_timed_call() on hot path).
+     *
+     * When non-zero, injected as -DCJIT_AVG_ELAPSED_NS=<n>.
+     * Useful for latency-sensitive code paths that want to know their own cost.
+     *
+     * 0 = unknown (no define injected).
+     */
+    uint64_t avg_elapsed_ns;
 } codegen_opts_t;
 
 /* ─────────────────────────── API ───────────────────────────────────────────── */

@@ -1,0 +1,1 @@
+/usr/bin/cc --coverage -fprofile-arcs -ftest-coverage -g -Wl,--dependency-file=CMakeFiles/demo.dir/link.d CMakeFiles/demo.dir/examples/demo.c.o -o demo  libcjit_lib.a -lpthread -ldl

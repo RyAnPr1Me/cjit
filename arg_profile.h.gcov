@@ -1,0 +1,177 @@
+        -:    0:Source:/home/runner/work/cjit/cjit/src/arg_profile.h
+        -:    0:Graph:build_cov/CMakeFiles/cjit_lib.dir/src/codegen.c.gcno
+        -:    0:Data:build_cov/CMakeFiles/cjit_lib.dir/src/codegen.c.gcda
+        -:    0:Runs:9
+        -:    1:/**
+        -:    2: * arg_profile.h – Per-function argument-value profiling for the JIT engine.
+        -:    3: *
+        -:    4: * Overview
+        -:    5: * ────────
+        -:    6: * Each registered JIT function optionally tracks which argument VALUES are
+        -:    7: * most frequently passed at call sites.  When the monitor decides to
+        -:    8: * recompile a function at a higher optimization tier, codegen checks for a
+        -:    9: * "confident dominant value" on any integer argument and, if found, wraps the
+        -:   10: * user's function in a thin specialization shell:
+        -:   11: *
+        -:   12: *   1. The user's original function is renamed to an internal symbol via a
+        -:   13: *      preprocessor -D flag (e.g. -Dmy_func=_cjit_i_my_func).
+        -:   14: *
+        -:   15: *   2. A new exported `my_func` wrapper is prepended to the source:
+        -:   16: *
+        -:   17: *        // [JIT-generated specialization for my_func: arg0 always 0]
+        -:   18: *        static int _cjit_i_my_func(int x, int y);  // forward decl
+        -:   19: *        int my_func(int x, int y) {
+        -:   20: *            if (__builtin_expect(x == 0, 1))
+        -:   21: *                return _cjit_i_my_func(0, y);   // constant-folded path
+        -:   22: *            return _cjit_i_my_func(x, y);        // generic fallback
+        -:   23: *        }
+        -:   24: *
+        -:   25: *   3. With -finline-functions (enabled at O2+), the compiler inlines
+        -:   26: *      _cjit_i_my_func(0, y) into the hot path and constant-folds through
+        -:   27: *      it, eliminating dead branches, simplifying loops, etc.
+        -:   28: *
+        -:   29: * Sampling
+        -:   30: * ────────
+        -:   31: * Collection overhead is minimised by piggybacking on the existing
+        -:   32: * CJIT_TLS_FLUSH_THRESHOLD flush cycle: the CJIT_SAMPLE_ARGS macro checks
+        -:   33: * whether cjit_tls_counts[id] is at the flush boundary (the one-in-N sample
+        -:   34: * point) BEFORE cjit_get_func_counted() resets it.  This means sampling
+        -:   35: * happens approximately once per CJIT_TLS_FLUSH_THRESHOLD calls per thread,
+        -:   36: * with no additional counter or TLS variable.  On the common (non-sample)
+        -:   37: * path the overhead is:
+        -:   38: *   • One TLS load (already in L1 cache — shared with cjit_get_func_counted)
+        -:   39: *   • One compare + branch (predicted not-taken: < 1 cycle amortised)
+        -:   40: *
+        -:   41: * Dominant-value tracking
+        -:   42: * ───────────────────────
+        -:   43: * Each argument slot uses a Boyer-Moore majority-vote style algorithm:
+        -:   44: *   • On match (v == dominant_val):  dominant_cnt++
+        -:   45: *   • On mismatch:                   dominant_cnt--; replace if cnt reaches 0
+        -:   46: *   • total_samples always increments
+        -:   47: *
+        -:   48: * This gives an O(1) per-sample update with no heap allocation.  Confidence
+        -:   49: * is computed at specialisation time as:
+        -:   50: *   confidence = dominant_cnt * 100 / total_samples
+        -:   51: * and must exceed CJIT_PROFILE_MIN_CONFIDENCE_PCT with at least
+        -:   52: * CJIT_PROFILE_MIN_SAMPLES total samples before specialisation is attempted.
+        -:   53: *
+        -:   54: * Safety
+        -:   55: * ──────
+        -:   56: * All fields in cjit_arg_profile_t are plain (non-atomic).  The profile is
+        -:   57: * written by calling threads (via cjit_record_arg_samples) and read by the
+        -:   58: * compiler thread (during codegen_compile).  Since the data is statistical
+        -:   59: * and the worst case is a slightly stale snapshot — never a memory-safety
+        -:   60: * violation — no locking is required.  64-bit dominant_val writes are
+        -:   61: * naturally atomic on x86-64 and AArch64 when 8-byte aligned.
+        -:   62: */
+        -:   63:
+        -:   64:#pragma once
+        -:   65:
+        -:   66:#include <stdint.h>
+        -:   67:#include <stdbool.h>
+        -:   68:
+        -:   69:/* ─────────────────────────── constants ────────────────────────────────────── */
+        -:   70:
+        -:   71:/**
+        -:   72: * Maximum number of argument slots profiled per function.
+        -:   73: *
+        -:   74: * Slots beyond this count are silently ignored.  8 is sufficient for virtually
+        -:   75: * all real JIT workloads; reducing it saves memory on the cold cache line.
+        -:   76: */
+        -:   77:#define CJIT_MAX_PROFILED_ARGS  8u
+        -:   78:
+        -:   79:/**
+        -:   80: * Minimum number of samples (total_samples) before specialisation is
+        -:   81: * considered.  Guards against specialising on a single observation.
+        -:   82: *
+        -:   83: * At CJIT_TLS_FLUSH_THRESHOLD = 32, each thread contributes ~1 sample per
+        -:   84: * 32 calls; after 256 calls from a single thread total_samples >= 8.
+        -:   85: */
+        -:   86:#define CJIT_PROFILE_MIN_SAMPLES  8u
+        -:   87:
+        -:   88:/**
+        -:   89: * Minimum confidence (dominant_cnt * 100 / total_samples) required for
+        -:   90: * specialisation.  75 % means the dominant value was observed in at least
+        -:   91: * 3 of every 4 sample points.
+        -:   92: *
+        -:   93: * Expressed as a percentage in [1, 100].
+        -:   94: */
+        -:   95:#define CJIT_PROFILE_MIN_CONFIDENCE_PCT  75u
+        -:   96:
+        -:   97:/**
+        -:   98: * Safety limit: if the function symbol name appears more than this many times
+        -:   99: * in the IR source text (e.g. due to recursive calls or type aliases), skip
+        -:  100: * specialisation to avoid unintended -D macro substitution.
+        -:  101: */
+        -:  102:#define CJIT_SPEC_MAX_NAME_OCCURRENCES   8u
+        -:  103:
+        -:  104:/* ─────────────────────────── types ────────────────────────────────────────── */
+        -:  105:
+        -:  106:/**
+        -:  107: * One tracked argument slot.
+        -:  108: *
+        -:  109: * Size: 16 bytes (fits three slots per cache line with 4-byte padding).
+        -:  110: */
+        -:  111:typedef struct {
+        -:  112:    uint64_t dominant_val;  /**< Current dominant (majority-candidate) value.  */
+        -:  113:    uint32_t dominant_cnt;  /**< Boyer-Moore vote count for dominant_val.       */
+        -:  114:    uint32_t total_samples; /**< Total sample points observed on this slot.     */
+        -:  115:} cjit_arg_slot_t;
+        -:  116:
+        -:  117:/**
+        -:  118: * Full per-function argument profile.
+        -:  119: *
+        -:  120: * Stored on the cold cache line of func_table_entry_t; never touched on the
+        -:  121: * hot dispatch path unless CJIT_SAMPLE_ARGS is used.
+        -:  122: *
+        -:  123: * Size: CJIT_MAX_PROFILED_ARGS × 16 + 8 = 136 bytes (two cache lines).
+        -:  124: */
+        -:  125:typedef struct {
+        -:  126:    cjit_arg_slot_t slots[CJIT_MAX_PROFILED_ARGS]; /**< Per-arg slots (16 B ea) */
+        -:  127:    uint8_t         n_profiled; /**< Number of argument slots being tracked.    */
+        -:  128:    uint8_t         _pad[7];
+        -:  129:} cjit_arg_profile_t;
+        -:  130:
+        -:  131:/* ─────────────────────────── inline helpers ────────────────────────────────── */
+        -:  132:
+        -:  133:/**
+        -:  134: * Update one argument slot with a new observed value v.
+        -:  135: *
+        -:  136: * Boyer-Moore majority-vote update:
+        -:  137: *   • First sample: adopt v as the dominant value.
+        -:  138: *   • Match:        increment dominant_cnt (saturating).
+        -:  139: *   • Mismatch:     decrement dominant_cnt; if it hits 0, replace with v.
+        -:  140: *   • total_samples always incremented (saturating).
+        -:  141: */
+        -:  142:static inline void cjit_arg_slot_update(cjit_arg_slot_t *slot, uint64_t v)
+        -:  143:{
+        -:  144:    if (slot->total_samples == 0) {
+        -:  145:        slot->dominant_val = v;
+        -:  146:        slot->dominant_cnt = 1;
+        -:  147:    } else if (v == slot->dominant_val) {
+        -:  148:        if (slot->dominant_cnt < UINT32_MAX) slot->dominant_cnt++;
+        -:  149:    } else {
+        -:  150:        if (slot->dominant_cnt > 0) {
+        -:  151:            slot->dominant_cnt--;
+        -:  152:        } else {
+        -:  153:            slot->dominant_val = v;
+        -:  154:            slot->dominant_cnt = 1;
+        -:  155:        }
+        -:  156:    }
+        -:  157:    if (slot->total_samples < UINT32_MAX) slot->total_samples++;
+        -:  158:}
+        -:  159:
+        -:  160:/**
+        -:  161: * Return true if slot has a confident dominant value that is safe to
+        -:  162: * specialize on.
+        -:  163: *
+        -:  164: * "Confident" = total_samples >= CJIT_PROFILE_MIN_SAMPLES AND
+        -:  165: *               dominant_cnt * 100 / total_samples >= CJIT_PROFILE_MIN_CONFIDENCE_PCT.
+        -:  166: */
+       13:  167:static inline bool cjit_arg_slot_confident(const cjit_arg_slot_t *slot)
+        -:  168:{
+      13*:  169:    if (slot->total_samples < CJIT_PROFILE_MIN_SAMPLES) return false;
+        -:  170:    /* Avoid division: rearrange to dominant_cnt * 100 >= pct * total_samples */
+       13:  171:    return (uint64_t)slot->dominant_cnt * 100u
+       13:  172:               >= (uint64_t)CJIT_PROFILE_MIN_CONFIDENCE_PCT * slot->total_samples;
+        -:  173:}

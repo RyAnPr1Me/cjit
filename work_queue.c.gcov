@@ -1,0 +1,140 @@
+        -:    0:Source:/home/runner/work/cjit/cjit/src/work_queue.c
+        -:    0:Graph:build_cov/CMakeFiles/cjit_lib.dir/src/work_queue.c.gcno
+        -:    0:Data:build_cov/CMakeFiles/cjit_lib.dir/src/work_queue.c.gcda
+        -:    0:Runs:9
+        -:    1:/**
+        -:    2: * work_queue.c – Lock-free bounded MPMC queue implementation.
+        -:    3: *
+        -:    4: * See work_queue.h for the algorithm description.
+        -:    5: */
+        -:    6:
+        -:    7:#ifndef _GNU_SOURCE
+        -:    8:#define _GNU_SOURCE
+        -:    9:#endif
+        -:   10:#include "work_queue.h"
+        -:   11:
+        -:   12:#include <string.h>  /* memset */
+        -:   13:
+        -:   14:/* ─────────────────────────── helpers ──────────────────────────────────────── */
+        -:   15:
+     4922:   16:static inline uint_fast64_t wq_load_seq(const wq_slot_t *s)
+        -:   17:{
+        -:   18:    /* Acquire ordering: we need to observe the data written before seq was
+        -:   19:     * stored by the producer.                                               */
+     4922:   20:    return atomic_load_explicit(&s->seq, memory_order_acquire);
+        -:   21:}
+        -:   22:
+      738:   23:static inline void wq_store_seq(wq_slot_t *s, uint_fast64_t v)
+        -:   24:{
+        -:   25:    /* Release ordering: ensures data is visible before the sequence counter
+        -:   26:     * that signals "slot is ready".                                         */
+      738:   27:    atomic_store_explicit(&s->seq, v, memory_order_release);
+      738:   28:}
+        -:   29:
+        -:   30:/* ─────────────────────────── public functions ──────────────────────────────── */
+        -:   31:
+     1102:   32:void mpmc_init(mpmc_queue_t *q)
+        -:   33:{
+     1102:   34:    atomic_store_explicit(&q->enqueue_pos, 0, memory_order_relaxed);
+     1102:   35:    atomic_store_explicit(&q->dequeue_pos, 0, memory_order_relaxed);
+        -:   36:
+    71630:   37:    for (uint_fast64_t i = 0; i < WQ_CAPACITY; ++i) {
+        -:   38:        /*
+        -:   39:         * Initial sequence = slot index.
+        -:   40:         * This means slot[0] expects enqueue_pos==0 → seq==0 → it is free.
+        -:   41:         * Slot[i] will become free once pos wraps around to i again, at which
+        -:   42:         * point dequeue has advanced past it and stored seq = i + WQ_CAPACITY.
+        -:   43:         */
+    70528:   44:        atomic_store_explicit(&q->slots[i].seq, i, memory_order_relaxed);
+        -:   45:    }
+     1102:   46:}
+        -:   47:
+      369:   48:bool mpmc_enqueue(mpmc_queue_t *q, const compile_task_t *task)
+        -:   49:{
+        -:   50:    wq_slot_t      *slot;
+        -:   51:    uint_fast64_t   pos;
+        -:   52:    uint_fast64_t   seq;
+        -:   53:    intptr_t        diff;
+        -:   54:
+      369:   55:    pos = atomic_load_explicit(&q->enqueue_pos, memory_order_relaxed);
+        -:   56:
+        -:   57:    for (;;) {
+      369:   58:        slot = &q->slots[pos & (WQ_CAPACITY - 1u)];
+      369:   59:        seq  = wq_load_seq(slot);
+      369:   60:        diff = (intptr_t)(seq) - (intptr_t)(pos);
+        -:   61:
+      369:   62:        if (diff == 0) {
+        -:   63:            /*
+        -:   64:             * Slot is free for us to claim.  Race with other producers via
+        -:   65:             * CAS; only one will win.
+        -:   66:             */
+      369:   67:            if (atomic_compare_exchange_weak_explicit(
+        -:   68:                    &q->enqueue_pos, &pos, pos + 1,
+        -:   69:                    memory_order_relaxed, memory_order_relaxed)) {
+      369:   70:                break; /* we own the slot */
+        -:   71:            }
+        -:   72:            /* Another producer claimed it first; reload pos and retry. */
+    #####:   73:        } else if (diff < 0) {
+        -:   74:            /* Queue is full (consumer has not freed this slot yet). */
+    #####:   75:            return false;
+        -:   76:        } else {
+        -:   77:            /*
+        -:   78:             * Another producer just incremented enqueue_pos past us; refresh
+        -:   79:             * our view and retry.
+        -:   80:             */
+    #####:   81:            pos = atomic_load_explicit(&q->enqueue_pos, memory_order_relaxed);
+        -:   82:        }
+        -:   83:    }
+        -:   84:
+        -:   85:    /* Write the payload, then publish by advancing seq to pos+1. */
+      369:   86:    slot->data = *task;
+      369:   87:    wq_store_seq(slot, pos + 1);
+      369:   88:    return true;
+        -:   89:}
+        -:   90:
+     4553:   91:bool mpmc_dequeue(mpmc_queue_t *q, compile_task_t *out)
+        -:   92:{
+        -:   93:    wq_slot_t      *slot;
+        -:   94:    uint_fast64_t   pos;
+        -:   95:    uint_fast64_t   seq;
+        -:   96:    intptr_t        diff;
+        -:   97:
+     4553:   98:    pos = atomic_load_explicit(&q->dequeue_pos, memory_order_relaxed);
+        -:   99:
+        -:  100:    for (;;) {
+     4553:  101:        slot = &q->slots[pos & (WQ_CAPACITY - 1u)];
+     4553:  102:        seq  = wq_load_seq(slot);
+     4553:  103:        diff = (intptr_t)(seq) - (intptr_t)(pos + 1);
+        -:  104:
+     4553:  105:        if (diff == 0) {
+        -:  106:            /* Item is ready.  Race with other consumers via CAS. */
+      369:  107:            if (atomic_compare_exchange_weak_explicit(
+        -:  108:                    &q->dequeue_pos, &pos, pos + 1,
+        -:  109:                    memory_order_relaxed, memory_order_relaxed)) {
+      369:  110:                break; /* we own the slot */
+        -:  111:            }
+     4184:  112:        } else if (diff < 0) {
+        -:  113:            /* Queue is empty. */
+     4184:  114:            return false;
+        -:  115:        } else {
+        -:  116:            /* Another consumer raced ahead; refresh and retry. */
+    #####:  117:            pos = atomic_load_explicit(&q->dequeue_pos, memory_order_relaxed);
+        -:  118:        }
+        -:  119:    }
+        -:  120:
+        -:  121:    /* Read the payload, then free the slot by advancing seq to pos+CAPACITY. */
+      369:  122:    *out = slot->data;
+      369:  123:    wq_store_seq(slot, pos + WQ_CAPACITY);
+      369:  124:    return true;
+        -:  125:}
+        -:  126:
+     5010:  127:uint32_t mpmc_size(const mpmc_queue_t *q)
+        -:  128:{
+     5010:  129:    uint_fast64_t eq = atomic_load_explicit(&q->enqueue_pos, memory_order_relaxed);
+     5010:  130:    uint_fast64_t dq = atomic_load_explicit(&q->dequeue_pos, memory_order_relaxed);
+     5010:  131:    if (eq >= dq) {
+     5010:  132:        uint_fast64_t sz = eq - dq;
+    5010*:  133:        return (uint32_t)(sz < WQ_CAPACITY ? sz : WQ_CAPACITY);
+        -:  134:    }
+    #####:  135:    return 0;
+        -:  136:}

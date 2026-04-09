@@ -1,0 +1,1 @@
+/usr/bin/cc --coverage -fprofile-arcs -ftest-coverage -g -Wl,--dependency-file=CMakeFiles/test_jit.dir/link.d CMakeFiles/test_jit.dir/tests/test_jit.c.o -o test_jit  libcjit_lib.a -lpthread -ldl

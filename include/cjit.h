@@ -51,6 +51,11 @@
 extern "C" {
 #endif
 
+/* ══════════════════════════════ version ═══════════════════════════════════ */
+
+/** Human-readable version string. */
+#define CJIT_VERSION "0.5.0"
+
 /* ═══════════════════════════ tuneable constants ═══════════════════════════ */
 
 /** Maximum number of concurrently registered functions. */
@@ -85,6 +90,26 @@ extern "C" {
  * Maximum length (including NUL) of the cc_binary string in cjit_config_t.
  */
 #define CJIT_MAX_CC_BINARY      64
+
+/**
+ * Maximum length (including NUL) of the cache_dir string in cjit_config_t.
+ */
+#define CJIT_MAX_CACHE_DIR      256
+
+/**
+ * Number of log₂ latency buckets in the per-function call-latency histogram.
+ *
+ * Bucket k covers durations in [2^(k-1), 2^k) nanoseconds.
+ * Bucket 0  : [0,   1) ns  (sub-nanosecond noise floor)
+ * Bucket 10 : [512ns, 1µs)
+ * Bucket 20 : [524µs, 1ms)
+ * Bucket 30 : [537ms, 1.07s)
+ * Bucket 31 : [1.07s, ∞)   (catch-all for very slow calls)
+ *
+ * The histogram is only populated when CJIT_DISPATCH_TIMED or
+ * cjit_record_timed_call() is used for dispatch.
+ */
+#define CJIT_HIST_BUCKETS 32
 
 /**
  * Per-calling-thread TLS call-counter flush threshold.
@@ -375,10 +400,54 @@ typedef struct {
     bool     enable_vectorization;/**< Pass -ftree-vectorize to compiler.         */
     bool     enable_loop_unroll;  /**< Pass -funroll-loops to compiler.           */
     bool     enable_const_fold;   /**< Constant folding (enabled at -O1+).       */
-    bool     enable_native_arch;  /**< Pass -march=native at OPT_O3.             */
+    bool     enable_native_arch;  /**< Pass -march=native from OPT_O2 upwards.   */
     bool     enable_fast_math;    /**< Pass -ffast-math at OPT_O3 (may change
                                        floating-point semantics).                 */
     bool     verbose;             /**< Print compilation events to stderr.        */
+
+    /**
+     * Enable an O1 warm-up tier: automatically compile functions to OPT_O1
+     * before they are hot enough for the full OPT_O2 tier.
+     *
+     * When true, the monitor checks each function's call-rate EMA against
+     * warm_rate_t0.  The first time the EMA crosses that threshold the
+     * function is compiled at OPT_O1 (fast compile, decent performance),
+     * reducing the window during which it runs as uncompiled baseline code.
+     * Normal OPT_O2 and OPT_O3 promotions proceed as usual; OPT_O1 is
+     * merely an early-start step.
+     *
+     * Default: false (backward-compatible; OPT_O2 is still the first tier).
+     */
+    bool     enable_o1_warmup;
+
+    /**
+     * Minimum sustained call rate (calls/second) to trigger OPT_O1 warm-up.
+     *
+     * Ignored when enable_o1_warmup is false.
+     *
+     * When zero (the default), the threshold is auto-computed as hot_rate_t1/4
+     * (one quarter of the O2 trigger rate).  Set explicitly to override.
+     *
+     * The OPT_O1 warm-up fires immediately on the first monitor scan cycle
+     * where the EMA exceeds this threshold (no streak confirmation needed —
+     * OPT_O1 compiles quickly, so false positives are cheap).
+     */
+    uint64_t warm_rate_t0;
+
+    /**
+     * Pin each compiler background thread to its own CPU core (Linux only).
+     *
+     * When true, cjit_start() calls pthread_setaffinity_np() for each
+     * compiler thread, assigning it to core i % ncpu.  Pinning prevents
+     * thread migration between cores, keeping the compiler thread's cache
+     * lines warm and avoiding NUMA cross-socket overhead for large IR blobs.
+     *
+     * Has no effect on non-Linux platforms.  Safe to set on single-CPU
+     * systems — all threads will be pinned to the same core.
+     *
+     * Default: false.
+     */
+    bool     pin_compiler_threads;
 
     /* ── IR LRU cache settings ──────────────────────────────────────────── */
     uint32_t hot_ir_cache_size;   /**< Max HOT-gen IR entries in memory (def 64). */
@@ -530,6 +599,64 @@ typedef struct {
      */
     uint32_t extra_streak_per_recompile;
 
+    /* ── Tier-skip optimization ─────────────────────────────────────────── */
+
+    /**
+     * Call-rate multiplier that triggers a direct O0→O3 tier-skip.
+     *
+     * When a function that has never been compiled reaches a call rate of
+     * (hot_rate_t2 × tier_skip_multiplier), the monitor issues a direct
+     * OPT_O3 compilation request, skipping the intermediate OPT_O2 tier
+     * entirely.  This halves the number of compiler invocations for
+     * explosively hot functions (e.g., a newly-called tight inner loop
+     * that immediately dominates the workload).
+     *
+     * Semantics:
+     *   0.0  – disabled (default).  All functions must pass through O2 first.
+     *   1.0  – skip to O3 whenever rate ≥ hot_rate_t2  (even on first call-burst).
+     *   2.0  – skip to O3 whenever rate ≥ 2 × hot_rate_t2  (conservative).
+     *
+     * The same hot_confirm_cycles stability gate applies — the function must
+     * sustain the multiplied rate for hot_confirm_cycles consecutive scans
+     * before the skip promotion fires.
+     *
+     * Default: 0.0f (disabled, backward-compatible).
+     */
+    float tier_skip_multiplier;
+
+    /* ── Predictive EMA-slope promotion ─────────────────────────────────── */
+
+    /**
+     * Forward-look horizon (in monitor-scan cycles) for predictive promotion.
+     *
+     * When non-zero the monitor estimates the call rate
+     * (prediction_lookahead_cycles) scan-cycles into the future using a
+     * first-order linear extrapolation of the EMA slope:
+     *
+     *   predicted_rate = ema_rate + slope × prediction_lookahead_cycles
+     *
+     * where `slope` is the per-scan delta of the EMA (new_ema − old_ema).
+     * The predicted rate is compared against the tier threshold instead of
+     * the raw EMA; this fires the tier promotion earlier when the call rate
+     * is visibly trending upward.
+     *
+     * Typical benefit: during application startup, functions ramp up quickly.
+     * The EMA takes hot_confirm_cycles cycles to confirm steady hotness; with
+     * a lookahead the engine "bets" on the trend and promotes one to three
+     * scan cycles earlier.  This reduces the first-compile latency for
+     * fast-ramping functions from (hot_confirm_cycles × interval_ms) to
+     * roughly half of that when the rate is doubling each cycle.
+     *
+     * The feature interacts correctly with all other gates (cooloff, uptime,
+     * min_calls, recompile cap): if any other gate would block the promotion,
+     * the extrapolated rate does not override it.
+     *
+     * 0  – disabled (default, backward-compatible).
+     * 2  – look two scan cycles ahead (recommended starting point).
+     * 5  – aggressive; may cause premature promotions under transient spikes.
+     */
+    uint32_t prediction_lookahead_cycles;
+
     /* ── CPU-time-based tier promotion ─────────────────────────────────── */
 
     /**
@@ -590,6 +717,46 @@ typedef struct {
      * Maximum length: CJIT_MAX_CC_BINARY - 1 characters.
      */
     char cc_binary[CJIT_MAX_CC_BINARY];
+
+    /**
+     * Directory for the persistent compiled-artifact cache.
+     *
+     * When non-empty, the codegen backend caches every compiled .so file
+     * on disk, keyed by a content-address hash of the IR source, optimisation
+     * level, compiler flags, and compiler binary.  On a cache hit the compiler
+     * subprocess is bypassed entirely and the cached .so is dlopen()'d
+     * directly — the dominant speedup for warm restarts and repeated runs.
+     *
+     * The directory is created (mode 0700) automatically if it does not exist.
+     * Multiple processes sharing the same directory are safe: stores use an
+     * atomic rename(2) so there are no torn writes.
+     *
+     * Leave empty (default) to disable the artifact cache.
+     *
+     * Maximum length: CJIT_MAX_CACHE_DIR - 1 characters.
+     */
+    char cache_dir[CJIT_MAX_CACHE_DIR];
+
+    /**
+     * Maximum wall-clock time (milliseconds) to wait for the C compiler
+     * subprocess to complete before killing it and marking the compilation
+     * as timed out.
+     *
+     * When a compilation times out:
+     *   • The compiler subprocess receives SIGTERM then SIGKILL (if needed).
+     *   • The compile task is marked failed (result->timed_out = true).
+     *   • cjit_stats_t.compile_timeouts is incremented.
+     *   • The function retains its previous pointer (AOT fallback or older
+     *     JIT tier) — no downgrade occurs.
+     *
+     * Pathological compilation (e.g., runaway template expansion, full disk,
+     * or a stalled cross-compiler) cannot block a compiler thread forever
+     * when this is set.
+     *
+     * 0 = no timeout (default, backward-compatible).  For interactive use a
+     * value of 30 000 (30 s) is a conservative starting point.
+     */
+    uint32_t compile_timeout_ms;
 } cjit_config_t;
 
 /* ══════════════════════════════ runtime stats ═════════════════════════════ */
@@ -600,10 +767,12 @@ typedef struct {
     uint32_t registered_functions;  /**< Total functions registered.            */
     uint64_t total_compilations;    /**< Total successful compilations.         */
     uint64_t failed_compilations;   /**< Total failed compilations.             */
+    uint64_t compile_timeouts;      /**< Compiler subprocesses killed (timeout).*/
     uint64_t total_swaps;           /**< Total atomic pointer swaps performed.  */
     uint64_t retired_handles;       /**< Total handles enqueued for deferred GC.*/
     uint64_t freed_handles;         /**< Total handles already freed.           */
     uint32_t queue_depth;           /**< Current depth of the compile queue.    */
+    uint32_t prio_queue_depth;      /**< Current depth of the priority queue.   */
 
     /**
      * Highest recompile_count seen across all registered functions.
@@ -612,6 +781,14 @@ typedef struct {
      * the scaled thresholds are having the desired effect.
      */
     uint32_t max_recompile_count;   /**< Highest per-function recompile count.  */
+
+    /* ── Tier-skip and predictive promotion ────────────────────────────── */
+    uint64_t tier_skips;            /**< Direct O0→O3 skips (tier_skip_multiplier). */
+    uint64_t predictive_promotions; /**< Promotions triggered by slope lookahead.   */
+
+    /* ── Compiled-artifact cache ──────────────────────────────────────── */
+    uint64_t artifact_cache_hits;   /**< Compilations skipped via cache hit.    */
+    uint64_t artifact_cache_misses; /**< Compilations where cache was cold.     */
 
     /* ── IR LRU cache ────────────────────────────────────────────────── */
     uint32_t ir_hot_count;          /**< Entries in HOT  generation (memory).  */
@@ -641,6 +818,41 @@ typedef struct {
      */
     uint64_t total_elapsed_ns;
 } cjit_stats_t;
+
+/* ══════════════════════════ compile-event callback ════════════════════════ */
+
+/**
+ * Event record delivered to a user-registered compile callback.
+ *
+ * Populated by the compiler thread after every compilation attempt
+ * (success, failure, or timeout) and passed to the callback before the
+ * compiler thread picks up its next task.
+ *
+ * The callback is invoked from a background compiler thread.  It must be
+ * async-signal-safe with respect to the calling thread: it may use
+ * mutexes and malloc but must not call back into the CJIT engine.
+ */
+typedef struct {
+    func_id_t   func_id;        /**< Numeric ID of the compiled function.      */
+    char        func_name[64];  /**< Symbol name (NUL-terminated, truncated).  */
+    opt_level_t level;          /**< Optimisation level that was attempted.    */
+    bool        success;        /**< True iff compilation succeeded and the
+                                 *   function pointer was swapped.              */
+    bool        timed_out;      /**< True iff the compiler was killed (timeout).*/
+    bool        cache_hit;      /**< True iff result came from artifact cache. */
+    uint32_t    duration_ms;    /**< Wall-clock time the compilation took (ms).*/
+    char        errmsg[256];    /**< Error message on failure (empty on success).*/
+} cjit_compile_event_t;
+
+/**
+ * Compile-event callback type.
+ *
+ * @param event     Read-only pointer to the event record; valid only for the
+ *                  duration of the callback.
+ * @param userdata  Opaque pointer passed to cjit_set_compile_callback().
+ */
+typedef void (*cjit_compile_callback_t)(const cjit_compile_event_t *event,
+                                         void                        *userdata);
 
 /* ══════════════════════════════ public API ════════════════════════════════ */
 
@@ -688,6 +900,25 @@ void cjit_start(cjit_engine_t *engine);
 void cjit_stop(cjit_engine_t *engine);
 
 /**
+ * Register a compile-event callback.
+ *
+ * The callback is invoked by a compiler thread immediately after every
+ * compilation attempt (success, failure, or timeout).  Only one callback
+ * can be active at a time; a second call replaces the previous one.
+ * Pass NULL to remove the callback.
+ *
+ * Thread safety: safe to call before or after cjit_start().  The new
+ * callback is visible to compiler threads as soon as the function returns.
+ *
+ * @param engine    The engine.
+ * @param cb        Callback function, or NULL to deregister.
+ * @param userdata  Opaque value forwarded to cb unchanged.
+ */
+void cjit_set_compile_callback(cjit_engine_t           *engine,
+                                cjit_compile_callback_t  cb,
+                                void                    *userdata);
+
+/**
  * Register a function with the JIT engine.
  *
  * @param engine       The engine.
@@ -705,6 +936,54 @@ func_id_t cjit_register_function(cjit_engine_t *engine,
                                   const char    *name,
                                   const char    *ir_source,
                                   jit_func_t     aot_fallback);
+
+/**
+ * Register multiple functions from a single C source string.
+ *
+ * Convenience wrapper that calls cjit_register_function(engine, names[i],
+ * source, NULL) for each i in [0, n).  Each function name must be a valid
+ * C symbol that can be located in the compiled shared object via dlsym.
+ *
+ * When the compiled-artifact cache is enabled (cfg.cache_dir non-empty),
+ * all functions sharing the same source at the same optimisation level
+ * produce identical compiled .so files.  The cache stores one copy; every
+ * subsequent lookup for a different function name in the same source finds
+ * the same .so and only needs a dlsym call — compiler spawns are reduced
+ * to one regardless of how many names are registered.
+ *
+ * @param engine   The engine (must be non-NULL).
+ * @param source   C source string shared by all n functions.
+ * @param n        Number of names to register.
+ * @param names    Array of n NUL-terminated function name strings.
+ * @param ids_out  Optional: receives the func_id_t for each name on success,
+ *                 or CJIT_INVALID_FUNC_ID on per-function failure.  May be
+ *                 NULL (IDs are discarded).
+ * @return         Number of successfully registered functions (0 on complete
+ *                 failure).  Any name that fails registration sets its
+ *                 ids_out slot to CJIT_INVALID_FUNC_ID.
+ */
+size_t cjit_register_from_source(cjit_engine_t *engine,
+                                  const char    *source,
+                                  size_t         n,
+                                  const char *const names[],
+                                  func_id_t      ids_out[]);
+
+/**
+ * Look up a function by name and return its current function pointer.
+ *
+ * Convenience wrapper combining cjit_lookup_function() and cjit_get_func()
+ * into a single call.  Useful for setup-time or diagnostic use where the
+ * func_id_t is not cached.
+ *
+ * Not suitable for hot-path dispatch — use cjit_get_func() with a cached
+ * func_id_t for zero-overhead dispatch.
+ *
+ * @param engine  The engine.
+ * @param name    Exact function name as passed to cjit_register_function().
+ * @return        Current function pointer, or NULL if the name is not found
+ *                or the function has not yet been compiled.
+ */
+jit_func_t cjit_get_func_by_name(cjit_engine_t *engine, const char *name);
 
 /**
  * Retrieve the current function pointer for the given ID.
@@ -1056,6 +1335,250 @@ bool cjit_update_ir(cjit_engine_t *engine,
 bool cjit_wait_compiled(cjit_engine_t *engine,
                         func_id_t      id,
                         uint32_t       timeout_ms);
+
+/**
+ * Copy a snapshot of the per-function call-latency histogram into out[].
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @param out     Array of at least CJIT_HIST_BUCKETS uint64_t values.
+ *                out[k] receives the count of flush-batches whose average
+ *                per-call latency fell in bucket k ([2^(k-1), 2^k) ns).
+ *
+ * The histogram is only populated when CJIT_DISPATCH_TIMED or
+ * cjit_record_timed_call() is used.  All buckets are zero for functions
+ * dispatched via CJIT_DISPATCH.
+ *
+ * Thread safety: non-synchronized relaxed loads — suitable for profiling
+ * and diagnostics; not suitable for strong consistency checks.
+ */
+void cjit_get_histogram(const cjit_engine_t *engine,
+                        func_id_t            id,
+                        uint64_t             out[CJIT_HIST_BUCKETS]);
+
+/**
+ * Estimate the p-th percentile call latency (in nanoseconds) from the
+ * per-function call-latency histogram.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID.
+ * @param pct     Percentile in [0, 100].  E.g. 50 = median, 99 = p99.
+ * @return        Estimated latency in nanoseconds (upper bound of the bucket
+ *                containing the p-th percentile); 0 if no samples are
+ *                available or id is invalid.
+ *
+ * The returned value is the upper bound of the histogram bucket that
+ * contains the p-th percentile sample (a power of two in nanoseconds),
+ * e.g. 1024 means the percentile falls in [512ns, 1024ns).  For most
+ * profiling purposes this resolution is sufficient.
+ *
+ * Thread safety: same as cjit_get_histogram().
+ */
+uint64_t cjit_percentile_ns(const cjit_engine_t *engine,
+                             func_id_t            id,
+                             unsigned             pct);
+
+/**
+ * Pin a function, preventing the monitor thread from auto-promoting it.
+ *
+ * While pinned:
+ *   • The monitor will not enqueue automatic tier promotions for this function.
+ *   • Manual cjit_request_recompile() calls are unaffected (they work normally).
+ *   • The function can still be dispatched through the normal hot path.
+ *
+ * Pinning is useful when you want to control a function's optimisation level
+ * manually (e.g. after a hot-reload) without the monitor interfering.
+ *
+ * Thread safety: atomic store; safe to call at any time including while the
+ * engine is running.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @return        true on success, false if id is invalid.
+ */
+bool cjit_pin_function(cjit_engine_t *engine, func_id_t id);
+
+/**
+ * Unpin a previously pinned function, re-enabling automatic tier promotion.
+ *
+ * After unpinning, the monitor resumes normal tier-promotion logic.  Any
+ * EMA/streak state that accumulated while the function was pinned is retained;
+ * the function may be promoted on the next scan cycle if the gates are met.
+ *
+ * Thread safety: atomic store; safe to call at any time.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @return        true on success, false if id is invalid.
+ */
+bool cjit_unpin_function(cjit_engine_t *engine, func_id_t id);
+
+/**
+ * Query whether a function is currently pinned.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID.
+ * @return        true if pinned, false if not pinned or id is invalid.
+ */
+bool cjit_is_pinned(const cjit_engine_t *engine, func_id_t id);
+
+/**
+ * Write a snapshot of all registered function IR sources to a directory.
+ *
+ * Creates the directory if it does not exist (mode 0700).  For each
+ * registered function writes:
+ *   <dir>/<name>.c   – the raw IR source (as registered or last updated).
+ *
+ * Also writes a machine-readable manifest:
+ *   <dir>/manifest.txt – one line per function:
+ *       <func_id>\t<name>\t<gen>\t<call_count>\t<opt_level>\n
+ *   where <gen> is HOT, WARM, or COLD.
+ *
+ * IR for COLD functions is loaded from the on-disk IR cache on demand (the
+ * same promotion mechanism used by the compiler thread).  If loading fails
+ * for a COLD entry, that function is skipped and the count reflects only
+ * successfully written files.
+ *
+ * Thread safety: acquires the IR-cache mutex for each entry; safe to call
+ * while the engine is running.  The snapshot is a point-in-time best-effort
+ * copy; concurrent cjit_update_ir() calls may produce a mixed snapshot.
+ *
+ * @param engine  The engine.
+ * @param dir     Path to the output directory (created if absent).
+ * @return        Number of .c files written, or -1 on fatal error (NULL engine,
+ *                NULL dir, or directory creation failure).
+ */
+int cjit_snapshot_ir(cjit_engine_t *engine, const char *dir);
+
+/**
+ * Reset per-function performance counters and profiling state.
+ *
+ * Atomically zeroes the following for the specified function:
+ *   • call_cnt          – call counter (TLS-flushed)
+ *   • total_elapsed_ns  – cumulative execution time (TLS-flushed)
+ *   • hist_counts[]     – all CJIT_HIST_BUCKETS latency histogram buckets
+ *   • recompile_count   – JIT recompile count (resets monitor threshold scaling)
+ *
+ * Typical use-case: after a cjit_update_ir() hot-reload, reset counters so
+ * that the monitor evaluates the new code from a clean baseline, rather than
+ * inheriting the call-rate history of the old implementation.
+ *
+ * The current function pointer and optimisation level are NOT affected; the
+ * function continues to run at its existing tier.  The monitor will re-observe
+ * the call rate from scratch and may re-promote the function.
+ *
+ * Thread safety: each field is zeroed with a relaxed atomic store.  An
+ * in-flight TLS flush may race to increment call_cnt or total_elapsed_ns
+ * immediately after; that is benign — it is equivalent to a call happening
+ * just after the reset.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @return        true on success, false if engine is NULL or id is invalid.
+ */
+bool cjit_reset_function_stats(cjit_engine_t *engine, func_id_t id);
+
+/**
+ * Block until all pending compile tasks have been dequeued and executed.
+ *
+ * Polls the total compile-queue depth (sum of all normal and priority lanes
+ * across all compiler threads) until it reaches zero, then waits for any
+ * in-progress compilation to finish by checking whether `in_queue` is clear
+ * for every registered function.
+ *
+ * Use-case: test scaffolding, warmup phases where you want to guarantee all
+ * background compiles are complete before starting production traffic.
+ *
+ * The function does NOT require the engine to be started — it returns true
+ * immediately if called before cjit_start() or after cjit_stop().
+ *
+ * Thread safety: safe to call concurrently with cjit_start(), cjit_stop(),
+ * dispatch loops, and any other public API.
+ *
+ * @param engine      The engine.
+ * @param timeout_ms  Maximum time to wait in milliseconds.
+ *                    0 = single non-blocking check.
+ * @return            true if the queue drained (depth == 0) before the
+ *                    timeout expired; false on timeout or NULL engine.
+ */
+bool cjit_drain_queue(cjit_engine_t *engine, uint32_t timeout_ms);
+
+/**
+ * Compile a function synchronously in the calling thread.
+ *
+ * Performs the full compilation pipeline (IR fetch → codegen_compile →
+ * atomic pointer swap → deferred GC retire) in the calling thread, without
+ * going through the background compile queue.  The function pointer is
+ * updated before this call returns.
+ *
+ * This is the fastest path for "compile now" warmup scenarios:
+ *
+ *   cjit_register_function(e, "fast_path", IR, NULL);
+ *   cjit_compile_sync(e, id, OPT_O2);   // block until compiled
+ *   // ... serve production traffic
+ *
+ * Behaviour:
+ *   • Acquires entry->compile_lock (blocking, unlike the compiler thread
+ *     which uses trylock).  If another thread is compiling the same function
+ *     simultaneously, this call serialises behind it.
+ *   • Fires the compile-event callback (if registered) after the attempt,
+ *     exactly like the background compiler thread.
+ *   • Increments the same engine-level statistics (stat_compilations,
+ *     stat_failed, stat_swaps).
+ *   • The version_req check is skipped: `cjit_compile_sync` always compiles
+ *     with the current IR regardless of any pending queue tasks.
+ *   • Does NOT clear `in_queue`; a background task for the same function
+ *     may still be queued but will be discarded (version mismatch) once
+ *     this call completes and increments the version counter.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @param level   Desired optimisation level.
+ * @return        true if compilation succeeded and the pointer was swapped.
+ *                false if id is invalid, no IR is available, the engine is
+ *                NULL, or the compiler subprocess failed.
+ */
+bool cjit_compile_sync(cjit_engine_t *engine, func_id_t id, opt_level_t level);
+
+/**
+ * Print a formatted IR-cache statistics block to stderr.
+ *
+ * Covers hot/warm/cold counts, disk read/write counts, eviction/promotion
+ * counters, and memory-pressure state.  Useful for diagnostics and
+ * production-quality telemetry.
+ *
+ * Thread safety: safe to call from any thread at any time.
+ *
+ * @param engine  The engine whose IR cache should be reported.  A NULL
+ *                engine is silently ignored.
+ */
+void cjit_print_ir_cache_stats(const cjit_engine_t *engine);
+
+/**
+ * Asynchronously prefetch the IR for a function into WARM memory.
+ *
+ * If the engine was created with io_threads > 0, the prefetch request is
+ * queued for a background I/O thread, which reads the IR from disk and
+ * promotes the entry from COLD → WARM.  The call is non-blocking: it
+ * returns true as soon as the request is queued, before the I/O completes.
+ *
+ * If io_threads == 0, the function falls back to a synchronous
+ * ir_cache_get_ir() call in the calling thread, which may block for the
+ * duration of the disk read.
+ *
+ * Typical use: during application start-up, call cjit_ir_cache_prefetch()
+ * for every function that is expected to be compiled soon.  The compiler
+ * thread will then find the IR already in WARM memory (a cache hit) instead
+ * of needing to read it from disk while holding the compile_lock.
+ *
+ * @param engine  The engine.
+ * @param id      Function ID returned by cjit_register_function().
+ * @return        true  — request queued (or synchronous load succeeded).
+ *                false — no IR cache configured, id invalid, prefetch queue
+ *                        full (transient; retry later), or io_threads == 0
+ *                        and the synchronous load failed.
+ */
+bool cjit_ir_cache_prefetch(cjit_engine_t *engine, func_id_t id);
 
 #ifdef __cplusplus
 }
