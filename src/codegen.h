@@ -47,21 +47,27 @@
  *              -funswitch-loops    (hoist invariant conditionals out of loops)
  *              -fpeel-loops        (peel first/last iterations; unroll small
  *                                  known-trip-count loops to straight-line)
+ *              -ftree-loop-distribute-patterns  (replace memcpy/memset/memcmp
+ *                                  loop patterns with optimized library calls;
+ *                                  GCC enables this only at -O3 by default)
+ *              -fgcse-after-reload  (global common-subexpression elimination
+ *                                  after register allocation; GCC O3-only by
+ *                                  default; unknown flags suppressed by -w)
  *              -march=native        (if enable_native_arch)
- *   OPT_O3   : -O3 -fomit-frame-pointer -fno-semantic-interposition
- *              -mtune=native
- *              -fno-plt            (Linux/ELF only)
- *              -finline-functions -funroll-loops -ftree-vectorize
- *              -funswitch-loops
- *              -fpeel-loops
- *              -march=native        (if enable_native_arch)
+ *              -fipa-cp-clone       (if enable_const_fold: clone functions for
+ *                                  constant-valued call sites; GCC O3-only by
+ *                                  default)
+ *   OPT_O3   : -O3 + all OPT_O2 flags +
  *              -ffast-math          (if enable_fast_math)
  *
  * Applied at every tier (including OPT_NONE):
- *   -fno-stack-protector        removes stack-canary overhead
+ *   -fno-stack-protector             removes stack-canary overhead
  *   -fno-asynchronous-unwind-tables  omits .eh_frame (smaller .so,
  *                                    faster dlopen, better I-cache)
- *   -fno-ident                  omits .comment section (smaller .so,
+ *   -fno-unwind-tables               omits basic unwind tables (.ARM.exidx
+ *                                    etc.); further reduces .so size on ARM
+ *                                    and RISC-V
+ *   -fno-ident                       omits .comment section (smaller .so,
  *                                    faster dlopen)
  *
  * Source file delivery
@@ -90,6 +96,11 @@
  *   #define NORETURN                 __attribute__((noreturn))
  *   #define CJIT_EXPORT              __attribute__((visibility("default")))
  *   #define MALLOC_FUNC              __attribute__((malloc))
+ *   #define ASSUME(cond)             assert-like hint: if false → UB
+ *                                    (enables compiler optimisations based
+ *                                    on assumed invariants; no runtime check)
+ *   #define UNROLL(n)                loop-unroll hint: "GCC unroll n"
+ *   #define IVDEP                    no-loop-dependency hint: "GCC ivdep"
  *
  * Also included automatically: <stdint.h>, <string.h>, <stdlib.h>,
  * <limits.h>, <stdbool.h>.
@@ -129,8 +140,11 @@ typedef struct {
     bool enable_inlining;      /**< -finline-functions                          */
     bool enable_vectorization; /**< -ftree-vectorize                            */
     bool enable_loop_unroll;   /**< -funroll-loops                              */
-    bool enable_native_arch;   /**< -march=native (only at OPT_O3)             */
+    bool enable_native_arch;   /**< -march=native (from OPT_O2 upwards)        */
     bool enable_fast_math;     /**< -ffast-math   (only at OPT_O3)             */
+    bool enable_const_fold;    /**< -fipa-cp-clone at O2+: clone functions for
+                                *   constant-valued arguments, enabling more
+                                *   aggressive interprocedural const-propagation*/
     bool verbose;              /**< Print compiler command to stderr            */
 
     /**

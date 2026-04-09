@@ -399,7 +399,19 @@ typedef struct {
     bool     enable_inlining;     /**< Pass -finline-functions to compiler.       */
     bool     enable_vectorization;/**< Pass -ftree-vectorize to compiler.         */
     bool     enable_loop_unroll;  /**< Pass -funroll-loops to compiler.           */
-    bool     enable_const_fold;   /**< Constant folding (enabled at -O1+).       */
+    bool     enable_const_fold;   /**< Enables -fipa-cp-clone at O2+: GCC creates
+                                        specialised clones of functions called
+                                        with constant-value arguments, allowing
+                                        the compiler to constant-fold through
+                                        function boundaries and eliminate dead
+                                        branches in the clones.  GCC applies
+                                        this only at -O3 by default; enabling
+                                        it at O2 is safe and can significantly
+                                        improve throughput for JIT functions
+                                        that call helper routines with fixed
+                                        parameters.  Silently accepted (and
+                                        then ignored) by Clang, so enabling
+                                        it is always safe.                     */
     bool     enable_native_arch;  /**< Pass -march=native from OPT_O2 upwards.   */
     bool     enable_fast_math;    /**< Pass -ffast-math at OPT_O3 (may change
                                        floating-point semantics).                 */
@@ -448,6 +460,74 @@ typedef struct {
      * Default: false.
      */
     bool     pin_compiler_threads;
+
+    /* ── PGO (profile-guided optimization) ─────────────────────────────── */
+
+    /**
+     * Enable the automatic PGO cycle.
+     *
+     * When true, instead of promoting a hot function directly from O2 to O3,
+     * the engine first compiles it with -fprofile-generate (an instrumented
+     * version that records branch frequencies, value profiles, etc.).  After
+     * pgo_profile_calls invocations, the engine flushes the profile data and
+     * recompiles with -fprofile-use to produce a highly optimised O3 binary
+     * tailored to the actual runtime behaviour.
+     *
+     * PGO uses GCC's gcov-based instrumentation (-fprofile-generate /
+     * -fprofile-use).  Both GCC and recent Clang accept these flags.
+     * If the compiler does not support them (the PGO_GENERATE compilation
+     * fails), pgo_state is set to DONE and the engine falls back to a
+     * standard O3 compile.
+     *
+     * Default: false (disabled).
+     */
+    bool     enable_pgo;
+
+    /**
+     * Number of instrumented calls to collect before triggering the PGO_USE
+     * compile.  Larger values collect richer profile data at the cost of
+     * running the slower instrumented binary for longer.
+     *
+     * The hot-dispatch path (func_ptr atomic load) is unchanged during the
+     * profiling window; the only performance cost is the gcov counter updates
+     * inside the instrumented function body (~5-15% overhead, depending on
+     * branch density).
+     *
+     * Default: 5 000 calls.
+     */
+    uint32_t pgo_profile_calls;
+
+    /**
+     * Base directory for PGO profile data files (.gcda).
+     *
+     * An engine-unique subdirectory (cjit_pgo_<pid>_<funcid>/) is created
+     * under this path for each function undergoing a PGO cycle.  Profile
+     * files are removed once the PGO_USE compilation succeeds.
+     *
+     * Empty string (default): use /tmp.
+     */
+    char     pgo_base_dir[256];
+
+    /**
+     * Maximum acceptable profiling-window duration (milliseconds).
+     *
+     * Before starting a PGO_GENERATE cycle the monitor estimates the
+     * instrumented execution window:
+     *
+     *   estimated_window_ms = pgo_profile_calls * 1000 / ema_rate
+     *                         + 2 * last_compile_duration_ms
+     *
+     * The first term is how long the function will run with gcov counters
+     * enabled (overhead ~5-15%).  The second term is the cost of two extra
+     * compiler invocations (PGO_GENERATE + PGO_USE).
+     *
+     * If estimated_window_ms > pgo_max_overhead_ms, the engine falls back
+     * to a direct O3 compile so that the function is optimised without the
+     * added latency of a full PGO cycle.  Set to 0 to disable the check.
+     *
+     * Default: 2 000 ms.
+     */
+    uint32_t pgo_max_overhead_ms;
 
     /* ── IR LRU cache settings ──────────────────────────────────────────── */
     uint32_t hot_ir_cache_size;   /**< Max HOT-gen IR entries in memory (def 64). */
@@ -785,6 +865,9 @@ typedef struct {
     /* ── Tier-skip and predictive promotion ────────────────────────────── */
     uint64_t tier_skips;            /**< Direct O0→O3 skips (tier_skip_multiplier). */
     uint64_t predictive_promotions; /**< Promotions triggered by slope lookahead.   */
+
+    /* ── PGO ─────────────────────────────────────────────────────────── */
+    uint64_t pgo_cycles;            /**< Functions that completed a full PGO cycle.  */
 
     /* ── Compiled-artifact cache ──────────────────────────────────────── */
     uint64_t artifact_cache_hits;   /**< Compilations skipped via cache hit.    */
