@@ -1641,7 +1641,7 @@ static void *monitor_thread_fn(void *arg)
                     func_table_get(engine->ftable, (func_id_t)pi);
                 if (!pe) continue;
                 if (atomic_load_explicit(&pe->pgo_state,
-                                          memory_order_relaxed) != PGO_STATE_RUNNING)
+                                          memory_order_acquire) != PGO_STATE_RUNNING)
                     continue;
                 if (atomic_load_explicit(&pe->in_queue,
                                           memory_order_relaxed))
@@ -1878,6 +1878,10 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
         free(e->work_queues);
         pthread_cond_destroy(&e->work_cond);
         pthread_mutex_destroy(&e->work_cond_mutex);
+        pthread_cond_destroy(&e->compile_done_cond);
+        pthread_mutex_destroy(&e->compile_done_mutex);
+        pthread_mutex_destroy(&e->cb_mutex);
+        codegen_cache_destroy(e->artifact_cache);
         ir_cache_destroy(e->ir_cache);
         func_table_destroy(e->ftable);
         free(e);

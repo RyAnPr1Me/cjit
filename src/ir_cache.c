@@ -370,9 +370,10 @@ static bool irc_write_to_disk(const char *path, const char *ir)
 {
     FILE *f = fopen(path, "w");
     if (!f) return false;
-    fputs(ir, f);
-    fclose(f);
-    return true;
+    bool ok = (fputs(ir, f) != EOF);
+    if (fclose(f) != 0) ok = false;
+    if (!ok) unlink(path);
+    return ok;
 }
 
 /** Read entire file into a malloc'd NUL-terminated buffer. Caller frees. */
@@ -690,11 +691,13 @@ char *ir_cache_get_ir(ir_lru_cache_t *cache, func_id_t func_id)
     pthread_mutex_lock(&cache->lock);
 
     if (node->gen != IR_GEN_COLD) {
-        /* Already promoted by a concurrent thread; return their in-memory copy. */
+        /* Already promoted by a concurrent thread; return their in-memory copy.
+         * Do NOT increment stat_cache_hits: we already counted a cache_miss and
+         * a disk_read above for this call.  Counting a hit here would
+         * double-count a single lookup as both a miss and a hit. */
         char *copy = node->ir_source ? strdup(node->ir_source) : strdup(loaded);
         pthread_mutex_unlock(&cache->lock);
         free(loaded);
-        atomic_fetch_add_explicit(&cache->stat_cache_hits, 1, memory_order_relaxed);
         return copy;
     }
 

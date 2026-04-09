@@ -65,8 +65,12 @@ void func_table_destroy(func_table_t *ft)
 {
     if (!ft) return;
 
-    uint32_t n = atomic_load_explicit(&ft->count, memory_order_relaxed);
-    for (uint32_t i = 0; i < n; ++i) {
+    /*
+     * Destroy mutexes for ALL capacity entries: func_table_create() calls
+     * entry_init() (which calls pthread_mutex_init) for every entry up to
+     * capacity, not just for the ones that were subsequently registered.
+     */
+    for (uint32_t i = 0; i < ft->capacity; ++i) {
         pthread_mutex_destroy(&ft->entries[i].compile_lock);
     }
     free(ft->entries);

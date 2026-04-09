@@ -1515,7 +1515,7 @@ bool codegen_compile(const char          *func_name,
     result->handle  = handle;
     result->success = true;
 
-    if (opts->verbose) {
+    if (opts && opts->verbose) {
         fprintf(stderr, "[cjit/codegen] compiled '%s' at O%d → %p\n",
                 func_name, (int)level, (void *)(uintptr_t)result->fn);
     }
