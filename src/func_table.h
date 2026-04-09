@@ -201,6 +201,51 @@ typedef struct {
      * Manual cjit_request_recompile() is never blocked by this flag.
      */
     atomic_bool                 pinned;
+
+    /**
+     * PGO (profile-guided optimization) state machine.
+     *
+     * The PGO cycle for a function proceeds as follows:
+     *
+     *   PGO_STATE_NONE (0):
+     *     PGO has not started.  When the monitor decides to promote the
+     *     function to OPT_O3 and enable_pgo is set, instead of issuing a
+     *     direct O3 compile it issues a PGO_MODE_GENERATE task.
+     *
+     *   PGO_STATE_RUNNING (1):
+     *     An instrumented O2 .so is installed and collecting branch-frequency
+     *     and value-profile data.  Written by the compiler thread (release)
+     *     after a successful PGO_GENERATE compile.  Read by the monitor thread
+     *     (acquire) to detect when enough data has been collected.
+     *
+     *   PGO_STATE_DONE (2):
+     *     The PGO cycle is complete (or was aborted due to a compilation
+     *     failure).  The monitor will attempt normal O3 promotion if the
+     *     function is still hot.
+     *
+     * pgo_dir             : absolute path to the directory where .gcda files
+     *                       are written by the instrumented binary.  Set by
+     *                       the compiler thread; valid while pgo_state >= RUNNING.
+     * pgo_calls_at_start  : value of call_cnt when the instrumented version
+     *                       was installed; used by the monitor to measure how
+     *                       many profiling calls have been collected.
+     * pgo_instr_handle    : dlopen handle of the instrumented .so; used by the
+     *                       monitor to dlsym and call _cjit_pgo_flush() when
+     *                       enough data has been collected.  The handle remains
+     *                       live (via deferred GC) until after the PGO_USE
+     *                       compile installs the optimised version.
+     *
+     * Thread safety:
+     *   pgo_state is atomic (acquire/release).  pgo_dir, pgo_calls_at_start,
+     *   and pgo_instr_handle are written by the compiler thread strictly before
+     *   the release store of pgo_state; the monitor reads them only after an
+     *   acquire load of pgo_state, so the happens-before chain guarantees
+     *   visibility without additional synchronisation.
+     */
+    atomic_int                  pgo_state;         /**< 0=NONE, 1=RUNNING, 2=DONE */
+    char                        pgo_dir[256];      /**< Profile data directory.    */
+    uint64_t                    pgo_calls_at_start;/**< call_cnt when instr. installed.*/
+    void                       *pgo_instr_handle;  /**< dlopen handle for flush.   */
 } func_table_entry_t;
 
 /* ─────────────────────────── table ─────────────────────────────────────────── */

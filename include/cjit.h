@@ -461,6 +461,53 @@ typedef struct {
      */
     bool     pin_compiler_threads;
 
+    /* ── PGO (profile-guided optimization) ─────────────────────────────── */
+
+    /**
+     * Enable the automatic PGO cycle.
+     *
+     * When true, instead of promoting a hot function directly from O2 to O3,
+     * the engine first compiles it with -fprofile-generate (an instrumented
+     * version that records branch frequencies, value profiles, etc.).  After
+     * pgo_profile_calls invocations, the engine flushes the profile data and
+     * recompiles with -fprofile-use to produce a highly optimised O3 binary
+     * tailored to the actual runtime behaviour.
+     *
+     * PGO uses GCC's gcov-based instrumentation (-fprofile-generate /
+     * -fprofile-use).  Both GCC and recent Clang accept these flags.
+     * If the compiler does not support them (the PGO_GENERATE compilation
+     * fails), pgo_state is set to DONE and the engine falls back to a
+     * standard O3 compile.
+     *
+     * Default: false (disabled).
+     */
+    bool     enable_pgo;
+
+    /**
+     * Number of instrumented calls to collect before triggering the PGO_USE
+     * compile.  Larger values collect richer profile data at the cost of
+     * running the slower instrumented binary for longer.
+     *
+     * The hot-dispatch path (func_ptr atomic load) is unchanged during the
+     * profiling window; the only performance cost is the gcov counter updates
+     * inside the instrumented function body (~5-15% overhead, depending on
+     * branch density).
+     *
+     * Default: 5 000 calls.
+     */
+    uint32_t pgo_profile_calls;
+
+    /**
+     * Base directory for PGO profile data files (.gcda).
+     *
+     * An engine-unique subdirectory (cjit_pgo_<pid>_<funcid>/) is created
+     * under this path for each function undergoing a PGO cycle.  Profile
+     * files are removed once the PGO_USE compilation succeeds.
+     *
+     * Empty string (default): use /tmp.
+     */
+    char     pgo_base_dir[256];
+
     /* ── IR LRU cache settings ──────────────────────────────────────────── */
     uint32_t hot_ir_cache_size;   /**< Max HOT-gen IR entries in memory (def 64). */
     uint32_t warm_ir_cache_size;  /**< Max WARM-gen IR entries in memory (def 128).*/
@@ -797,6 +844,9 @@ typedef struct {
     /* ── Tier-skip and predictive promotion ────────────────────────────── */
     uint64_t tier_skips;            /**< Direct O0→O3 skips (tier_skip_multiplier). */
     uint64_t predictive_promotions; /**< Promotions triggered by slope lookahead.   */
+
+    /* ── PGO ─────────────────────────────────────────────────────────── */
+    uint64_t pgo_cycles;            /**< Functions that completed a full PGO cycle.  */
 
     /* ── Compiled-artifact cache ──────────────────────────────────────── */
     uint64_t artifact_cache_hits;   /**< Compilations skipped via cache hit.    */

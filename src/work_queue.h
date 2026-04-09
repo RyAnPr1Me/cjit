@@ -28,8 +28,8 @@
  * No ABA problem: the sequence counter grows monotonically and wraps only
  * after 2^64 operations.  No spurious failures beyond the expected retry.
  *
- * The compile_task payload is small (12 bytes); the full struct fits in one
- * cache line together with its sequence counter.
+ * The compile_task payload is 32 bytes; the full struct fits in one cache line
+ * together with its sequence counter.
  *
  * Thread safety: fully lock-free; safe for any number of concurrent
  * producers and consumers.
@@ -67,6 +67,23 @@ WQ_STATIC_ASSERT((WQ_CAPACITY & (WQ_CAPACITY - 1u)) == 0u); /* power of 2 */
 /* ───────────────────────── payload type ─────────────────────────────────── */
 
 /**
+ * PGO (profile-guided optimization) mode for a compile task.
+ *
+ * PGO_MODE_NONE    – normal compilation (no profiling).
+ * PGO_MODE_GENERATE – compile with -fprofile-generate; an instrumented .so
+ *                    is installed and runs for pgo_profile_calls invocations
+ *                    to collect branch-frequency and value-profile data.
+ * PGO_MODE_USE     – compile with -fprofile-use, consuming the .gcda data
+ *                    files written by the instrumented version to produce a
+ *                    highly optimised final binary.
+ */
+typedef enum {
+    PGO_MODE_NONE     = 0,
+    PGO_MODE_GENERATE = 1,
+    PGO_MODE_USE      = 2,
+} pgo_mode_t;
+
+/**
  * A single compilation request.
  *
  * Fields
@@ -80,6 +97,9 @@ WQ_STATIC_ASSERT((WQ_CAPACITY & (WQ_CAPACITY - 1u)) == 0u); /* power of 2 */
  * call_rate    : Observed calls/sec at the time of enqueue.  Carried through
  *                to the compiler thread for verbose logging and future
  *                profile-guided optimisation hints.  Zero for manual requests.
+ * pgo_mode     : PGO_MODE_NONE for normal compilation; PGO_MODE_GENERATE or
+ *                PGO_MODE_USE for a PGO cycle step.  PGO tasks bypass the
+ *                cur_level >= target_level skip check in the compiler thread.
  */
 typedef struct {
     func_id_t   func_id;
@@ -87,6 +107,7 @@ typedef struct {
     uint32_t    priority;
     uint32_t    version_req;
     uint64_t    call_rate;   /* calls/sec at time of enqueue */
+    uint8_t     pgo_mode;    /* pgo_mode_t: 0=none, 1=generate, 2=use */
 } compile_task_t;
 
 /* ───────────────────────── queue structure ───────────────────────────────── */
@@ -99,7 +120,7 @@ typedef struct {
  *
  * Layout on LP64 (x86-64 / AArch64):
  *   seq  : 8 bytes  (atomic_uint_fast64_t)
- *   data : 24 bytes (compile_task_t: 4+4+4+4+8)
+ *   data : 32 bytes (compile_task_t: 4+4+4+4+8+1 = 25, padded to 32)
  *   pad  : 32 bytes
  *   total: 64 bytes = 1 cache line
  */

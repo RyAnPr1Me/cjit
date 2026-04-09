@@ -146,6 +146,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <sys/stat.h>  /* mkdir */
+#include <ftw.h>       /* nftw for PGO dir cleanup */
 #ifdef __linux__
 #include <sched.h>    /* sched_getaffinity, CPU_COUNT */
 #endif
@@ -185,6 +186,63 @@ __thread uint8_t  cjit_tls_counts[CJIT_MAX_FUNCTIONS];
  * Zero-initialised; stays zero for functions not dispatched via timed paths.
  */
 static __thread uint64_t cjit_tls_elapsed[CJIT_MAX_FUNCTIONS];
+
+/* ══════════════════════════ PGO helpers ═══════════════════════════════════ */
+
+/*
+ * PGO state constants (stored in func_table_entry_t::pgo_state).
+ * Kept as plain ints so they can be used with atomic_int without casts.
+ */
+#define PGO_STATE_NONE    0   /* PGO not started              */
+#define PGO_STATE_RUNNING 1   /* Instrumented version running */
+#define PGO_STATE_DONE    2   /* PGO cycle complete           */
+
+/*
+ * Source snippet prepended to every PGO_GENERATE compilation.
+ *
+ * Injects _cjit_pgo_flush() into the instrumented .so so the engine can
+ * flush the gcov counters to disk (via __gcov_dump / __gcov_flush) at a
+ * convenient point WITHOUT waiting for process exit.
+ *
+ * Both symbols are declared weak so that:
+ *   • On GCC with -lgcov: __gcov_dump is linked into the .so directly and
+ *     _cjit_pgo_flush() calls it.
+ *   • On Clang or when gcov is unavailable: both resolve to NULL; the
+ *     function becomes a safe no-op (profile data will not be written, and
+ *     the PGO_USE compilation falls back gracefully via -fprofile-correction).
+ *
+ * __attribute__((visibility("default"))) ensures that dlsym(handle, …) can
+ * always locate _cjit_pgo_flush even if the .so was compiled with -fvisibility=
+ * hidden (it isn't by default, but be explicit).
+ */
+static const char CJIT_PGO_FLUSH_HELPER[] =
+    "extern void __gcov_dump(void)  __attribute__((weak));\n"
+    "extern void __gcov_flush(void) __attribute__((weak));\n"
+    "__attribute__((visibility(\"default\")))\n"
+    "void _cjit_pgo_flush(void) {\n"
+    "    if (__gcov_dump)  { __gcov_dump();  return; }\n"
+    "    if (__gcov_flush)   __gcov_flush();\n"
+    "}\n";
+
+/*
+ * nftw callback for pgo_rmdir: remove files and directories depth-first.
+ */
+static int pgo_rm_cb(const char *path, const struct stat *sb,
+                     int typeflag, struct FTW *ftwbuf)
+{
+    (void)sb; (void)ftwbuf;
+    return (typeflag == FTW_F || typeflag == FTW_SL) ? unlink(path) : rmdir(path);
+}
+
+/*
+ * Recursively remove a PGO profile-data directory.
+ * Silently ignores errors (the directory may already be gone).
+ */
+static void pgo_rmdir(const char *dir)
+{
+    if (dir && dir[0])
+        nftw(dir, pgo_rm_cb, 8, FTW_DEPTH | FTW_PHYS);
+}
 
 /* ══════════════════════════ engine structure ══════════════════════════════ */
 
@@ -291,6 +349,7 @@ struct cjit_engine {
     atomic_uint_fast64_t stat_swaps;
     atomic_uint_fast64_t stat_tier_skips;        /**< O0→O3 tier-skip promotions. */
     atomic_uint_fast64_t stat_predictive_promos; /**< Slope-lookahead early promotions. */
+    atomic_uint_fast64_t stat_pgo_cycles;
 
     /**
      * Count of compiler threads that have acquired compile_lock and are
@@ -500,11 +559,15 @@ static void *compiler_thread_fn(void *raw_arg)
             continue;
         }
 
-        /* Skip if already at the requested tier or higher. */
+        /* Skip if already at the requested tier or higher.
+         * Exception: PGO tasks (pgo_mode != PGO_MODE_NONE) always proceed —
+         * PGO_GENERATE re-instruments a function at the same O2 level, and
+         * PGO_USE may legitimately target a level already reached via a
+         * non-PGO path in a race. */
         opt_level_t cur_level =
             (opt_level_t)atomic_load_explicit(&entry->cur_level,
                                                memory_order_relaxed);
-        if (cur_level >= task.target_level) {
+        if (task.pgo_mode == PGO_MODE_NONE && cur_level >= task.target_level) {
             if (engine->cfg.verbose)
                 fprintf(stderr,
                         "[cjit/compiler#%u] skip '%s': already O%d >= O%d\n",
@@ -607,8 +670,81 @@ static void *compiler_thread_fn(void *raw_arg)
                                                       memory_order_relaxed);
             copts.avg_elapsed_ns = (cnt_snap > 0) ? (ns_snap / cnt_snap) : 0;
         }
-        bool ok = codegen_compile(entry->name, ir_to_use,
-                                   task.target_level, &copts, &cres);
+
+        /*
+         * PGO: per-task compilation setup.
+         *
+         * For PGO tasks we need to:
+         *   PGO_GENERATE – (a) create the profile directory, (b) augment
+         *                  extra_cflags with -fprofile-generate=<dir> -lgcov,
+         *                  (c) prepend the _cjit_pgo_flush() helper to the IR.
+         *   PGO_USE      – augment extra_cflags with -fprofile-use=<dir>
+         *                  -fprofile-correction and skip the artifact cache
+         *                  (profile data is run-specific; caching would defeat
+         *                  the purpose and produce a wrong cache key).
+         *
+         * We modify a *per-task copy* of copts so the shared copts template is
+         * not mutated between tasks.
+         */
+        char           pgo_extra_cflags[900];
+        char          *pgo_ir        = NULL;
+        codegen_opts_t task_copts    = copts;   /* per-task copy */
+        const char    *effective_ir  = ir_to_use;
+
+        if (task.pgo_mode == PGO_MODE_GENERATE) {
+            /* Construct (or reuse) the per-function PGO directory. */
+            const char *base = (engine->cfg.pgo_base_dir[0])
+                                   ? engine->cfg.pgo_base_dir : "/tmp";
+            snprintf(entry->pgo_dir, sizeof(entry->pgo_dir),
+                     "%s/cjit_pgo_%d_%u", base, (int)getpid(),
+                     (unsigned)task.func_id);
+            mkdir(entry->pgo_dir, 0700); /* ignore EEXIST */
+
+            /* Augment extra_cflags for instrumented compilation. */
+            snprintf(pgo_extra_cflags, sizeof(pgo_extra_cflags),
+                     "-fprofile-generate=%s -fprofile-update=atomic -lgcov%s%s",
+                     entry->pgo_dir,
+                     (copts.extra_cflags && copts.extra_cflags[0]) ? " " : "",
+                     copts.extra_cflags ? copts.extra_cflags : "");
+            task_copts.extra_cflags = pgo_extra_cflags;
+
+            /* PGO compilations must never hit the artifact cache
+             * (profile data is run-specific). */
+            task_copts.cache = NULL;
+
+            /* Prepend the gcov flush helper to the IR. */
+            size_t hlen = sizeof(CJIT_PGO_FLUSH_HELPER) - 1;
+            size_t ilen = strlen(ir_to_use);
+            pgo_ir = malloc(hlen + ilen + 1);
+            if (pgo_ir) {
+                memcpy(pgo_ir, CJIT_PGO_FLUSH_HELPER, hlen);
+                memcpy(pgo_ir + hlen, ir_to_use, ilen + 1);
+                effective_ir = pgo_ir;
+            }
+            if (engine->cfg.verbose)
+                fprintf(stderr,
+                        "[cjit/compiler#%u] PGO_GENERATE '%s' dir=%s\n",
+                        me, entry->name, entry->pgo_dir);
+        } else if (task.pgo_mode == PGO_MODE_USE) {
+            /* Augment extra_cflags for PGO-optimised compilation. */
+            snprintf(pgo_extra_cflags, sizeof(pgo_extra_cflags),
+                     "-fprofile-use=%s -fprofile-correction%s%s",
+                     entry->pgo_dir,
+                     (copts.extra_cflags && copts.extra_cflags[0]) ? " " : "",
+                     copts.extra_cflags ? copts.extra_cflags : "");
+            task_copts.extra_cflags = pgo_extra_cflags;
+            task_copts.cache        = NULL; /* same reason as above */
+            if (engine->cfg.verbose)
+                fprintf(stderr,
+                        "[cjit/compiler#%u] PGO_USE '%s' dir=%s\n",
+                        me, entry->name, entry->pgo_dir);
+        }
+
+        bool ok = codegen_compile(entry->name, effective_ir,
+                                   task.target_level, &task_copts, &cres);
+        free(pgo_ir);
+
+        /* Restore shared copts fields that the per-task copy may have changed. */
         copts.arg_profile    = NULL; /* clear for next task */
         copts.call_rate      = 0;
         copts.avg_elapsed_ns = 0;
@@ -621,6 +757,26 @@ static void *compiler_thread_fn(void *raw_arg)
                               memory_order_relaxed);
 
         if (!ok) {
+            /*
+             * PGO failure handling.
+             *
+             * If a PGO_GENERATE task fails (e.g. -lgcov not available on a
+             * Clang system), mark the function as PGO_DONE so the monitor
+             * falls back to a normal O3 compile rather than retrying PGO
+             * indefinitely.
+             *
+             * If a PGO_USE task fails, the function is still running the
+             * instrumented O2 version (which is slower).  Set pgo_state=DONE
+             * and clean up the profile dir; the monitor will promote to plain
+             * O3 on the next hot cycle.
+             */
+            if (task.pgo_mode == PGO_MODE_GENERATE || task.pgo_mode == PGO_MODE_USE) {
+                pgo_rmdir(entry->pgo_dir);
+                entry->pgo_dir[0] = '\0';
+                entry->pgo_instr_handle = NULL;
+                atomic_store_explicit(&entry->pgo_state, PGO_STATE_DONE,
+                                      memory_order_relaxed);
+            }
             atomic_fetch_add_explicit(&engine->stat_failed, 1,
                                       memory_order_relaxed);
             if (cres.timed_out) {
@@ -670,6 +826,47 @@ static void *compiler_thread_fn(void *raw_arg)
                                             task.target_level);
         atomic_fetch_add_explicit(&engine->stat_swaps, 1,
                                   memory_order_relaxed);
+
+        /*
+         * PGO success book-keeping (done BEFORE releasing compile_lock so
+         * the monitor observes pgo_state after all writes are visible).
+         *
+         * PGO_GENERATE:
+         *   Store the instrumented .so's handle and the current call count.
+         *   Then atomically publish pgo_state=RUNNING (release) so the
+         *   monitor can start checking for profile-data sufficiency.
+         *
+         * PGO_USE:
+         *   Profile has been consumed; mark the cycle complete, bump the stat,
+         *   clear the handle reference (the old_handle below goes to GC), and
+         *   clean up the .gcda files from disk.
+         */
+        if (task.pgo_mode == PGO_MODE_GENERATE) {
+            entry->pgo_instr_handle  = cres.handle; /* not yet in GC */
+            entry->pgo_calls_at_start =
+                atomic_load_explicit(&entry->call_cnt, memory_order_relaxed);
+            atomic_store_explicit(&entry->pgo_state, PGO_STATE_RUNNING,
+                                  memory_order_release);
+            if (engine->cfg.verbose)
+                fprintf(stderr,
+                        "[cjit/compiler#%u] PGO instrumented '%s' "
+                        "(collect %u calls)\n",
+                        me, entry->name, engine->cfg.pgo_profile_calls);
+        } else if (task.pgo_mode == PGO_MODE_USE) {
+            entry->pgo_instr_handle = NULL; /* old_handle goes to DGC below */
+            atomic_store_explicit(&entry->pgo_state, PGO_STATE_DONE,
+                                  memory_order_relaxed);
+            atomic_fetch_add_explicit(&engine->stat_pgo_cycles, 1,
+                                      memory_order_relaxed);
+            /* Clean up profile data directory. */
+            pgo_rmdir(entry->pgo_dir);
+            entry->pgo_dir[0] = '\0';
+            if (engine->cfg.verbose)
+                fprintf(stderr,
+                        "[cjit/compiler#%u] PGO optimised '%s' O3\n",
+                        me, entry->name);
+        }
+
         pthread_mutex_unlock(&entry->compile_lock);
         atomic_fetch_sub_explicit(&engine->active_compilations, 1,
                                   memory_order_relaxed);
@@ -1253,6 +1450,59 @@ static void *monitor_thread_fn(void *arg)
                 else
                     scaled_min_calls = UINT64_MAX;
                 if (calls_since < scaled_min_calls) continue;
+
+                /*
+                 * PGO gate: when enable_pgo is set, intercept the first O3
+                 * promotion and redirect it through the PGO cycle instead.
+                 *
+                 *   PGO_STATE_NONE    → issue a PGO_GENERATE task (O2 +
+                 *                       profiling) instead of plain O3.
+                 *   PGO_STATE_RUNNING → profile collection is in progress;
+                 *                       the second monitor pass below handles
+                 *                       the flush + PGO_USE scheduling.  Skip
+                 *                       this cycle to avoid a race.
+                 *   PGO_STATE_DONE    → PGO cycle completed (or failed and
+                 *                       fell back); allow the normal O3 path.
+                 */
+                if (engine->cfg.enable_pgo) {
+                    int pgo_st = atomic_load_explicit(&entry->pgo_state,
+                                                      memory_order_relaxed);
+                    if (pgo_st == PGO_STATE_RUNNING) {
+                        /* Second pass will schedule PGO_USE; skip here. */
+                        hot_scan_streak[i] = 0;
+                        continue;
+                    } else if (pgo_st == PGO_STATE_NONE) {
+                        /* Redirect: issue PGO_GENERATE instead of plain O3. */
+                        bool expected_pgo = false;
+                        if (!atomic_compare_exchange_strong_explicit(
+                                &entry->in_queue, &expected_pgo, true,
+                                memory_order_relaxed, memory_order_relaxed))
+                            continue;
+                        compile_task_t pgo_gen_task = {
+                            .func_id      = entry->id,
+                            .target_level = OPT_O2, /* same level, re-instrumented */
+                            .priority     = 1,
+                            .version_req  = atomic_load_explicit(&entry->version,
+                                                                  memory_order_relaxed),
+                            .call_rate    = (uint64_t)ema_rate[i],
+                            .pgo_mode     = PGO_MODE_GENERATE,
+                        };
+                        if (!engine_enqueue_task(engine, &pgo_gen_task)) {
+                            atomic_store_explicit(&entry->in_queue, false,
+                                                  memory_order_relaxed);
+                        } else {
+                            cnt_at_compile[i]  = cur_cnt;
+                            last_queued_ms[i]  = now;
+                            hot_scan_streak[i] = 0;
+                            if (engine->cfg.verbose)
+                                fprintf(stderr,
+                                    "[cjit/monitor] PGO_GENERATE '%s' queued\n",
+                                    entry->name);
+                        }
+                        continue; /* skip normal O3 enqueue below */
+                    }
+                    /* pgo_st == PGO_STATE_DONE: fall through to normal O3 */
+                }
             }
 
             /* ── Enqueue ────────────────────────────────────────────────── */
@@ -1294,6 +1544,83 @@ static void *monitor_thread_fn(void *arg)
                             hot_scan_streak[i], req_streak,
                             rc, effective_cooloff,
                             (predicted_hot && !rate_hot) ? " [predictive]" : "");
+            }
+        }
+        }
+
+        /*
+         * ── PGO second pass: flush profile data and schedule PGO_USE ──────
+         *
+         * Walk all registered functions and check whether any instrumented
+         * (PGO_STATE_RUNNING) function has accumulated enough profiling calls.
+         * When it has:
+         *   1. Call _cjit_pgo_flush() on the instrumented handle to write
+         *      the .gcda files to disk.
+         *   2. Enqueue a PGO_USE task (OPT_O3, high priority).
+         *
+         * This pass runs every monitor scan cycle but only touches entries
+         * whose pgo_state is RUNNING, so it is essentially free in the common
+         * case (pgo_state load is relaxed; the branch is almost never taken).
+         */
+        if (engine->cfg.enable_pgo) {
+            uint32_t npgo = (uint32_t)atomic_load_explicit(
+                &engine->ftable->count, memory_order_relaxed);
+            for (uint32_t pi = 0; pi < npgo; pi++) {
+                func_table_entry_t *pe =
+                    func_table_get(engine->ftable, (func_id_t)pi);
+                if (!pe) continue;
+                if (atomic_load_explicit(&pe->pgo_state,
+                                          memory_order_relaxed) != PGO_STATE_RUNNING)
+                    continue;
+                if (atomic_load_explicit(&pe->in_queue,
+                                          memory_order_relaxed))
+                    continue;
+
+                uint64_t pcnt = atomic_load_explicit(&pe->call_cnt,
+                                                      memory_order_relaxed);
+                uint64_t need = (engine->cfg.pgo_profile_calls > 0)
+                                    ? engine->cfg.pgo_profile_calls : 5000u;
+                if (pcnt < pe->pgo_calls_at_start + need) continue;
+
+                /* Enough calls: flush profile data. */
+                void *ph = pe->pgo_instr_handle; /* see-before via acquire load */
+                if (ph) {
+                    typedef void (*pgo_flush_fn_t)(void);
+                    pgo_flush_fn_t flush_fn = (pgo_flush_fn_t)(uintptr_t)
+                        dlsym(ph, "_cjit_pgo_flush");
+                    if (flush_fn) {
+                        flush_fn();
+                        if (engine->cfg.verbose)
+                            fprintf(stderr,
+                                    "[cjit/monitor] PGO flushed '%s' "
+                                    "(%llu calls)\n",
+                                    pe->name,
+                                    (unsigned long long)(pcnt - pe->pgo_calls_at_start));
+                    }
+                }
+
+                /* Enqueue PGO_USE (OPT_O3, high priority). */
+                bool exp_pu = false;
+                if (atomic_compare_exchange_strong_explicit(
+                        &pe->in_queue, &exp_pu, true,
+                        memory_order_relaxed, memory_order_relaxed)) {
+                    compile_task_t use_task = {
+                        .func_id      = (func_id_t)pi,
+                        .target_level = OPT_O3,
+                        .priority     = 2,
+                        .version_req  = atomic_load_explicit(&pe->version,
+                                                              memory_order_relaxed),
+                        .call_rate    = 0,
+                        .pgo_mode     = PGO_MODE_USE,
+                    };
+                    if (!engine_enqueue_task(engine, &use_task))
+                        atomic_store_explicit(&pe->in_queue, false,
+                                              memory_order_relaxed);
+                    else if (engine->cfg.verbose)
+                        fprintf(stderr,
+                                "[cjit/monitor] PGO_USE '%s' queued\n",
+                                pe->name);
+                }
             }
         }
     }
@@ -1369,6 +1696,10 @@ cjit_config_t cjit_default_config(void)
     /* O1 warm-up tier (disabled by default; opt-in). */
     cfg.enable_o1_warmup = false;
     cfg.warm_rate_t0     = 0;  /* auto: hot_rate_t1 / 4 */
+
+    /* PGO (disabled by default; opt-in). */
+    cfg.enable_pgo        = false;
+    cfg.pgo_profile_calls = 5000;
 
     /* Compiler thread CPU affinity (disabled by default; opt-in). */
     cfg.pin_compiler_threads = false;
@@ -1477,6 +1808,7 @@ cjit_engine_t *cjit_create(const cjit_config_t *config)
     atomic_init(&e->stat_swaps,             0);
     atomic_init(&e->stat_tier_skips,        0);
     atomic_init(&e->stat_predictive_promos, 0);
+    atomic_init(&e->stat_pgo_cycles,        0);
 
     return e;
 }
